@@ -171,7 +171,7 @@ define amdgpu_kernel void @v_uaddo_v2i32(<2 x i32> addrspace(1)* %out, <2 x i32>
 }
 
 ; FUNC-LABEL: {{^}}s_uaddo_clamp_bit:
-; GCN: v_add_{{i|u|co_u}}32_e32
+; GCN: s_add_i32
 ; GCN: s_endpgm
 define amdgpu_kernel void @s_uaddo_clamp_bit(i32 addrspace(1)* %out, i1 addrspace(1)* %carryout, i32 %a, i32 %b) #0 {
 entry:
