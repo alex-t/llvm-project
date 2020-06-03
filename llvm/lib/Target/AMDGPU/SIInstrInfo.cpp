@@ -627,6 +627,12 @@ void SIInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
   }
 
   if (RC == &AMDGPU::SReg_64RegClass) {
+    if (SrcReg == AMDGPU::SCC) {
+      BuildMI(MBB, MI, DL, get(AMDGPU::S_CSELECT_B64), DestReg)
+          .addImm(1)
+          .addImm(0);
+      return;
+    }
     if (DestReg == AMDGPU::VCC) {
       if (AMDGPU::SReg_64RegClass.contains(SrcReg)) {
         BuildMI(MBB, MI, DL, get(AMDGPU::S_MOV_B64), AMDGPU::VCC)
@@ -6076,7 +6082,6 @@ void SIInstrInfo::addSCCDefUsersToVALUWorklist(MachineOperand &Op,
   // Ensure that def inst defines SCC, which is still live.
   assert(Op.isReg() && Op.getReg() == AMDGPU::SCC && Op.isDef() &&
          !Op.isDead() && Op.getParent() == &SCCDefInst);
-  SmallVector<MachineInstr *, 4> CopyToDelete;
   // This assumes that all the users of SCC are in the same block
   // as the SCC def.
   for (MachineInstr &MI : // Skip the def inst itself.
@@ -6085,19 +6090,7 @@ void SIInstrInfo::addSCCDefUsersToVALUWorklist(MachineOperand &Op,
     // Check if SCC is used first.
     if (MI.findRegisterUseOperandIdx(AMDGPU::SCC, false, &RI) != -1) {
       if (MI.isCopy()) {
-        MachineRegisterInfo &MRI = MI.getParent()->getParent()->getRegInfo();
-        unsigned DestReg = MI.getOperand(0).getReg();
-        SmallVector<MachineInstr *, 4> Users;
-        for (auto &User : MRI.use_nodbg_instructions(DestReg)) {
-          if ((User.getOpcode() == AMDGPU::S_ADD_CO_PSEUDO) ||
-              (User.getOpcode() == AMDGPU::S_SUB_CO_PSEUDO)) {
-            Users.push_back(&User);
-            Worklist.insert(&User);
-          }
-        }
-        for (auto &U : Users)
-          U->getOperand(4).setReg(RI.getVCC());
-        CopyToDelete.push_back(&MI);
+        MI.getOperand(1).setReg(RI.getVCC());
       } else
         Worklist.insert(&MI);
     }
@@ -6105,8 +6098,6 @@ void SIInstrInfo::addSCCDefUsersToVALUWorklist(MachineOperand &Op,
     if (MI.findRegisterDefOperandIdx(AMDGPU::SCC, false, false, &RI) != -1)
       break;
   }
-  for (auto &Copy : CopyToDelete)
-    Copy->eraseFromParent();
 }
 
 const TargetRegisterClass *SIInstrInfo::getDestEquivalentVGPRClass(
