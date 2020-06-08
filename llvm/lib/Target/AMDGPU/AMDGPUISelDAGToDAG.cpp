@@ -906,6 +906,31 @@ void AMDGPUDAGToDAGISel::Select(SDNode *N) {
     SelectINTRINSIC_VOID(N);
     return;
   }
+  case ISD::SELECT: {
+    if (N->isDivergent()) {
+      if (N->getValueType(0) == MVT::i64) {
+        ReplaceNode(
+            N, CurDAG->getMachineNode(AMDGPU::V_CNDMASK_B64_PSEUDO, SDLoc(N),
+                                      N->getValueType(0), N->getOperand(2),
+                                      N->getOperand(1), N->getOperand(0)));
+      } else {
+        ArrayRef<SDValue> Ops = {
+            CurDAG->getTargetConstant(0, SDLoc(N), MVT::i32), N->getOperand(2),
+            CurDAG->getTargetConstant(0, SDLoc(N), MVT::i32), N->getOperand(1),
+            N->getOperand(0)};
+        ReplaceNode(N,
+                    CurDAG->getMachineNode(AMDGPU::V_CNDMASK_B32_e64, SDLoc(N),
+                                           N->getValueType(0), Ops));
+      }
+    } else {
+      ReplaceNode(N,
+                  CurDAG->getMachineNode(AMDGPU::SELECT_B32_PSEUDO, SDLoc(N),
+                                         N->getValueType(0), N->getOperand(1),
+                                         N->getOperand(2), N->getOperand(0)));
+
+    }
+    return;
+  }
   }
 
   SelectCode(N);

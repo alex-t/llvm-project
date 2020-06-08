@@ -5125,6 +5125,35 @@ void SIInstrInfo::moveToVALU(MachineInstr &TopInst,
     switch (Opcode) {
     default:
       break;
+    case AMDGPU::SELECT_B32_PSEUDO:
+    case AMDGPU::SELECT_B64_PSEUDO: {
+      Register Dst = Inst.getOperand(0).getReg();
+      const TargetRegisterClass *RC = MRI.getRegClass(Dst);
+      const TargetRegisterClass *NewRC = RI.getEquivalentVGPRClass(RC);
+      Register NewDst = MRI.createVirtualRegister(NewRC);
+      MachineInstr *CndMask = nullptr;
+      if (RC == &AMDGPU::SReg_64RegClass) {
+        CndMask = BuildMI(*MBB, Inst, Inst.getDebugLoc(),
+                       get(AMDGPU::V_CNDMASK_B64_PSEUDO),
+                NewDst)
+            .add(Inst.getOperand(2))
+            .add(Inst.getOperand(1))
+            .addReg(Inst.getOperand(3).getReg());
+      } else {
+        CndMask = BuildMI(*MBB, Inst, Inst.getDebugLoc(),
+                get(AMDGPU::V_CNDMASK_B32_e64), NewDst)
+          .addImm(0)
+            .add(Inst.getOperand(2))
+          .addImm(0)
+            .add(Inst.getOperand(1))
+            .addReg(Inst.getOperand(3).getReg());
+      }
+      MRI.replaceRegWith(Dst, NewDst);
+      addUsersToMoveToVALUWorklist(NewDst, MRI, Worklist);
+      legalizeOperands(*CndMask, MDT);
+      Inst.eraseFromParent();
+    }
+      continue;
     case AMDGPU::S_ADD_U64_PSEUDO:
     case AMDGPU::S_SUB_U64_PSEUDO:
       splitScalar64BitAddSub(Worklist, Inst, MDT);

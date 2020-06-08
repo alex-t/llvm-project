@@ -240,6 +240,14 @@ def S_USUBO_PSEUDO : SPseudoInstSI <
   (outs SReg_32:$sdst, SSrc_i1:$scc_out), (ins SSrc_b32:$src0, SSrc_b32:$src1)
 >;
 
+def SELECT_B32_PSEUDO : SPseudoInstSI <
+  (outs SReg_32:$sdst), (ins SSrc_b32:$src0, SSrc_b32:$src1, SSrc_i1:$scc_in)
+>;
+
+def SELECT_B64_PSEUDO : SPseudoInstSI <
+  (outs SReg_64:$sdst), (ins SSrc_b64:$src0, SSrc_b64:$src1, SSrc_i1:$scc_in)
+>;
+
 } // End usesCustomInserter = 1, Defs = [SCC]
 
 let usesCustomInserter = 1 in {
