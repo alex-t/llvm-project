@@ -338,11 +338,11 @@ define amdgpu_gs void @_amdgpu_gs_main(i32 inreg %primShaderTableAddrLow, <31 x 
   ; CHECK:   [[V_OR_B32_e32_62:%[0-9]+]]:vgpr_32 = V_OR_B32_e32 [[V_OR_B32_e32_61]], [[V_ADD_U32_e32_26]], implicit $exec
   ; CHECK:   [[SI_SPILL_S32_RESTORE1:%[0-9]+]]:sreg_32_xm0_xexec = SI_SPILL_S32_RESTORE %stack.0, implicit $exec, implicit $sgpr32 :: (load 4 from %stack.0, addrspace 5)
   ; CHECK:   [[SI_SPILL_S128_RESTORE:%[0-9]+]]:sgpr_128 = SI_SPILL_S128_RESTORE %stack.1, implicit $exec, implicit $sgpr32 :: (load 16 from %stack.1, align 4, addrspace 5)
-  ; CHECK:   undef %914.sub2_sub3:sgpr_128 = COPY [[SI_SPILL_S128_RESTORE]].sub2_sub3 {
-  ; CHECK:     internal %914.sub0:sgpr_128 = COPY [[SI_SPILL_S128_RESTORE]].sub0
+  ; CHECK:   undef %915.sub2_sub3:sgpr_128 = COPY [[SI_SPILL_S128_RESTORE]].sub2_sub3 {
+  ; CHECK:     internal %915.sub0:sgpr_128 = COPY [[SI_SPILL_S128_RESTORE]].sub0
   ; CHECK:   }
-  ; CHECK:   %914.sub1:sgpr_128 = COPY [[SI_SPILL_S32_RESTORE1]]
-  ; CHECK:   [[S_BUFFER_LOAD_DWORD_IMM8:%[0-9]+]]:sreg_32_xm0_xexec = S_BUFFER_LOAD_DWORD_IMM %914, 0, 0, 0 :: (dereferenceable invariant load 4)
+  ; CHECK:   %915.sub1:sgpr_128 = COPY [[SI_SPILL_S32_RESTORE1]]
+  ; CHECK:   [[S_BUFFER_LOAD_DWORD_IMM8:%[0-9]+]]:sreg_32_xm0_xexec = S_BUFFER_LOAD_DWORD_IMM %915, 0, 0, 0 :: (dereferenceable invariant load 4)
   ; CHECK:   [[V_ADD_U32_e32_28:%[0-9]+]]:vgpr_32 = V_ADD_U32_e32 -576, [[BUFFER_LOAD_FORMAT_X_IDXEN]], implicit $exec
   ; CHECK:   [[V_OR_B32_e32_63:%[0-9]+]]:vgpr_32 = V_OR_B32_e32 [[V_OR_B32_e32_62]], [[V_ADD_U32_e32_27]], implicit $exec
   ; CHECK:   [[V_ADD_U32_e32_29:%[0-9]+]]:vgpr_32 = V_ADD_U32_e32 -577, [[BUFFER_LOAD_FORMAT_X_IDXEN]], implicit $exec
@@ -354,8 +354,8 @@ define amdgpu_gs void @_amdgpu_gs_main(i32 inreg %primShaderTableAddrLow, <31 x 
   ; CHECK:   [[S_ADD_I32_24:%[0-9]+]]:sreg_32 = S_ADD_I32 [[S_BUFFER_LOAD_DWORD_IMM8]], -594, implicit-def dead $scc
   ; CHECK:   [[V_OR_B32_e32_67:%[0-9]+]]:vgpr_32 = V_OR_B32_e32 [[S_ADD_I32_24]], [[V_OR_B32_e32_66]], implicit $exec
   ; CHECK:   [[V_CMP_EQ_U32_e64_:%[0-9]+]]:sreg_32_xm0_xexec = V_CMP_EQ_U32_e64 0, [[V_OR_B32_e32_67]], implicit $exec
-  ; CHECK:   undef %691.sub3:vreg_128 = V_CNDMASK_B32_e64 0, 0, 0, 1, [[V_CMP_EQ_U32_e64_]], implicit $exec
-  ; CHECK:   IMAGE_STORE_V4_V2_gfx10 %691, undef %578:vreg_64, [[S_LOAD_DWORDX8_IMM]], 15, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, implicit $exec :: (dereferenceable store 16 into custom "TargetCustom8")
+  ; CHECK:   undef %692.sub3:vreg_128 = V_CNDMASK_B32_e64 0, 0, 0, 1, [[V_CMP_EQ_U32_e64_]], implicit $exec
+  ; CHECK:   IMAGE_STORE_V4_V2_gfx10 %692, undef %578:vreg_64, [[S_LOAD_DWORDX8_IMM]], 15, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, implicit $exec :: (dereferenceable store 16 into custom "TargetCustom8")
   ; CHECK:   S_ENDPGM 0
 .expVert:
   %0 = extractelement <31 x i32> %userData, i64 2

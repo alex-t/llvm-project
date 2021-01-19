@@ -234,8 +234,9 @@ exit:
 
 ; CHECK-LABEL: {{^}}test_kill_control_flow_return:
 
-; CHECK: v_cmp_eq_u32_e64 [[KILL_CC:s\[[0-9]+:[0-9]+\]]], s0, 1
-; CHECK: s_and_b64 exec, exec, s[2:3]
+; CHECK: s_cmp_eq_u32 s0, 1
+; CHECK: s_cselect_b64 [[KILL_CC:s\[[0-9]+:[0-9]+\]]], -1, 0
+; CHECK: s_and_b64 exec, exec, [[KILL_CC]]
 ; CHECK-NEXT: s_cbranch_execz [[EXIT_BB:BB[0-9]+_[0-9]+]]
 
 ; CHECK: s_cmp_lg_u32 s{{[0-9]+}}, 0
