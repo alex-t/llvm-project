@@ -1251,19 +1251,30 @@ void RewriteInstance::createPLTBinaryFunction(uint64_t TargetAddress,
   if (!TargetAddress)
     return;
 
+  auto setPLTSymbol = [&](BinaryFunction *BF, StringRef Name) {
+    const unsigned PtrSize = BC->AsmInfo->getCodePointerSize();
+    MCSymbol *TargetSymbol = BC->registerNameAtAddress(
+        Name.str() + "@GOT", TargetAddress, PtrSize, PtrSize);
+    BF->setPLTSymbol(TargetSymbol);
+  };
+
+  BinaryFunction *BF = BC->getBinaryFunctionAtAddress(EntryAddress);
+  if (BF && BC->isAArch64()) {
+    // Handle IFUNC trampoline
+    setPLTSymbol(BF, BF->getOneName());
+    return;
+  }
+
   const Relocation *Rel = BC->getDynamicRelocationAt(TargetAddress);
   if (!Rel || !Rel->Symbol)
     return;
 
-  const unsigned PtrSize = BC->AsmInfo->getCodePointerSize();
   ErrorOr<BinarySection &> Section = BC->getSectionForAddress(EntryAddress);
   assert(Section && "cannot get section for address");
-  BinaryFunction *BF = BC->createBinaryFunction(
-      Rel->Symbol->getName().str() + "@PLT", *Section, EntryAddress, 0,
-      EntrySize, Section->getAlignment());
-  MCSymbol *TargetSymbol = BC->registerNameAtAddress(
-      Rel->Symbol->getName().str() + "@GOT", TargetAddress, PtrSize, PtrSize);
-  BF->setPLTSymbol(TargetSymbol);
+  BF = BC->createBinaryFunction(Rel->Symbol->getName().str() + "@PLT", *Section,
+                                EntryAddress, 0, EntrySize,
+                                Section->getAlignment());
+  setPLTSymbol(BF, Rel->Symbol->getName());
 }
 
 void RewriteInstance::disassemblePLTSectionAArch64(BinarySection &Section) {
@@ -1635,8 +1646,7 @@ Error RewriteInstance::readSpecialSections() {
   parseSDTNotes();
 
   // Read .dynamic/PT_DYNAMIC.
-  readELFDynamic();
-  return Error::success();
+  return readELFDynamic();
 }
 
 void RewriteInstance::adjustCommandLineOptions() {
@@ -2940,8 +2950,10 @@ void RewriteInstance::buildFunctionsCFG() {
         if (!BF.buildCFG(AllocId))
           return;
 
-        if (opts::PrintAll)
+        if (opts::PrintAll) {
+          auto L = BC->scopeLock();
           BF.print(outs(), "while building cfg", true);
+        }
       };
 
   ParallelUtilities::PredicateTy SkipPredicate = [&](const BinaryFunction &BF) {
@@ -5098,7 +5110,7 @@ void RewriteInstance::patchELFDynamic(ELFObjectFile<ELFT> *File) {
 }
 
 template <typename ELFT>
-void RewriteInstance::readELFDynamic(ELFObjectFile<ELFT> *File) {
+Error RewriteInstance::readELFDynamic(ELFObjectFile<ELFT> *File) {
   const ELFFile<ELFT> &Obj = File->getELFFile();
 
   using Elf_Phdr = typename ELFFile<ELFT>::Elf_Phdr;
@@ -5117,15 +5129,18 @@ void RewriteInstance::readELFDynamic(ELFObjectFile<ELFT> *File) {
     outs() << "BOLT-INFO: static input executable detected\n";
     // TODO: static PIE executable might have dynamic header
     BC->IsStaticExecutable = true;
-    return;
+    return Error::success();
   }
 
-  assert(DynamicPhdr->p_memsz == DynamicPhdr->p_filesz &&
-         "dynamic section sizes should match");
+  if (DynamicPhdr->p_memsz != DynamicPhdr->p_filesz)
+    return createStringError(errc::executable_format_error,
+                             "dynamic section sizes should match");
 
   // Go through all dynamic entries to locate entries of interest.
-  typename ELFT::DynRange DynamicEntries =
-      cantFail(Obj.dynamicEntries(), "error accessing dynamic table");
+  auto DynamicEntriesOrErr = Obj.dynamicEntries();
+  if (!DynamicEntriesOrErr)
+    return DynamicEntriesOrErr.takeError();
+  typename ELFT::DynRange DynamicEntries = DynamicEntriesOrErr.get();
 
   for (const Elf_Dyn &Dyn : DynamicEntries) {
     switch (Dyn.d_tag) {
@@ -5165,6 +5180,7 @@ void RewriteInstance::readELFDynamic(ELFObjectFile<ELFT> *File) {
     PLTRelocationsAddress.reset();
     PLTRelocationsSize = 0;
   }
+  return Error::success();
 }
 
 uint64_t RewriteInstance::getNewFunctionAddress(uint64_t OldAddress) {
