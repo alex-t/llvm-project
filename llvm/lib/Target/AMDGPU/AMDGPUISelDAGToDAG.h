@@ -132,6 +132,8 @@ private:
     return Subtarget->getInstrInfo()->isInlineConstant(Imm);
   }
 
+  bool isVALUInput(const SDNode *N, unsigned ResNo)const;
+  bool isUniform(const SDNode *N)const;
   bool isVGPRImm(const SDNode *N) const;
   bool isUniformLoad(const SDNode *N) const;
   bool isUniformBr(const SDNode *N) const;

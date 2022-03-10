@@ -997,7 +997,8 @@ EmitMachineNode(SDNode *Node, bool IsClone, bool IsCloned,
 #endif
 
   // Create the new machine instruction.
-  MachineInstrBuilder MIB = BuildMI(*MF, Node->getDebugLoc(), II);
+  MachineInstrBuilder MIB =
+      BuildMI(*MF, Node->getDebugLoc(), II, MIDivergence(Node->isDivergent()));
 
   // Add result register values for things that are defined by this
   // instruction.

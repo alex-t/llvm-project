@@ -2803,6 +2803,72 @@ SDValue AMDGPUDAGToDAGISel::getHi16Elt(SDValue In) const {
   return SDValue();
 }
 
+bool AMDGPUDAGToDAGISel::isVALUInput(const SDNode *N, unsigned ResNo) const {
+  EVT ValueType = N->getValueType(ResNo);
+  if (ValueType.isFloatingPoint())
+    return true;
+  if (ValueType == MVT::i1)
+    return false;
+  for (auto &O : N->ops()) {
+    if (O.getValueType().isFloatingPoint())
+      return true;
+  }
+  return false;
+}
+
+bool AMDGPUDAGToDAGISel::isUniform(const SDNode *N) const {
+  if (N->isDivergent())
+    return false;
+  const SIInstrInfo *SI = Subtarget->getInstrInfo();
+  const TargetRegisterInfo *TRI = Subtarget->getRegisterInfo();
+  unsigned VGPRInputCount = 0;
+  for (SDNode::op_iterator O = N->op_begin(); O != N->op_end(); ++O) {
+    if (isVALUInput(O->getNode(), O->getResNo())) {
+      VGPRInputCount++;
+    }
+  }
+  if (VGPRInputCount > 1)
+    return false;
+
+  unsigned MoveToVGPRCount = 0;
+  for (SDNode::use_iterator U = N->use_begin(), E = SDNode::use_end(); U != E;
+       ++U) {
+    SDNode *User = *U;
+    if (User->isMachineOpcode()) {
+      unsigned Opc = User->getMachineOpcode();
+      if (SI->isVALU(Opc)) {
+        // User is uniform. If it can accept SReg
+        // We should not bump counter. If it can accept SReg if commuted
+        // we should not bump counter either.
+        // In latter case SIFoldOperands further take care of folding the SGPR
+        // to VGPR copy if any.
+        // TODO: by example of isVGPRImm
+        const TargetRegisterClass *RC =
+            getOperandRegClass(*U, U.getOperandNo());
+        if (TRI->isDivergentRegClass(RC)) {
+          MoveToVGPRCount++;
+          MCInstrDesc Desc = SI->get(Opc);
+          if (Desc.isCommutable()) {
+            unsigned OpIdx = Desc.getNumDefs() + U.getOperandNo();
+            unsigned CommuteIdx1 = TargetInstrInfo::CommuteAnyOperandIndex;
+            if (SI->findCommutedOpIndices(Desc, OpIdx, CommuteIdx1)) {
+              unsigned CommutedOpNo = CommuteIdx1 - Desc.getNumDefs();
+              const TargetRegisterClass *CommutedRC =
+                  getOperandRegClass(*U, CommutedOpNo);
+              if (!TRI->isDivergentRegClass(CommutedRC))
+                MoveToVGPRCount--;
+            }
+          }
+        }
+      }
+
+      if (MoveToVGPRCount > 2)
+        return false;
+    }
+  }
+  return true;
+}
+
 bool AMDGPUDAGToDAGISel::isVGPRImm(const SDNode * N) const {
   assert(CurDAG->getTarget().getTargetTriple().getArch() == Triple::amdgcn);
 

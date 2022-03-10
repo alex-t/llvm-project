@@ -131,6 +131,8 @@ private:
                                         // anything other than to convey comment
                                         // information to AsmPrinter.
 
+  bool IsDivergent = true;
+
   // OperandCapacity has uint8_t size, so it should be next to AsmPrinterFlags
   // to properly pack.
   using OperandCapacity = ArrayRecycler<MachineOperand>::Capacity;
@@ -267,8 +269,8 @@ private:
   /// This constructor create a MachineInstr and add the implicit operands.
   /// It reserves space for number of operands specified by
   /// MCInstrDesc.  An explicit DebugLoc is supplied.
-  MachineInstr(MachineFunction &, const MCInstrDesc &TID, DebugLoc DL,
-               bool NoImp = false);
+  MachineInstr(MachineFunction &, const MCInstrDesc &tid, DebugLoc dl,
+               bool NoImp = false, bool IsDiv = true);
 
   // MachineInstrs are pool-allocated and owned by MachineFunction.
   friend class MachineFunction;
@@ -285,6 +287,8 @@ public:
 
   const MachineBasicBlock* getParent() const { return Parent; }
   MachineBasicBlock* getParent() { return Parent; }
+
+  bool isDivergent() { return IsDivergent; }
 
   /// Move the instruction before \p MovePos.
   void moveBefore(MachineInstr *MovePos);

@@ -115,14 +115,15 @@ void MachineInstr::addImplicitDefUseOperands(MachineFunction &MF) {
 /// MachineInstr ctor - This constructor creates a MachineInstr and adds the
 /// implicit operands. It reserves space for the number of operands specified by
 /// the MCInstrDesc.
-MachineInstr::MachineInstr(MachineFunction &MF, const MCInstrDesc &TID,
-                           DebugLoc DL, bool NoImp)
-    : MCID(&TID), DbgLoc(std::move(DL)), DebugInstrNum(0) {
+MachineInstr::MachineInstr(MachineFunction &MF, const MCInstrDesc &tid,
+                           DebugLoc dl, bool NoImp, bool IsDiv)
+    : MCID(&tid), DbgLoc(std::move(dl)), DebugInstrNum(0),
+      IsDivergent(IsDiv) {
   assert(DbgLoc.hasTrivialDestructor() && "Expected trivial destructor");
 
   // Reserve space for the expected number of operands.
-  if (unsigned NumOps = MCID->getNumOperands() +
-    MCID->getNumImplicitDefs() + MCID->getNumImplicitUses()) {
+  if (unsigned NumOps = MCID->getNumOperands() + MCID->getNumImplicitDefs() +
+                        MCID->getNumImplicitUses()) {
     CapOperands = OperandCapacity::get(NumOps);
     Operands = MF.allocateOperandArray(CapOperands);
   }
@@ -145,6 +146,8 @@ MachineInstr::MachineInstr(MachineFunction &MF, const MachineInstr &MI)
   // Copy operands.
   for (const MachineOperand &MO : MI.operands())
     addOperand(MF, MO);
+
+  IsDivergent = MI.IsDivergent;
 
   // Copy all the sensible flags.
   setFlags(MI.Flags);
@@ -2083,12 +2086,13 @@ void MachineInstr::emitError(StringRef Msg) const {
 MachineInstrBuilder llvm::BuildMI(MachineFunction &MF, const DebugLoc &DL,
                                   const MCInstrDesc &MCID, bool IsIndirect,
                                   Register Reg, const MDNode *Variable,
-                                  const MDNode *Expr) {
+                                  const MDNode *Expr,
+                                  MIDivergence IsDivergent) {
   assert(isa<DILocalVariable>(Variable) && "not a variable");
   assert(cast<DIExpression>(Expr)->isValid() && "not an expression");
   assert(cast<DILocalVariable>(Variable)->isValidLocationForIntrinsic(DL) &&
          "Expected inlined-at fields to agree");
-  auto MIB = BuildMI(MF, DL, MCID).addReg(Reg);
+  auto MIB = BuildMI(MF, DL, MCID, IsDivergent).addReg(Reg, RegState::Debug);
   if (IsIndirect)
     MIB.addImm(0U);
   else
@@ -2098,16 +2102,18 @@ MachineInstrBuilder llvm::BuildMI(MachineFunction &MF, const DebugLoc &DL,
 
 MachineInstrBuilder llvm::BuildMI(MachineFunction &MF, const DebugLoc &DL,
                                   const MCInstrDesc &MCID, bool IsIndirect,
-                                  const MachineOperand &MO,
-                                  const MDNode *Variable, const MDNode *Expr) {
+                                  MachineOperand &MO, const MDNode *Variable,
+                                  const MDNode *Expr,
+                                  MIDivergence IsDivergent) {
   assert(isa<DILocalVariable>(Variable) && "not a variable");
   assert(cast<DIExpression>(Expr)->isValid() && "not an expression");
   assert(cast<DILocalVariable>(Variable)->isValidLocationForIntrinsic(DL) &&
          "Expected inlined-at fields to agree");
   if (MO.isReg())
-    return BuildMI(MF, DL, MCID, IsIndirect, MO.getReg(), Variable, Expr);
+    return BuildMI(MF, DL, MCID, IsIndirect, MO.getReg(), Variable, Expr,
+                   IsDivergent);
 
-  auto MIB = BuildMI(MF, DL, MCID).add(MO);
+  auto MIB = BuildMI(MF, DL, MCID, IsDivergent).add(MO);
   if (IsIndirect)
     MIB.addImm(0U);
   else
@@ -2118,13 +2124,13 @@ MachineInstrBuilder llvm::BuildMI(MachineFunction &MF, const DebugLoc &DL,
 MachineInstrBuilder llvm::BuildMI(MachineFunction &MF, const DebugLoc &DL,
                                   const MCInstrDesc &MCID, bool IsIndirect,
                                   ArrayRef<MachineOperand> MOs,
-                                  const MDNode *Variable, const MDNode *Expr) {
+                                  const MDNode *Variable, const MDNode *Expr, MIDivergence IsDivergent) {
   assert(isa<DILocalVariable>(Variable) && "not a variable");
   assert(cast<DIExpression>(Expr)->isValid() && "not an expression");
   assert(cast<DILocalVariable>(Variable)->isValidLocationForIntrinsic(DL) &&
          "Expected inlined-at fields to agree");
   if (MCID.Opcode == TargetOpcode::DBG_VALUE)
-    return BuildMI(MF, DL, MCID, IsIndirect, MOs[0], Variable, Expr);
+    return BuildMI(MF, DL, MCID, IsIndirect, MOs[0], Variable, Expr, IsDivergent);
 
   auto MIB = BuildMI(MF, DL, MCID);
   MIB.addMetadata(Variable).addMetadata(Expr);
@@ -2140,9 +2146,11 @@ MachineInstrBuilder llvm::BuildMI(MachineBasicBlock &BB,
                                   MachineBasicBlock::iterator I,
                                   const DebugLoc &DL, const MCInstrDesc &MCID,
                                   bool IsIndirect, Register Reg,
-                                  const MDNode *Variable, const MDNode *Expr) {
+                                  const MDNode *Variable, const MDNode *Expr,
+                                  MIDivergence IsDivergent) {
   MachineFunction &MF = *BB.getParent();
-  MachineInstr *MI = BuildMI(MF, DL, MCID, IsIndirect, Reg, Variable, Expr);
+  MachineInstr *MI =
+      BuildMI(MF, DL, MCID, IsIndirect, Reg, Variable, Expr, IsDivergent);
   BB.insert(I, MI);
   return MachineInstrBuilder(MF, MI);
 }
@@ -2151,9 +2159,11 @@ MachineInstrBuilder llvm::BuildMI(MachineBasicBlock &BB,
                                   MachineBasicBlock::iterator I,
                                   const DebugLoc &DL, const MCInstrDesc &MCID,
                                   bool IsIndirect, MachineOperand &MO,
-                                  const MDNode *Variable, const MDNode *Expr) {
+                                  const MDNode *Variable, const MDNode *Expr,
+                                  MIDivergence IsDivergent) {
   MachineFunction &MF = *BB.getParent();
-  MachineInstr *MI = BuildMI(MF, DL, MCID, IsIndirect, MO, Variable, Expr);
+  MachineInstr *MI =
+      BuildMI(MF, DL, MCID, IsIndirect, MO, Variable, Expr, IsDivergent);
   BB.insert(I, MI);
   return MachineInstrBuilder(MF, *MI);
 }

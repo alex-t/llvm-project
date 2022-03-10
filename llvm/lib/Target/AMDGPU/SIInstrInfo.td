@@ -617,7 +617,7 @@ def atomic_store_local_64_m0 : PatFrag <
 def si_setcc_uniform : PatFrag <
   (ops node:$lhs, node:$rhs, node:$cond),
   (setcc node:$lhs, node:$rhs, node:$cond), [{
-  return !N->isDivergent();
+    return isUniform(N);
 }]>;
 
 //===----------------------------------------------------------------------===//

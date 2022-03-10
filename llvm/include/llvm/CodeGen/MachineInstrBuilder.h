@@ -324,29 +324,46 @@ public:
   }
 };
 
+class MIDivergence {
+public:
+  enum class MID {
+    MID_FALSE = 0,
+    MID_TRUE,
+  };
+  explicit MIDivergence(bool IsDiv) {
+    Val = IsDiv ? MID::MID_TRUE : MID::MID_FALSE;
+  }
+  operator bool() { return Val == MID::MID_TRUE; }
+
+private:
+  MID Val;
+};
+
 /// Builder interface. Specify how to create the initial instruction itself.
-inline MachineInstrBuilder BuildMI(MachineFunction &MF, const DebugLoc &DL,
-                                   const MCInstrDesc &MCID) {
-  return MachineInstrBuilder(MF, MF.CreateMachineInstr(MCID, DL));
+inline MachineInstrBuilder
+BuildMI(MachineFunction &MF, const DebugLoc &DL, const MCInstrDesc &MCID,
+        MIDivergence IsDivergent = MIDivergence(false)) {
+  return MachineInstrBuilder(
+      MF, MF.CreateMachineInstr(MCID, DL, false, IsDivergent));
 }
 
-/// This version of the builder sets up the first operand as a
-/// destination virtual register.
-inline MachineInstrBuilder BuildMI(MachineFunction &MF, const DebugLoc &DL,
-                                   const MCInstrDesc &MCID, Register DestReg) {
-  return MachineInstrBuilder(MF, MF.CreateMachineInstr(MCID, DL))
-           .addReg(DestReg, RegState::Define);
+inline MachineInstrBuilder
+BuildMI(MachineFunction &MF, const DebugLoc &DL, const MCInstrDesc &MCID,
+        Register DestReg, MIDivergence IsDivergent = MIDivergence(false)) {
+  return MachineInstrBuilder(
+             MF, MF.CreateMachineInstr(MCID, DL, false, IsDivergent))
+      .addReg(DestReg, RegState::Define);
 }
 
 /// This version of the builder inserts the newly-built instruction before
 /// the given position in the given MachineBasicBlock, and sets up the first
 /// operand as a destination virtual register.
-inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
-                                   MachineBasicBlock::iterator I,
-                                   const DebugLoc &DL, const MCInstrDesc &MCID,
-                                   Register DestReg) {
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock &BB, MachineBasicBlock::iterator I,
+        const DebugLoc &DL, const MCInstrDesc &MCID, Register DestReg,
+        MIDivergence IsDivergent = MIDivergence(false)) {
   MachineFunction &MF = *BB.getParent();
-  MachineInstr *MI = MF.CreateMachineInstr(MCID, DL);
+  MachineInstr *MI = MF.CreateMachineInstr(MCID, DL, false, IsDivergent);
   BB.insert(I, MI);
   return MachineInstrBuilder(MF, MI).addReg(DestReg, RegState::Define);
 }
@@ -357,84 +374,93 @@ inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
 ///
 /// If \c I is inside a bundle, then the newly inserted \a MachineInstr is
 /// added to the same bundle.
-inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
-                                   MachineBasicBlock::instr_iterator I,
-                                   const DebugLoc &DL, const MCInstrDesc &MCID,
-                                   Register DestReg) {
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock &BB, MachineBasicBlock::instr_iterator I,
+        const DebugLoc &DL, const MCInstrDesc &MCID, Register DestReg,
+        MIDivergence IsDivergent = MIDivergence(false)) {
   MachineFunction &MF = *BB.getParent();
-  MachineInstr *MI = MF.CreateMachineInstr(MCID, DL);
+  MachineInstr *MI = MF.CreateMachineInstr(MCID, DL, false, IsDivergent);
   BB.insert(I, MI);
   return MachineInstrBuilder(MF, MI).addReg(DestReg, RegState::Define);
 }
 
-inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB, MachineInstr &I,
-                                   const DebugLoc &DL, const MCInstrDesc &MCID,
-                                   Register DestReg) {
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock &BB, MachineInstr &I, const DebugLoc &DL,
+        const MCInstrDesc &MCID, Register DestReg,
+        MIDivergence IsDivergent = MIDivergence(false)) {
   // Calling the overload for instr_iterator is always correct.  However, the
   // definition is not available in headers, so inline the check.
   if (I.isInsideBundle())
-    return BuildMI(BB, MachineBasicBlock::instr_iterator(I), DL, MCID, DestReg);
-  return BuildMI(BB, MachineBasicBlock::iterator(I), DL, MCID, DestReg);
+    return BuildMI(BB, MachineBasicBlock::instr_iterator(I), DL, MCID, DestReg,
+                   IsDivergent);
+  return BuildMI(BB, MachineBasicBlock::iterator(I), DL, MCID, DestReg,
+                 IsDivergent);
 }
 
-inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB, MachineInstr *I,
-                                   const DebugLoc &DL, const MCInstrDesc &MCID,
-                                   Register DestReg) {
-  return BuildMI(BB, *I, DL, MCID, DestReg);
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock &BB, MachineInstr *I, const DebugLoc &DL,
+        const MCInstrDesc &MCID, Register DestReg,
+        MIDivergence IsDivergent = MIDivergence(false)) {
+  return BuildMI(BB, *I, DL, MCID, DestReg, IsDivergent);
 }
 
 /// This version of the builder inserts the newly-built instruction before the
 /// given position in the given MachineBasicBlock, and does NOT take a
 /// destination register.
-inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
-                                   MachineBasicBlock::iterator I,
-                                   const DebugLoc &DL,
-                                   const MCInstrDesc &MCID) {
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock &BB, MachineBasicBlock::iterator I,
+        const DebugLoc &DL, const MCInstrDesc &MCID,
+        MIDivergence IsDivergent = MIDivergence(false)) {
   MachineFunction &MF = *BB.getParent();
-  MachineInstr *MI = MF.CreateMachineInstr(MCID, DL);
+  MachineInstr *MI = MF.CreateMachineInstr(MCID, DL, false, IsDivergent);
   BB.insert(I, MI);
   return MachineInstrBuilder(MF, MI);
 }
 
 inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
                                    MachineBasicBlock::instr_iterator I,
-                                   const DebugLoc &DL,
-                                   const MCInstrDesc &MCID) {
+        const DebugLoc &DL, const MCInstrDesc &MCID,
+        MIDivergence IsDivergent = MIDivergence(false)) {
   MachineFunction &MF = *BB.getParent();
-  MachineInstr *MI = MF.CreateMachineInstr(MCID, DL);
+  MachineInstr *MI = MF.CreateMachineInstr(MCID, DL, false, IsDivergent);
   BB.insert(I, MI);
   return MachineInstrBuilder(MF, MI);
 }
 
-inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB, MachineInstr &I,
-                                   const DebugLoc &DL,
-                                   const MCInstrDesc &MCID) {
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock &BB, MachineInstr &I, const DebugLoc &DL,
+        const MCInstrDesc &MCID,
+        MIDivergence IsDivergent = MIDivergence(false)) {
   // Calling the overload for instr_iterator is always correct.  However, the
   // definition is not available in headers, so inline the check.
   if (I.isInsideBundle())
-    return BuildMI(BB, MachineBasicBlock::instr_iterator(I), DL, MCID);
-  return BuildMI(BB, MachineBasicBlock::iterator(I), DL, MCID);
+    return BuildMI(BB, MachineBasicBlock::instr_iterator(I), DL, MCID,
+                   IsDivergent);
+  return BuildMI(BB, MachineBasicBlock::iterator(I), DL, MCID, IsDivergent);
 }
 
-inline MachineInstrBuilder BuildMI(MachineBasicBlock &BB, MachineInstr *I,
-                                   const DebugLoc &DL,
-                                   const MCInstrDesc &MCID) {
-  return BuildMI(BB, *I, DL, MCID);
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock &BB, MachineInstr *I, const DebugLoc &DL,
+        const MCInstrDesc &MCID,
+        MIDivergence IsDivergent = MIDivergence(false)) {
+  return BuildMI(BB, *I, DL, MCID, IsDivergent);
 }
 
 /// This version of the builder inserts the newly-built instruction at the end
 /// of the given MachineBasicBlock, and does NOT take a destination register.
-inline MachineInstrBuilder BuildMI(MachineBasicBlock *BB, const DebugLoc &DL,
-                                   const MCInstrDesc &MCID) {
-  return BuildMI(*BB, BB->end(), DL, MCID);
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock *BB, const DebugLoc &DL, const MCInstrDesc &MCID,
+        MIDivergence IsDivergent = MIDivergence(false)) {
+  return BuildMI(*BB, BB->end(), DL, MCID, IsDivergent);
 }
 
 /// This version of the builder inserts the newly-built instruction at the
 /// end of the given MachineBasicBlock, and sets up the first operand as a
 /// destination virtual register.
-inline MachineInstrBuilder BuildMI(MachineBasicBlock *BB, const DebugLoc &DL,
-                                   const MCInstrDesc &MCID, Register DestReg) {
-  return BuildMI(*BB, BB->end(), DL, MCID, DestReg);
+inline MachineInstrBuilder
+BuildMI(MachineBasicBlock *BB, const DebugLoc &DL, const MCInstrDesc &MCID,
+        Register DestReg, MIDivergence IsDivergent = MIDivergence(false)) {
+  return BuildMI(*BB, BB->end(), DL, MCID, DestReg, IsDivergent);
 }
 
 /// This version of the builder builds a DBG_VALUE intrinsic
@@ -444,21 +470,24 @@ inline MachineInstrBuilder BuildMI(MachineBasicBlock *BB, const DebugLoc &DL,
 MachineInstrBuilder BuildMI(MachineFunction &MF, const DebugLoc &DL,
                             const MCInstrDesc &MCID, bool IsIndirect,
                             Register Reg, const MDNode *Variable,
-                            const MDNode *Expr);
+                            const MDNode *Expr,
+                            MIDivergence IsDivergent = MIDivergence(false));
 
 /// This version of the builder builds a DBG_VALUE intrinsic
 /// for a MachineOperand.
 MachineInstrBuilder BuildMI(MachineFunction &MF, const DebugLoc &DL,
                             const MCInstrDesc &MCID, bool IsIndirect,
-                            const MachineOperand &MO, const MDNode *Variable,
-                            const MDNode *Expr);
+                            MachineOperand &MO, const MDNode *Variable,
+                            const MDNode *Expr,
+                            MIDivergence IsDivergent = MIDivergence(false));
 
 /// This version of the builder builds a DBG_VALUE or DBG_VALUE_LIST intrinsic
 /// for a MachineOperand.
 MachineInstrBuilder BuildMI(MachineFunction &MF, const DebugLoc &DL,
                             const MCInstrDesc &MCID, bool IsIndirect,
                             ArrayRef<MachineOperand> MOs,
-                            const MDNode *Variable, const MDNode *Expr);
+                            const MDNode *Variable, const MDNode *Expr,
+                            MIDivergence IsDivergent = MIDivergence(false));
 
 /// This version of the builder builds a DBG_VALUE intrinsic
 /// for either a value in a register or a register-indirect
@@ -467,7 +496,8 @@ MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
                             MachineBasicBlock::iterator I, const DebugLoc &DL,
                             const MCInstrDesc &MCID, bool IsIndirect,
                             Register Reg, const MDNode *Variable,
-                            const MDNode *Expr);
+                            const MDNode *Expr,
+                            MIDivergence IsDivergent = MIDivergence(false));
 
 /// This version of the builder builds a DBG_VALUE intrinsic
 /// for a machine operand and inserts it at position I.
@@ -475,7 +505,8 @@ MachineInstrBuilder BuildMI(MachineBasicBlock &BB,
                             MachineBasicBlock::iterator I, const DebugLoc &DL,
                             const MCInstrDesc &MCID, bool IsIndirect,
                             MachineOperand &MO, const MDNode *Variable,
-                            const MDNode *Expr);
+                            const MDNode *Expr,
+                            MIDivergence IsDivergent = MIDivergence(false));
 
 /// This version of the builder builds a DBG_VALUE or DBG_VALUE_LIST intrinsic
 /// for a machine operand and inserts it at position I.
