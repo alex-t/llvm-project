@@ -22,6 +22,7 @@
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
 #include "llvm/CodeGen/ScheduleDAG.h"
@@ -2130,6 +2131,23 @@ bool SIInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
     // This only gets its own opcode so that SIPreAllocateWWMRegs can tell when
     // WWM/STICT_WQM is exited.
     MI.setDesc(get(ST.isWave32() ? AMDGPU::S_MOV_B32 : AMDGPU::S_MOV_B64));
+    break;
+  }
+  case AMDGPU::SI_RETURN: {
+    const MachineFunction *MF = MBB.getParent();
+    const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+    const SIRegisterInfo *TRI = ST.getRegisterInfo();
+    // Hiding the return address use with SI_RETURN may lead to extra kills in
+    // the function and missing live-ins. We are fine in practice because callee
+    // saved register handling ensures the register value is restored before
+    // RET, but we need the undef flag here to appease the MachineVerifier
+    // liveness checks.
+    MachineInstrBuilder MIB =
+        BuildMI(MBB, MI, DL, get(AMDGPU::S_SETPC_B64_return))
+            .addReg(TRI->getReturnAddressReg(*MF), RegState::Undef);
+
+    MIB.copyImplicitOps(MI);
+    MI.eraseFromParent();
     break;
   }
   }
