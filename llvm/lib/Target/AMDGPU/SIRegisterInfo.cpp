@@ -2234,55 +2234,76 @@ void SIRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator MI,
         // Convert to a swizzled stack address by scaling by the wave size.
         //
         // In an entry function/kernel the offset is already swizzled.
+        bool IsSALU = TII->isSALU(*MI);
+        bool LiveSCC = RS->isRegUsed(AMDGPU::SCC);
 
+        const TargetRegisterClass *RC = IsSALU && !LiveSCC
+                                            ? &AMDGPU::SReg_32RegClass
+                                                   : &AMDGPU::VGPR_32RegClass;
         bool IsCopy = MI->getOpcode() == AMDGPU::V_MOV_B32_e32;
         Register ResultReg =
             IsCopy ? MI->getOperand(0).getReg()
-                   : RS->scavengeRegister(&AMDGPU::VGPR_32RegClass, MI, 0);
+                   : RS->scavengeRegister(RC, MI, 0);
 
         int64_t Offset = FrameInfo.getObjectOffset(Index);
         if (Offset == 0) {
+          unsigned OpCode = IsSALU & !LiveSCC ? AMDGPU::S_LSHR_B32
+                                                    : AMDGPU::V_LSHRREV_B32_e64;
           // XXX - This never happens because of emergency scavenging slot at 0?
-          BuildMI(*MBB, MI, DL, TII->get(AMDGPU::V_LSHRREV_B32_e64), ResultReg)
+          auto Shift = BuildMI(*MBB, MI, DL, TII->get(OpCode), ResultReg)
             .addImm(ST.getWavefrontSizeLog2())
             .addReg(FrameReg);
+          if (IsSALU && LiveSCC) {
+            Register NewDest =
+                RS->scavengeRegister(&AMDGPU::SReg_32RegClass, Shift, 0);
+            BuildMI(*MBB, MI, DL, TII->get(AMDGPU::V_READFIRSTLANE_B32),
+                    NewDest)
+                .addReg(ResultReg);
+            ResultReg = NewDest;
+          }
         } else {
-          if (auto MIB = TII->getAddNoCarry(*MBB, MI, DL, ResultReg, *RS)) {
-            // Reuse ResultReg in intermediate step.
-            Register ScaledReg = ResultReg;
+          MachineInstrBuilder MIB;
+          if (!IsSALU) {
+            if (MIB = TII->getAddNoCarry(*MBB, MI, DL, ResultReg, *RS)) {
+              // Reuse ResultReg in intermediate step.
+              Register ScaledReg = ResultReg;
 
-            BuildMI(*MBB, *MIB, DL, TII->get(AMDGPU::V_LSHRREV_B32_e64),
-                    ScaledReg)
-              .addImm(ST.getWavefrontSizeLog2())
-              .addReg(FrameReg);
+              BuildMI(*MBB, *MIB, DL, TII->get(AMDGPU::V_LSHRREV_B32_e64),
+                      ScaledReg)
+                  .addImm(ST.getWavefrontSizeLog2())
+                  .addReg(FrameReg);
 
-            const bool IsVOP2 = MIB->getOpcode() == AMDGPU::V_ADD_U32_e32;
+              const bool IsVOP2 = MIB->getOpcode() == AMDGPU::V_ADD_U32_e32;
 
-            // TODO: Fold if use instruction is another add of a constant.
-            if (IsVOP2 || AMDGPU::isInlinableLiteral32(Offset, ST.hasInv2PiInlineImm())) {
-              // FIXME: This can fail
-              MIB.addImm(Offset);
-              MIB.addReg(ScaledReg, RegState::Kill);
-              if (!IsVOP2)
+              // TODO: Fold if use instruction is another add of a constant.
+              if (IsVOP2 || AMDGPU::isInlinableLiteral32(
+                                Offset, ST.hasInv2PiInlineImm())) {
+                // FIXME: This can fail
+                MIB.addImm(Offset);
+                MIB.addReg(ScaledReg, RegState::Kill);
+                if (!IsVOP2)
+                  MIB.addImm(0); // clamp bit
+              } else {
+                assert(MIB->getOpcode() == AMDGPU::V_ADD_CO_U32_e64 &&
+                       "Need to reuse carry out register");
+
+                // Use scavenged unused carry out as offset register.
+                Register ConstOffsetReg;
+                if (!isWave32)
+                  ConstOffsetReg = getSubReg(MIB.getReg(1), AMDGPU::sub0);
+                else
+                  ConstOffsetReg = MIB.getReg(1);
+
+                BuildMI(*MBB, *MIB, DL, TII->get(AMDGPU::S_MOV_B32),
+                        ConstOffsetReg)
+                    .addImm(Offset);
+                MIB.addReg(ConstOffsetReg, RegState::Kill);
+                MIB.addReg(ScaledReg, RegState::Kill);
                 MIB.addImm(0); // clamp bit
-            } else {
-              assert(MIB->getOpcode() == AMDGPU::V_ADD_CO_U32_e64 &&
-                     "Need to reuse carry out register");
-
-              // Use scavenged unused carry out as offset register.
-              Register ConstOffsetReg;
-              if (!isWave32)
-                ConstOffsetReg = getSubReg(MIB.getReg(1), AMDGPU::sub0);
-              else
-                ConstOffsetReg = MIB.getReg(1);
-
-              BuildMI(*MBB, *MIB, DL, TII->get(AMDGPU::S_MOV_B32), ConstOffsetReg)
-                .addImm(Offset);
-              MIB.addReg(ConstOffsetReg, RegState::Kill);
-              MIB.addReg(ScaledReg, RegState::Kill);
-              MIB.addImm(0); // clamp bit
-            }
-          } else {
+              }
+            } 
+          }
+          if (!MIB || IsSALU) {
             // We have to produce a carry out, and there isn't a free SGPR pair
             // for it. We can keep the whole computation on the SALU to avoid
             // clobbering an additional register at the cost of an extra mov.

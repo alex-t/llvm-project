@@ -95,7 +95,7 @@ public:
   SIFixSGPRCopies() : MachineFunctionPass(ID) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override;
-  unsigned countVGPRUses(MachineInstr &MI);
+  unsigned countUsesBalance(MachineInstr &MI);
   MachineBasicBlock *processPHINode(MachineInstr &MI);
 
   StringRef getPassName() const override { return "SI Fix SGPR copies"; }
@@ -658,8 +658,22 @@ bool SIFixSGPRCopies::runOnMachineFunction(MachineFunction &MF) {
           MachineInstr *DefMI = MRI->getVRegDef(SrcReg);
 
           if (DefMI->isDivergent()) {
-            dbgs() << *MBB << "\n" << *DefMI;
-            assert(false && "Error porcessing VGPR2SGPR copy\n");
+            bool Exception = false;
+            for (auto &U : MRI->use_instructions(DstReg)) {
+              unsigned Opc = U.getOpcode();
+              if (Opc == AMDGPU::V_WRITELANE_B32 ||
+                  Opc == AMDGPU::S_BUFFER_LOAD_DWORD_IMM ||
+                  Opc == AMDGPU::BUFFER_LOAD_FORMAT_X_OFFSET ||
+                  Opc == AMDGPU::BUFFER_LOAD_FORMAT_X_IDXEN ||
+                  Opc == AMDGPU::BUFFER_LOAD_FORMAT_X_OFFEN ||
+                  Opc == AMDGPU::BUFFER_LOAD_FORMAT_X_BOTHEN ||
+                Opc == AMDGPU::IMAGE_SAMPLE_V1_V2)
+                Exception = true;
+            }
+            if (!Exception) {
+              dbgs() << *MBB << "\n" << *DefMI;
+              assert(false && "Error porcessing VGPR2SGPR copy\n");
+            }
           }
 
           unsigned SMovOp;
@@ -672,47 +686,41 @@ bool SIFixSGPRCopies::runOnMachineFunction(MachineFunction &MF) {
             MI.setDesc(TII->get(SMovOp));
             break;
           }
-          if (countVGPRUses(MI) <= 4) {
-            if (TRI->getRegSizeInBits(*SrcRC) == 32) {
-              I = BuildMI(*MBB, MI, MI.getDebugLoc(),
-                          TII->get(AMDGPU::V_READFIRSTLANE_B32), DstReg)
-                      .addReg(SrcReg);
-              MI.eraseFromParent();
+          if (countUsesBalance(MI) < 2) {
+            uint16_t SubRegs[4] = {AMDGPU::sub0, AMDGPU::sub1, AMDGPU::sub2,
+                                   AMDGPU::sub3};
+            unsigned SubReg = MI.getOperand(1).getSubReg();
+            bool IsSubReg = SubReg != AMDGPU::NoSubRegister;
+            const TargetRegisterClass *SourceRC =
+                IsSubReg
+                    ? TRI->getSubRegClass(SrcRC, MI.getOperand(1).getSubReg())
+                    : SrcRC;
+            if (TRI->getRegSizeInBits(*SourceRC) == 32) {
+              auto MIB = BuildMI(*MBB, MI, MI.getDebugLoc(),
+                                 TII->get(AMDGPU::V_READFIRSTLANE_B32), DstReg);
+              if (IsSubReg)
+                MIB.addReg(SrcReg, 0, SubReg);
+              else
+                MIB.addReg(SrcReg);
+              I = MIB;
             } else {
-              if (MI.getOperand(1).getSubReg() == AMDGPU::NoSubRegister) {
-                Register SrcLO = TII->buildExtractSubReg(
-                    MI, *MRI, MI.getOperand(1), SrcRC, AMDGPU::sub0,
+              auto Result = BuildMI(*MBB, MI, MI.getDebugLoc(),
+                                    TII->get(AMDGPU::REG_SEQUENCE), DstReg);
+              int N = TRI->getRegSizeInBits(*SourceRC) / 32;
+              for (int i = 0; i < N; i++) {
+                Register PartialSrc = TII->buildExtractSubReg(
+                    Result, *MRI, MI.getOperand(1), SrcRC, SubRegs[i],
                     &AMDGPU::VGPR_32RegClass);
-                Register DstLO =
+                Register PartialDst =
                     MRI->createVirtualRegister(&AMDGPU::SReg_32RegClass);
-                I = BuildMI(*MBB, MI, MI.getDebugLoc(),
-                            TII->get(AMDGPU::V_READFIRSTLANE_B32), DstLO)
-                        .addReg(SrcLO);
-
-                Register SrcHI = TII->buildExtractSubReg(
-                    MI, *MRI, MI.getOperand(1), SrcRC, AMDGPU::sub1,
-                    &AMDGPU::VGPR_32RegClass);
-                Register DstHI =
-                    MRI->createVirtualRegister(&AMDGPU::SReg_32RegClass);
-                I = BuildMI(*MBB, MI, MI.getDebugLoc(),
-                            TII->get(AMDGPU::V_READFIRSTLANE_B32), DstHI)
-                        .addReg(SrcHI);
-
-                I = BuildMI(*MBB, MI, MI.getDebugLoc(),
-                            TII->get(AMDGPU::REG_SEQUENCE), DstReg)
-                        .addReg(DstLO)
-                        .addImm(AMDGPU::sub0)
-                        .addReg(DstHI)
-                        .addImm(AMDGPU::sub1);
-              } else {
-                MachineOperand Super = MI.getOperand(1);
-                I = BuildMI(*MBB, MI, MI.getDebugLoc(),
-                            TII->get(AMDGPU::V_READFIRSTLANE_B32), DstReg)
-                        .addReg(Super.getReg(), 0, Super.getSubReg());
+                BuildMI(*MBB, *Result, Result->getDebugLoc(),
+                        TII->get(AMDGPU::V_READFIRSTLANE_B32), PartialDst)
+                    .addReg(PartialSrc);
+                Result.addReg(PartialDst).addImm(SubRegs[i]);
               }
-
-              MI.eraseFromParent();
+              I = Result;
             }
+            MI.eraseFromParent();
           } else {
             MachineBasicBlock *NewBB = TII->moveToVALU(MI, MDT);
             if (NewBB && NewBB != MBB) {
@@ -966,8 +974,9 @@ MachineBasicBlock *SIFixSGPRCopies::processPHINode(MachineInstr &MI) {
   return CreatedBB;
 }
 
-unsigned SIFixSGPRCopies::countVGPRUses(MachineInstr &MI) {
+unsigned SIFixSGPRCopies::countUsesBalance(MachineInstr &MI) {
   unsigned NumVGPRUsers = 0;
+  unsigned NumSGPRUsers = 0;
   if (MI.isCopy()) {
     SetVector<MachineInstr *> Worklist, Visited;
     Worklist.insert(&MI);
@@ -975,20 +984,23 @@ unsigned SIFixSGPRCopies::countVGPRUses(MachineInstr &MI) {
     while (!Worklist.empty()) {
       MachineInstr *Inst = Worklist.pop_back_val();
       if (Inst->getNumExplicitDefs() != 0) {
-        Register Reg = MI.getOperand(0).getReg();
+        Register Reg = Inst->getOperand(0).getReg();
         for (auto &U : MRI->use_operands(Reg)) {
           MachineInstr *UseMI = U.getParent();
+          if (Visited.insert(UseMI))
+            Worklist.insert(UseMI);
+          if (UseMI->isCopy())
+            continue;
           const TargetRegisterClass *OpRC =
               TII->getOpRegClass(*UseMI, UseMI->getOperandNo(&U));
           if (!TRI->isSGPRClass(OpRC) && OpRC != &AMDGPU::VS_32RegClass &&
               OpRC != &AMDGPU::VS_64RegClass) {
             NumVGPRUsers++;
-          }
-          if (Visited.insert(UseMI))
-            Worklist.insert(UseMI);
+          } else
+            NumSGPRUsers++;
         }
       }
     }
   }
-  return NumVGPRUsers;
+  return NumSGPRUsers == 0 ? UINT_MAX : NumVGPRUsers/NumSGPRUsers;
 }

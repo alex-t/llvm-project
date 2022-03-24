@@ -2918,7 +2918,8 @@ bool AMDGPUDAGToDAGISel::isVGPRImm(const SDNode * N) const {
 }
 
 bool AMDGPUDAGToDAGISel::isUniformLoad(const SDNode * N) const {
-  auto Ld = cast<LoadSDNode>(N);
+
+  auto Ld = cast<MemSDNode>(N);
 
   return Ld->getAlignment() >= 4 &&
         (
