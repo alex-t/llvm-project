@@ -85,6 +85,167 @@ namespace {
 class SIFixSGPRCopies : public MachineFunctionPass {
   MachineDominatorTree *MDT;
 
+  class UserInfo {
+    MachineInstr *Copy;
+    unsigned SScore, VScore, SVCopies;
+    SetVector<MachineInstr *> Descendants;
+
+  public:
+    UserInfo() : Copy(nullptr), SScore(0), VScore(0), SVCopies(0){};
+    // UserInfo(MachineInstr *C) : Copy(C) {}
+    UserInfo(MachineInstr *C, unsigned S, unsigned V, unsigned SV,
+             SetVector<MachineInstr *> D)
+        : Copy(C), SScore(S), VScore(V), SVCopies(SV), Descendants(D){};
+    unsigned getSScore() { return SScore; }
+    unsigned getVScore() { return VScore; }
+    unsigned getSVcopies() { return SVCopies; }
+    bool Reaching(MachineInstr *X) { return Descendants.contains(X); }
+    /* void setScores(unsigned S, unsigned V, unsigned SV) {
+      SScore = S;
+      VScore = V;
+      SVCopies = SV;
+    }*/
+    MachineInstr *getCopy() { return Copy; }
+    SetVector<MachineInstr *> &getDescendants() { return Descendants; }
+    // void addDescendants(SetVector<MachineInstr *> Desc) {
+    //   Descendants.insert(Desc.begin(), Desc.end());
+    // }
+    explicit operator bool() { return Copy != nullptr; }
+    void dump() const;
+    void print(raw_ostream &OS) const;
+  };
+
+  class V2SCopyInfo {
+    MachineInstr *Copy;
+    struct Sibling {
+      MachineInstr *SiblingCopy;
+      MachineInstr *CommonUser;
+      unsigned CommonUserSALUScore;
+      unsigned CommonUserVALUScore;
+      unsigned CommonUserS2VCopies;
+    };
+    SmallVector<Sibling, 4> Siblings;
+    unsigned SALUChainLength;
+    unsigned VALUChainLength;
+    unsigned NumSVCopies;
+    static DenseMap<MachineInstr *, V2SCopyInfo> V2SCopies;
+    static V2SCopyInfo NullInfo;
+
+  public:
+    MachineInstr *getCopy() { return Copy; }
+    unsigned getSALUScore() { return SALUChainLength; }
+    unsigned getVALUScore() { return VALUChainLength; }
+    unsigned getSVCopies() { return NumSVCopies; }
+    void setSALUScore(unsigned Score) { SALUChainLength = Score; }
+    void setVALUScore(unsigned Score) { VALUChainLength = Score; }
+    void incSALU() { SALUChainLength++; }
+    void incVALU() { VALUChainLength++; }
+    void incSVCopies() { NumSVCopies++; }
+
+    void addSibling(MachineInstr *SiblingCopy, MachineInstr *CommonUser,
+                    UserInfo& Info, bool UpdateScores = false) {
+      Siblings.push_back({SiblingCopy, CommonUser, Info.getSScore(),
+                          Info.getVScore(), Info.getSVcopies()});
+      if (UpdateScores) {
+        SALUChainLength += Info.getSScore();
+        VALUChainLength += Info.getVScore();
+        NumSVCopies += Info.getSVcopies();
+      }
+    }
+    //void addSibling(MachineInstr *SiblingCopy, MachineInstr *CommonUser) {
+    //  Siblings.push_back({SiblingCopy, CommonUser, SALUChainLength,
+    //                      VALUChainLength, NumSVCopies});
+    //}
+    SmallVector<Sibling, 4> &getSiblings() { return Siblings; }
+    int getScore() {
+      // VALUChainLength is not very useful. It reflects the summary length
+      // of all the VALU chains originated from the copy. Each VALU chain
+      // originated from the V2S copy requires S2V copy OR VALU instruction
+      // accepting SGPR operandand and producing result in VGPR
+      // TODO: deside if/how we should use this metric.
+      //
+      // NumSVCopies  - the real number of the VALU users of the root V2S copy.
+      // If we have many VALU users of the root V2S copy we'll likely need many
+      // S2V copies if we turn root copy to v_readfirstlane_b32. This number of
+      // S2V copis required considered a penaulty.
+      //
+      // NumReadfirstlanes - number of v_readfirstlane_b32 instructions that
+      // need to be added to keep the corresponding subtree in SALU.
+      //
+      // SALUChainLength - summarized length of all the continuous SALU tracks
+      // over all V2S copy users.
+      unsigned NumReadfirstlanes = 1 + Siblings.size();
+      return SALUChainLength - (NumReadfirstlanes /* + NumSVCopies*/);
+    }
+    V2SCopyInfo()
+        : Copy(nullptr), SALUChainLength(0), VALUChainLength(0),
+          NumSVCopies(0){};
+    V2SCopyInfo(MachineInstr *MI)
+        : Copy(MI), SALUChainLength(0), VALUChainLength(0), NumSVCopies(0){};
+    V2SCopyInfo(MachineInstr *MI, uint16_t nS, uint16_t nV)
+        : Copy(MI), SALUChainLength(nS), VALUChainLength(nV), NumSVCopies(0){};
+    ~V2SCopyInfo(){};
+
+    explicit operator bool() {
+      return Copy != nullptr;
+    }
+
+    static V2SCopyInfo& getV2SCopy(MachineInstr *MI) {
+      if (V2SCopies.count(MI))
+        return V2SCopies[MI];
+      return NullInfo;
+    }
+
+    static void addV2SCopy(MachineInstr *MI, V2SCopyInfo Copy) {
+      V2SCopies[MI] = Copy;
+    }
+
+    static void eraseV2SCopy(MachineInstr *MI) {
+      if (V2SCopyInfo &Info = getV2SCopy(MI)) {
+        // We turn to VALU V2S copy and all its SSA users subtree
+        // including the instruction common between the copy and its
+        // sibling Sibling scores reflect the numbers for the common
+        // instruction subtree but not instruction itself. Since it is
+        // going to turn to VALU we add one point to sibling VALU score
+        // and subtract one from its SALU score.
+        for (auto &S : Info.getSiblings()) {
+          if (V2SCopyInfo &SInfo = getV2SCopy(S.SiblingCopy)) {
+            unsigned SScore = Info.getSALUScore();
+            unsigned SiblingSScore = SInfo.getSALUScore();
+            SInfo.setSALUScore(
+                SiblingSScore > SScore + 1 ? SiblingSScore - SScore - 1 : 0);
+            SInfo.setVALUScore(SInfo.getVALUScore() + Info.getVALUScore() + 1);
+            for (auto &SS : SInfo.getSiblings())
+              if (SS.SiblingCopy == MI) {
+                SInfo.getSiblings().erase(&SS);
+                break;
+              }
+          }
+        }
+        // Remove all the related bookkeeping
+        LLVM_DEBUG(dbgs() << "Erasing V2S copy:" << *MI);
+        V2SCopies.erase(MI);
+      }
+    }
+
+    static SmallVector<V2SCopyInfo, 8> getSorted() {
+      SmallVector<V2SCopyInfo, 8> Ret;
+      struct {
+        bool operator()(V2SCopyInfo I, V2SCopyInfo J) {
+          return I.getScore() < J.getScore();
+        }
+      } Pred;
+      for (auto P : V2SCopies)
+        Ret.push_back(P.getSecond());
+      std::sort(Ret.begin(), Ret.end(), Pred);
+      return Ret;
+    }
+    static void clear() { V2SCopies.clear(); }
+    void dump() const;
+    void print(raw_ostream &OS) const;
+    static void print();
+  };
+
 public:
   static char ID;
 
@@ -95,7 +256,12 @@ public:
   SIFixSGPRCopies() : MachineFunctionPass(ID) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override;
-  unsigned countUsesBalance(MachineInstr &MI);
+  void collectV2SCopyInfo(MachineFunction &MF);
+  void lowerV2SCopies(MachineFunction &MF);
+  bool LowerSpecialCase(MachineInstr &MI);
+  void testIterative(MachineFunction &MF);
+  void testIterative1(MachineFunction &MF);
+
   MachineBasicBlock *processPHINode(MachineInstr &MI);
 
   StringRef getPassName() const override { return "SI Fix SGPR copies"; }
@@ -109,6 +275,12 @@ public:
 };
 
 } // end anonymous namespace
+
+DenseMap<MachineInstr *, SIFixSGPRCopies::V2SCopyInfo>
+    SIFixSGPRCopies::V2SCopyInfo::V2SCopies =
+        DenseMap<MachineInstr *, SIFixSGPRCopies::V2SCopyInfo>();
+SIFixSGPRCopies::V2SCopyInfo SIFixSGPRCopies::V2SCopyInfo::NullInfo =
+    V2SCopyInfo();
 
 INITIALIZE_PASS_BEGIN(SIFixSGPRCopies, DEBUG_TYPE,
                      "SI Fix SGPR copies", false, false)
@@ -569,6 +741,11 @@ bool SIFixSGPRCopies::runOnMachineFunction(MachineFunction &MF) {
   TII = ST.getInstrInfo();
   MDT = &getAnalysis<MachineDominatorTree>();
 
+  testIterative1(MF);
+
+  collectV2SCopyInfo(MF);
+  lowerV2SCopies(MF);
+
   for (MachineFunction::iterator BI = MF.begin(), BE = MF.end();
                                                   BI != BE; ++BI) {
     MachineBasicBlock *MBB = &*BI;
@@ -640,99 +817,7 @@ bool SIFixSGPRCopies::runOnMachineFunction(MachineFunction &MF) {
           continue;
         }
 
-        if (isVGPRToSGPRCopy(SrcRC, DstRC, *TRI)) {
-          Register SrcReg = MI.getOperand(1).getReg();
-          if (!SrcReg.isVirtual()) {
-            MachineBasicBlock *NewBB = TII->moveToVALU(MI, MDT);
-            if (NewBB && NewBB != MBB) {
-              MBB = NewBB;
-              E = MBB->end();
-              BI = MachineFunction::iterator(MBB);
-              BE = MF.end();
-            }
-            assert((!NewBB || NewBB == I->getParent()) &&
-                   "moveToVALU did not return the right basic block");
-            break;
-          }
-
-          MachineInstr *DefMI = MRI->getVRegDef(SrcReg);
-
-          if (DefMI->isDivergent()) {
-            bool Exception = false;
-            for (auto &U : MRI->use_instructions(DstReg)) {
-              unsigned Opc = U.getOpcode();
-              if (Opc == AMDGPU::V_WRITELANE_B32 ||
-                  Opc == AMDGPU::S_BUFFER_LOAD_DWORD_IMM ||
-                  Opc == AMDGPU::BUFFER_LOAD_FORMAT_X_OFFSET ||
-                  Opc == AMDGPU::BUFFER_LOAD_FORMAT_X_IDXEN ||
-                  Opc == AMDGPU::BUFFER_LOAD_FORMAT_X_OFFEN ||
-                  Opc == AMDGPU::BUFFER_LOAD_FORMAT_X_BOTHEN ||
-                Opc == AMDGPU::IMAGE_SAMPLE_V1_V2)
-                Exception = true;
-            }
-            if (!Exception) {
-              dbgs() << *MBB << "\n" << *DefMI;
-              assert(false && "Error porcessing VGPR2SGPR copy\n");
-            }
-          }
-
-          unsigned SMovOp;
-          int64_t Imm;
-          // If we are just copying an immediate, we can replace the copy with
-          // s_mov_b32.
-          if (isSafeToFoldImmIntoCopy(&MI, DefMI, TII, SMovOp, Imm)) {
-            MI.getOperand(1).ChangeToImmediate(Imm);
-            MI.addImplicitDefUseOperands(MF);
-            MI.setDesc(TII->get(SMovOp));
-            break;
-          }
-          if (countUsesBalance(MI) < 2) {
-            uint16_t SubRegs[4] = {AMDGPU::sub0, AMDGPU::sub1, AMDGPU::sub2,
-                                   AMDGPU::sub3};
-            unsigned SubReg = MI.getOperand(1).getSubReg();
-            bool IsSubReg = SubReg != AMDGPU::NoSubRegister;
-            const TargetRegisterClass *SourceRC =
-                IsSubReg
-                    ? TRI->getSubRegClass(SrcRC, MI.getOperand(1).getSubReg())
-                    : SrcRC;
-            if (TRI->getRegSizeInBits(*SourceRC) == 32) {
-              auto MIB = BuildMI(*MBB, MI, MI.getDebugLoc(),
-                                 TII->get(AMDGPU::V_READFIRSTLANE_B32), DstReg);
-              if (IsSubReg)
-                MIB.addReg(SrcReg, 0, SubReg);
-              else
-                MIB.addReg(SrcReg);
-              I = MIB;
-            } else {
-              auto Result = BuildMI(*MBB, MI, MI.getDebugLoc(),
-                                    TII->get(AMDGPU::REG_SEQUENCE), DstReg);
-              int N = TRI->getRegSizeInBits(*SourceRC) / 32;
-              for (int i = 0; i < N; i++) {
-                Register PartialSrc = TII->buildExtractSubReg(
-                    Result, *MRI, MI.getOperand(1), SrcRC, SubRegs[i],
-                    &AMDGPU::VGPR_32RegClass);
-                Register PartialDst =
-                    MRI->createVirtualRegister(&AMDGPU::SReg_32RegClass);
-                BuildMI(*MBB, *Result, Result->getDebugLoc(),
-                        TII->get(AMDGPU::V_READFIRSTLANE_B32), PartialDst)
-                    .addReg(PartialSrc);
-                Result.addReg(PartialDst).addImm(SubRegs[i]);
-              }
-              I = Result;
-            }
-            MI.eraseFromParent();
-          } else {
-            MachineBasicBlock *NewBB = TII->moveToVALU(MI, MDT);
-            if (NewBB && NewBB != MBB) {
-              MBB = NewBB;
-              E = MBB->end();
-              BI = MachineFunction::iterator(MBB);
-              BE = MF.end();
-            }
-            assert((!NewBB || NewBB == I->getParent()) &&
-                   "moveToVALU did not return the right basic block");
-          }
-        } else if (isSGPRToVGPRCopy(SrcRC, DstRC, *TRI)) {
+        if (isSGPRToVGPRCopy(SrcRC, DstRC, *TRI)) {
           tryChangeVGPRtoSGPRinCopy(MI, TRI, TII);
         }
 
@@ -974,33 +1059,422 @@ MachineBasicBlock *SIFixSGPRCopies::processPHINode(MachineInstr &MI) {
   return CreatedBB;
 }
 
-unsigned SIFixSGPRCopies::countUsesBalance(MachineInstr &MI) {
-  unsigned NumVGPRUsers = 0;
-  unsigned NumSGPRUsers = 0;
-  if (MI.isCopy()) {
-    SetVector<MachineInstr *> Worklist, Visited;
-    Worklist.insert(&MI);
-    Visited.insert(&MI);
-    while (!Worklist.empty()) {
-      MachineInstr *Inst = Worklist.pop_back_val();
-      if (Inst->getNumExplicitDefs() != 0) {
-        Register Reg = Inst->getOperand(0).getReg();
-        for (auto &U : MRI->use_operands(Reg)) {
-          MachineInstr *UseMI = U.getParent();
-          if (Visited.insert(UseMI))
-            Worklist.insert(UseMI);
-          if (UseMI->isCopy())
-            continue;
-          const TargetRegisterClass *OpRC =
-              TII->getOpRegClass(*UseMI, UseMI->getOperandNo(&U));
-          if (!TRI->isSGPRClass(OpRC) && OpRC != &AMDGPU::VS_32RegClass &&
-              OpRC != &AMDGPU::VS_64RegClass) {
-            NumVGPRUsers++;
-          } else
-            NumSGPRUsers++;
+void SIFixSGPRCopies::collectV2SCopyInfo(MachineFunction &MF) {
+  V2SCopyInfo::clear();
+  DenseMap<MachineInstr *, UserInfo> Instructions;
+  auto needProcessing = [](MachineInstr &MI) -> bool {
+    switch (MI.getOpcode()) {
+    case AMDGPU::COPY:
+    case AMDGPU::WQM:
+    case AMDGPU::STRICT_WQM:
+    case AMDGPU::SOFT_WQM:
+    case AMDGPU::STRICT_WWM:
+      return true;
+    default:
+      return false;
+    }
+  };
+  auto trackDown = [&](const auto &self, V2SCopyInfo *Copy, MachineInstr *Root,
+                       unsigned &SScore, unsigned &VScore, unsigned &SVScore,
+                       SetVector<MachineInstr *>& Reaching,
+                       SetVector<MachineInstr *>& Visited) {
+    if (!Visited.insert(Root))
+      return;
+    //if (Instructions.find(Root) != Instructions.end()) {
+    if (UserInfo UInfo = Instructions.lookup(Root)) {
+
+      //UserInfo UInfo = Instructions.find(Root)->getSecond();
+      MachineInstr *SiblingCopy = UInfo.getCopy();
+      if (SiblingCopy != Copy->getCopy()) {
+
+        V2SCopyInfo& SInfo = V2SCopyInfo::getV2SCopy(SiblingCopy);
+
+        for (auto &S : SInfo.getSiblings()) {
+          if (UserInfo SCUInfo = Instructions.lookup(S.CommonUser)) {
+            V2SCopyInfo &SSInfo = V2SCopyInfo::getV2SCopy(S.SiblingCopy);
+            if (UInfo.Reaching(S.CommonUser)) {
+              Copy->addSibling(S.SiblingCopy, S.CommonUser, SCUInfo, true);
+              SSInfo.addSibling(Copy->getCopy(), S.CommonUser, SCUInfo);
+            } else if (SCUInfo.Reaching(Root)) {
+              V2SCopyInfo &SSInfo = V2SCopyInfo::getV2SCopy(S.SiblingCopy);
+              Copy->addSibling(SSInfo.getCopy(), Root, UInfo);
+              SSInfo.addSibling(Copy->getCopy(), Root, UInfo);
+            }
+          }
         }
+
+        SInfo.addSibling(Copy->getCopy(), Root, UInfo);
+        Copy->addSibling(SiblingCopy, Root, UInfo, true);
+
+      }
+      SScore += UInfo.getSScore();
+      VScore += UInfo.getVScore();
+      SVScore += UInfo.getSVcopies();
+    } else {
+      unsigned STmp = SScore, VTmp = VScore, SVTmp = SVScore;
+      SetVector<MachineInstr *> List;
+      //UserInfo UInfo(Copy->getCopy());
+      if (Root->getNumExplicitDefs() != 0) {
+        Register Reg = Root->getOperand(0).getReg();
+        for (auto &U : MRI->use_instructions(Reg)) {
+          //if (UserInfo Cached = Instructions[&U]) {
+           // dbgs() << "TEST\n";
+          //  SScore += Cached.getSScore();
+          //  VScore += Cached.getVScore();
+          //  SVScore += Cached.getSVcopies();
+          //  Reaching.insert(Cached.getDescendants().begin(),
+          //                  Cached.getDescendants().end());
+          //}
+          if (!U.isCopy() && !U.isRegSequence()) {
+            if (TRI->isSGPRReg(*MRI, Reg)) {
+              Copy->incSALU();
+              SScore++;
+            } else {
+              Copy->incVALU();
+              VScore++;
+            }
+          } else if (TRI->isVGPR(*MRI, U.getOperand(0).getReg())) {
+            Copy->incSVCopies();
+            SVScore++;
+          }
+          List.clear();
+          self(self, Copy, &U, SScore, VScore, SVScore, List, Visited);
+          Reaching.insert(List.begin(), List.end());
+          //UInfo.addDescendants(List);
+        }
+      }
+      //UInfo.addDescendants(Reaching);
+      //UInfo.setScores(SScore - STmp, VScore - VTmp, SVScore - SVTmp);
+      Instructions.insert(std::make_pair(
+          Root, UserInfo(Copy->getCopy(), SScore - STmp, VScore - VTmp,
+                         SVScore - SVTmp, Reaching)));
+      Reaching.insert(Root);
+    }
+  };
+  for (MachineFunction::iterator BI = MF.begin(), BE = MF.end(); BI != BE;
+       ++BI) {
+    MachineBasicBlock *MBB = &*BI;
+    for (MachineBasicBlock::iterator I = MBB->begin(), E = MBB->end(); I != E;
+         ++I) {
+      MachineInstr &MI = *I;
+      if (!needProcessing(MI))
+        continue;
+      if (!LowerSpecialCase(MI)) {
+        V2SCopyInfo CopyInfo(&MI);
+
+        SetVector<MachineInstr *> Visited, Reaching;
+        Register Reg = MI.getOperand(0).getReg();
+        unsigned S = 0, V = 0, VS = 0;
+        for (auto &U : MRI->use_instructions(Reg)) {
+          // Reg here is always scalar. Hence ++S on each user.
+          CopyInfo.incSALU();
+          trackDown(trackDown, &CopyInfo, &U, ++S, V, VS, Reaching, Visited);
+        }
+        LLVM_DEBUG(for (auto &UI
+                        : Instructions) {
+          dbgs() << "\nInst: " << *UI.getFirst();
+          UI.getSecond().dump();
+        });
+        V2SCopyInfo::addV2SCopy(&MI, CopyInfo);
       }
     }
   }
-  return NumSGPRUsers == 0 ? UINT_MAX : NumVGPRUsers/NumSGPRUsers;
+  LLVM_DEBUG(SIFixSGPRCopies::V2SCopyInfo::print());
+}
+
+// REMOVE ME: temporary stuff to check the ISel correctness!
+
+static void checkIfDefMILegal(MachineRegisterInfo *MRI, Register CopySource,
+                              Register CopyDest) {
+  MachineInstr *DefMI = MRI->getVRegDef(CopySource);
+  if (DefMI->isDivergent()) {
+    for (auto &U : MRI->use_instructions(CopyDest)) {
+      unsigned Opc = U.getOpcode();
+      if (Opc != AMDGPU::V_WRITELANE_B32 &&
+          Opc != AMDGPU::S_BUFFER_LOAD_DWORD_IMM &&
+          Opc != AMDGPU::BUFFER_LOAD_FORMAT_X_OFFSET &&
+          Opc != AMDGPU::BUFFER_LOAD_FORMAT_X_IDXEN &&
+          Opc != AMDGPU::BUFFER_LOAD_FORMAT_X_OFFEN &&
+          Opc != AMDGPU::BUFFER_LOAD_FORMAT_X_BOTHEN &&
+          Opc != AMDGPU::IMAGE_SAMPLE_V1_V2) {
+        dbgs() << *DefMI->getParent() << "\n" << DefMI;
+        assert(false && "Error porcessing VGPR2SGPR copy\n");
+      }
+    }
+  }
+}
+
+bool SIFixSGPRCopies::LowerSpecialCase(MachineInstr &MI) {
+  MachineBasicBlock *MBB = MI.getParent();
+  const TargetRegisterClass *SrcRC, *DstRC;
+  std::tie(SrcRC, DstRC) = getCopyRegClasses(MI, *TRI, *MRI);
+
+  // We return true to indicate that no further processing needed
+  if (!isVGPRToSGPRCopy(SrcRC, DstRC, *TRI))
+    return true;
+
+  Register SrcReg = MI.getOperand(1).getReg();
+  Register DstReg = MI.getOperand(0).getReg();
+  if (!SrcReg.isVirtual() || TRI->isAGPR(*MRI, SrcReg)) {
+    TII->moveToVALU(MI, MDT);
+    return true;
+  }
+
+  checkIfDefMILegal(MRI, SrcReg, DstReg);
+
+  unsigned SMovOp;
+  int64_t Imm;
+  // If we are just copying an immediate, we can replace the copy with
+  // s_mov_b32.
+  if (isSafeToFoldImmIntoCopy(&MI, MRI->getVRegDef(SrcReg), TII, SMovOp, Imm)) {
+    MI.getOperand(1).ChangeToImmediate(Imm);
+    MI.addImplicitDefUseOperands(*MBB->getParent());
+    MI.setDesc(TII->get(SMovOp));
+    return true;
+  }
+  return false;
+}
+
+void SIFixSGPRCopies::lowerV2SCopies(MachineFunction &MF) {
+  for (auto &V : V2SCopyInfo::getSorted()) {
+    MachineInstr *MI = V.getCopy();
+    MachineBasicBlock *MBB = MI->getParent();
+    if (V2SCopyInfo::getV2SCopy(MI).getScore() > 2) {
+      // We decide to turn V2S copy to v_readfirstlanre_b32
+      // remove it from the V2SCopies and remove it from all its siblings
+      LLVM_DEBUG(dbgs() << "V2S copy " << *MI
+                        << " is being turned to v_readfirstlane_b32");
+      uint16_t SubRegs[4] = {AMDGPU::sub0, AMDGPU::sub1, AMDGPU::sub2,
+                             AMDGPU::sub3};
+      Register DstReg = MI->getOperand(0).getReg();
+      Register SrcReg = MI->getOperand(1).getReg();
+      unsigned SubReg = MI->getOperand(1).getSubReg();
+      bool IsSubReg = SubReg != AMDGPU::NoSubRegister;
+      const TargetRegisterClass *SrcRC = TRI->getRegClassForReg(*MRI, SrcReg);
+      if (IsSubReg)
+        SrcRC = TRI->getSubRegClass(SrcRC, SubReg);
+      if (TRI->getRegSizeInBits(*SrcRC) == 32) {
+        auto MIB = BuildMI(*MBB, MI, MI->getDebugLoc(),
+                           TII->get(AMDGPU::V_READFIRSTLANE_B32), DstReg);
+        if (IsSubReg)
+          MIB.addReg(SrcReg, 0, SubReg);
+        else
+          MIB.addReg(SrcReg);
+      } else {
+        auto Result = BuildMI(*MBB, MI, MI->getDebugLoc(),
+                              TII->get(AMDGPU::REG_SEQUENCE), DstReg);
+        int N = TRI->getRegSizeInBits(*SrcRC) / 32;
+        for (int i = 0; i < N; i++) {
+          Register PartialSrc =
+              TII->buildExtractSubReg(Result, *MRI, MI->getOperand(1), SrcRC,
+                                      SubRegs[i], &AMDGPU::VGPR_32RegClass);
+          Register PartialDst =
+              MRI->createVirtualRegister(&AMDGPU::SReg_32RegClass);
+          BuildMI(*MBB, *Result, Result->getDebugLoc(),
+                  TII->get(AMDGPU::V_READFIRSTLANE_B32), PartialDst)
+              .addReg(PartialSrc);
+          Result.addReg(PartialDst).addImm(SubRegs[i]);
+        }
+      }
+      MI->eraseFromParent();
+    } else {
+      // We decide to convert the V2S copy
+      // and all its SSA subtree to VALU
+      // We need to update its siblings scores
+      // to reflect the change we've made
+      // Also, remove all the related bookkeeping
+      LLVM_DEBUG(dbgs() << "V2S copy " << MI << " is being turned to VALU\n");
+      V2SCopyInfo::eraseV2SCopy(MI);
+
+      TII->moveToVALU(*MI, MDT);
+    }
+  }
+}
+
+// V2SCopyInfo print methods
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD void SIFixSGPRCopies::V2SCopyInfo::dump() const {
+  print(dbgs());
+}
+
+LLVM_DUMP_METHOD void SIFixSGPRCopies::UserInfo::dump() const {
+  print(dbgs());
+}
+#endif
+
+void SIFixSGPRCopies::V2SCopyInfo::print(raw_ostream &OS) const {
+  OS << "\nRoot V2S Copy: " << *Copy << "\n\t";
+  OS << "SALU chain length: " << SALUChainLength << "\n\t";
+  OS << "VALU chain length: " << VALUChainLength << "\n\t";
+  OS << "S2V copies number: " << NumSVCopies << "\n";
+  unsigned i = 0;
+  for (auto &S : Siblings) {
+    if (++i == 1)
+      OS << "\n\tSiblings: \n";
+    OS << "\t\t" << i << ": " << *S.SiblingCopy;
+    OS << "\t\t\tCommonUser: " << *S.CommonUser;
+    OS << "\t\t\tCommon user SSA subtree has: \n\t\t\t" << S.CommonUserSALUScore
+       << " SALU users and\n\t\t\t";
+    OS << S.CommonUserVALUScore << " VALU users and\n\t\t\t";
+    OS << S.CommonUserS2VCopies << " S2V copies\n-------------------------\n";
+  }
+}
+
+void SIFixSGPRCopies::UserInfo::print(raw_ostream &OS) const {
+  dbgs() << "Info: \n\t"
+         << " S:" << SScore
+         << " V:" << VScore
+         << " SV:" << SVCopies << "\n";
+  dbgs() << "Descendants:\n\t";
+  for (auto &D : Descendants)
+    dbgs() << *D << "\t";
+}
+
+void SIFixSGPRCopies::V2SCopyInfo::print() {
+  for (auto &I : V2SCopies) {
+    I.getSecond().dump();
+  }
+}
+
+
+void SIFixSGPRCopies::testIterative(MachineFunction& MF) {
+
+  auto needProcessing = [](MachineInstr &MI) -> bool {
+    switch (MI.getOpcode()) {
+    case AMDGPU::COPY:
+    case AMDGPU::WQM:
+    case AMDGPU::STRICT_WQM:
+    case AMDGPU::SOFT_WQM:
+    case AMDGPU::STRICT_WWM:
+      return true;
+    default:
+      return false;
+    }
+  };
+  DenseMap<MachineInstr *, unsigned> SiblingPenaulty;
+  for (MachineFunction::iterator BI = MF.begin(), BE = MF.end(); BI != BE;
+       ++BI) {
+    MachineBasicBlock *MBB = &*BI;
+    for (MachineBasicBlock::iterator I = MBB->begin(), E = MBB->end(); I != E;
+         ++I) {
+      MachineInstr &MI = *I;
+      if (!needProcessing(MI))
+        continue;
+      if (!LowerSpecialCase(MI)) {
+        unsigned S = 0, V = 0, SV = 0;
+        SmallVector<MachineInstr *, 8> worklist;
+        SmallSet<MachineInstr *, 8> visited;
+        worklist.push_back(&MI);
+        unsigned i = 0;
+        SmallVector<MachineInstr *, 8>::iterator I = worklist.begin();
+        while (true) {
+          MachineInstr *Inst = *I;
+          if (visited.insert(Inst).second) {
+            (*I)->dump();
+            if (Inst->getNumExplicitDefs() != 0) {
+              Register Reg = Inst->getOperand(0).getReg();
+              for (auto &U : MRI->use_instructions(Reg)) {
+                if (!U.isCopy() && !U.isRegSequence()) {
+                  if (TRI->isSGPRReg(*MRI, Reg)) {
+                    S++;
+                  } else {
+                    V++;
+                  }
+                } else if (TRI->isVGPR(*MRI, U.getOperand(0).getReg())) {
+                  SV++;
+                }
+                worklist.push_back(&U);
+              }
+            }
+          }
+
+          if (*I == worklist.back())
+            break;
+          I = &worklist[++i];
+        }
+        dbgs() << "\nS:" << S << " V:" << V << " SV:" << SV << "\n";
+      }
+    }
+  }
+
+}
+
+
+void SIFixSGPRCopies::testIterative1(MachineFunction &MF) {
+  struct Info {
+    MachineInstr *Copy;
+    SmallVector<MachineInstr *, 8> SChain;
+    unsigned S = 0, V = 0, SV = 0;
+  };
+  DenseMap<MachineInstr *, struct Info> Copies;
+  DenseMap<MachineInstr *, unsigned> SiblingPenaulty;
+
+  auto needProcessing = [](MachineInstr &MI) -> bool {
+    switch (MI.getOpcode()) {
+    case AMDGPU::COPY:
+    case AMDGPU::WQM:
+    case AMDGPU::STRICT_WQM:
+    case AMDGPU::SOFT_WQM:
+    case AMDGPU::STRICT_WWM:
+      return true;
+    default:
+      return false;
+    }
+  };
+  for (MachineFunction::iterator BI = MF.begin(), BE = MF.end(); BI != BE;
+       ++BI) {
+    MachineBasicBlock *MBB = &*BI;
+    for (MachineBasicBlock::iterator I = MBB->begin(), E = MBB->end(); I != E;
+         ++I) {
+      MachineInstr &MI = *I;
+      if (!needProcessing(MI))
+        continue;
+      if (!LowerSpecialCase(MI)) {
+        Copies[&MI].Copy = &MI;
+        SmallVector<MachineInstr *,8> worklist;
+        DenseSet<MachineInstr *> visited;
+        worklist.push_back(&MI);
+        while (!worklist.empty()) {
+          MachineInstr* Inst = worklist.pop_back_val();
+
+          if (visited.insert(Inst).second) {
+            if (SiblingPenaulty.count(Inst))
+              SiblingPenaulty[Inst]++;
+            else
+              SiblingPenaulty[Inst] = 1;
+            if (Inst->getNumExplicitDefs() != 0) {
+              Register Reg = Inst->getOperand(0).getReg();
+              for (auto &U : MRI->use_instructions(Reg)) {
+                if (!U.isCopy() && !U.isRegSequence()) {
+                  if (TRI->isSGPRReg(*MRI, Reg)) {
+                    Copies[&MI].S++;
+                    Copies[&MI].SChain.push_back(&U);
+                  } else {
+                    Copies[&MI].V++;
+                  }
+                } else if (TRI->isVGPR(*MRI, U.getOperand(0).getReg())) {
+                  Copies[&MI].SV++;
+                }
+                worklist.push_back(&U);
+              }
+            }
+          }
+        }
+        //dbgs() << "\nS:" << S << " V:" << V << " SV:" << SV << "\n";
+      }
+    }
+  }
+  for (auto &P : Copies) {
+    auto Pred = [&](MachineInstr *A, MachineInstr *B) -> bool {
+      return SiblingPenaulty[A] < SiblingPenaulty[B];
+    };
+    dbgs() << *P.first << "\n\tS:" << P.second.S << "\n\tV:" << P.second.V
+           << "\n\tSV:" << P.second.SV;
+    dbgs() << "\nSChain:\n";
+    for (auto &U : P.second.SChain)
+      dbgs() << *U;
+    dbgs() << "Max SP: "
+           << SiblingPenaulty[*std::max_element(P.second.SChain.begin(),
+                                              P.second.SChain.end(), Pred)];
+  }
 }

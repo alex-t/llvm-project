@@ -160,7 +160,7 @@ class SOP1_1 <string opName, list<dag> pattern=[]> : SOP1_Pseudo <
 class UniformUnaryFrag<SDPatternOperator Op> : PatFrag <
   (ops node:$src0),
   (Op $src0),
-  [{ return !N->isDivergent(); }]> {
+  [{ return isUniform(N); }]> {
   // This check is unnecessary as it's captured by the result register
   // bank constraint.
   //
@@ -172,7 +172,7 @@ class UniformUnaryFrag<SDPatternOperator Op> : PatFrag <
 class UniformBinFrag<SDPatternOperator Op> : PatFrag <
   (ops node:$src0, node:$src1),
   (Op $src0, $src1),
-  [{ return !N->isDivergent(); }]> {
+  [{ return isUniform(N); }]> {
   // This check is unnecessary as it's captured by the result register
   // bank constraint.
   //
@@ -184,7 +184,7 @@ class UniformBinFrag<SDPatternOperator Op> : PatFrag <
 class DivergentBinFrag<SDPatternOperator Op> : PatFrag <
   (ops node:$src0, node:$src1),
   (Op $src0, $src1),
-  [{ return N->isDivergent(); }]> {
+  [{ return !isUniform(N); }]> {
   // This check is unnecessary as it's captured by the result register
   // bank constraint.
   //
@@ -509,7 +509,7 @@ class SelectPat<SDPatternOperator select> : PatFrag <
   (ops node:$src1, node:$src2),
   (select SCC, $src1, $src2),
   [{ return Subtarget->hasScalarCompareEq64() &&
-            N->getOperand(0)->hasOneUse() && !N->isDivergent(); }]
+            N->getOperand(0)->hasOneUse() && isUniform(N); }]
 >;
 
 let Uses = [SCC] in {

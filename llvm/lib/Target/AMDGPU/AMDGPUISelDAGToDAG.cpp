@@ -2845,7 +2845,7 @@ bool AMDGPUDAGToDAGISel::isUniform(const SDNode *N) const {
         // TODO: by example of isVGPRImm
         const TargetRegisterClass *RC =
             getOperandRegClass(*U, U.getOperandNo());
-        if (TRI->isDivergentRegClass(RC)) {
+        if (RC && TRI->isDivergentRegClass(RC)) {
           MoveToVGPRCount++;
           MCInstrDesc Desc = SI->get(Opc);
           if (Desc.isCommutable()) {
@@ -2855,7 +2855,7 @@ bool AMDGPUDAGToDAGISel::isUniform(const SDNode *N) const {
               unsigned CommutedOpNo = CommuteIdx1 - Desc.getNumDefs();
               const TargetRegisterClass *CommutedRC =
                   getOperandRegClass(*U, CommutedOpNo);
-              if (!TRI->isDivergentRegClass(CommutedRC))
+              if (CommutedRC && !TRI->isDivergentRegClass(CommutedRC))
                 MoveToVGPRCount--;
             }
           }

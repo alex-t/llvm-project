@@ -177,6 +177,11 @@ public:
     return hasSGPRs(RC) && !hasVGPRs(RC) && !hasAGPRs(RC);
   }
 
+  virtual bool isDivergentRegClass(const TargetRegisterClass* RC) const override{
+    return !isSGPRClass(RC) && RC != &AMDGPU::VS_32RegClass &&
+           RC != &AMDGPU::VS_64RegClass;
+  }
+
   /// \returns true if this class ID contains only SGPR registers
   bool isSGPRClassID(unsigned RCID) const {
     return isSGPRClass(getRegClass(RCID));
@@ -279,10 +284,6 @@ public:
   }
 
   bool isConstantPhysReg(MCRegister PhysReg) const override;
-
-  bool isDivergentRegClass(const TargetRegisterClass *RC) const override {
-    return !isSGPRClass(RC);
-  }
 
   ArrayRef<int16_t> getRegSplitParts(const TargetRegisterClass *RC,
                                      unsigned EltSize) const;

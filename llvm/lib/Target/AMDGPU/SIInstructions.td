@@ -17,12 +17,12 @@ class GCNPat<dag pattern, dag result> : Pat<pattern, result>, GCNPredicateContro
 class UniformSextInreg<ValueType VT> : PatFrag<
   (ops node:$src),
   (sext_inreg $src, VT),
-  [{ return !N->isDivergent(); }]>;
+  [{ return isUniform(N); }]>;
 
 class DivergentSextInreg<ValueType VT> : PatFrag<
   (ops node:$src),
   (sext_inreg $src, VT),
-  [{ return N->isDivergent(); }]>;
+  [{ return !isUniform(N); }]>;
 
 include "SOPInstructions.td"
 include "VOPInstructions.td"
