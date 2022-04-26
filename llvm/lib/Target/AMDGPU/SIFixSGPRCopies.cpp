@@ -1402,11 +1402,13 @@ void SIFixSGPRCopies::testIterative(MachineFunction& MF) {
 
 void SIFixSGPRCopies::testIterative1(MachineFunction &MF) {
   struct Info {
+    struct Info(MachineInstr *C) : Copy(C){};
     MachineInstr *Copy;
     SmallVector<MachineInstr *, 8> SChain;
-    unsigned S = 0, V = 0, SV = 0;
+    unsigned S = 0, SV = 0;
+    unsigned Score = 0;
   };
-  DenseMap<MachineInstr *, struct Info> Copies;
+  SmallVector<struct Info> Copies;
   DenseMap<MachineInstr *, unsigned> SiblingPenaulty;
 
   auto needProcessing = [](MachineInstr &MI) -> bool {
@@ -1430,12 +1432,12 @@ void SIFixSGPRCopies::testIterative1(MachineFunction &MF) {
       if (!needProcessing(MI))
         continue;
       if (!LowerSpecialCase(MI)) {
-        Copies[&MI].Copy = &MI;
-        SmallVector<MachineInstr *,8> worklist;
+        struct Info Info(&MI);
+        SmallVector<MachineInstr *, 8> worklist;
         DenseSet<MachineInstr *> visited;
         worklist.push_back(&MI);
         while (!worklist.empty()) {
-          MachineInstr* Inst = worklist.pop_back_val();
+          MachineInstr *Inst = worklist.pop_back_val();
 
           if (visited.insert(Inst).second) {
             if (SiblingPenaulty.count(Inst))
@@ -1447,34 +1449,38 @@ void SIFixSGPRCopies::testIterative1(MachineFunction &MF) {
               for (auto &U : MRI->use_instructions(Reg)) {
                 if (!U.isCopy() && !U.isRegSequence()) {
                   if (TRI->isSGPRReg(*MRI, Reg)) {
-                    Copies[&MI].S++;
-                    Copies[&MI].SChain.push_back(&U);
-                  } else {
-                    Copies[&MI].V++;
+                    Info.S++;
                   }
                 } else if (TRI->isVGPR(*MRI, U.getOperand(0).getReg())) {
-                  Copies[&MI].SV++;
+                  Info.SV++;
                 }
+                Info.SChain.push_back(&U);
                 worklist.push_back(&U);
               }
             }
           }
+          // dbgs() << "\nS:" << S << " V:" << V << " SV:" << SV << "\n";
         }
-        //dbgs() << "\nS:" << S << " V:" << V << " SV:" << SV << "\n";
+        Copies.push_back(Info);
       }
     }
   }
-  for (auto &P : Copies) {
+  for (auto &C : Copies) {
     auto Pred = [&](MachineInstr *A, MachineInstr *B) -> bool {
       return SiblingPenaulty[A] < SiblingPenaulty[B];
     };
-    dbgs() << *P.first << "\n\tS:" << P.second.S << "\n\tV:" << P.second.V
-           << "\n\tSV:" << P.second.SV;
-    dbgs() << "\nSChain:\n";
-    for (auto &U : P.second.SChain)
-      dbgs() << *U;
-    dbgs() << "Max SP: "
-           << SiblingPenaulty[*std::max_element(P.second.SChain.begin(),
-                                              P.second.SChain.end(), Pred)];
+    unsigned SP = SiblingPenaulty[*std::max_element(C.SChain.begin(),
+                                                    C.SChain.end(), Pred)];
+    C.Score = C.S - (C.SV + SP);
+    dbgs() << *C.Copy << "\n\tS:" << C.S << "\n\tSV:" << C.SV
+           << "\n\tSP: " << SP << "\nScore: " << C.Score << "\n";
+  }
+  struct {
+    bool operator()(struct Info I, struct Info J) { return I.Score < J.Score; }
+  } Pred;
+  std::sort(Copies.begin(), Copies.end(), Pred);
+  for (auto &C : Copies) {
+    dbgs() << "Lower VGPR to SGPR copy:\n"
+           << *C.Copy << "with score " << C.Score << "\n";
   }
 }
