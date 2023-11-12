@@ -3025,8 +3025,10 @@ unsigned SIRegisterInfo::getRegPressureLimit(const TargetRegisterClass *RC,
                                              MachineFunction &MF) const {
   const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
 
-  unsigned Occupancy = ST.getOccupancyWithLocalMemSize(MFI->getLDSSize(),
-                                                       MF.getFunction());
+  // unsigned Occupancy = ST.getOccupancyWithLocalMemSize(MFI->getLDSSize(),
+  //                                                      MF.getFunction());
+  unsigned Occupancy = MFI->getOccupancy();
+
   switch (RC->getID()) {
   default:
     return AMDGPUGenRegisterInfo::getRegPressureLimit(RC, MF);
@@ -3050,6 +3052,18 @@ unsigned SIRegisterInfo::getRegPressureSetLimit(const MachineFunction &MF,
   if (Idx == AMDGPU::RegisterPressureSets::SReg_32)
     return getRegPressureLimit(&AMDGPU::SGPR_32RegClass,
                                const_cast<MachineFunction &>(MF));
+
+  llvm_unreachable("Unexpected register pressure set!");
+}
+
+unsigned llvm::SIRegisterInfo::getRegPressureSetScore(const MachineFunction &MF,
+                                                      unsigned PSetID) const {
+  if (PSetID == AMDGPU::RegisterPressureSets::VGPR_32 ||
+      PSetID == AMDGPU::RegisterPressureSets::AGPR_32)
+    return 1;
+
+  if (PSetID == AMDGPU::RegisterPressureSets::SReg_32)
+    return 2;
 
   llvm_unreachable("Unexpected register pressure set!");
 }

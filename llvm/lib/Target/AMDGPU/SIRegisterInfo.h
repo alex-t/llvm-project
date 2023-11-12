@@ -319,6 +319,9 @@ public:
   unsigned getRegPressureSetLimit(const MachineFunction &MF,
                                   unsigned Idx) const override;
 
+  virtual unsigned getRegPressureSetScore(const MachineFunction &MF,
+                                          unsigned PSetID) const override;
+
   const int *getRegUnitPressureSets(unsigned RegUnit) const override;
 
   MCRegister getReturnAddressReg(const MachineFunction &MF) const;

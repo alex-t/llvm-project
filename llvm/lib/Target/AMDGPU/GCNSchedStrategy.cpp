@@ -109,91 +109,93 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
                     << ", SGPRExcessLimit = " << SGPRExcessLimit << "\n\n");
 }
 
-void GCNSchedStrategy::initCandidate(SchedCandidate &Cand, SUnit *SU,
-                                     bool AtTop,
-                                     const RegPressureTracker &RPTracker,
-                                     const SIRegisterInfo *SRI,
-                                     unsigned SGPRPressure,
-                                     unsigned VGPRPressure) {
-  Cand.SU = SU;
-  Cand.AtTop = AtTop;
+// void GCNSchedStrategy::initCandidate(SchedCandidate &Cand, SUnit *SU,
+//                                      bool AtTop,
+//                                      const RegPressureTracker &RPTracker,
+//                                      const SIRegisterInfo *SRI,
+//                                      unsigned SGPRPressure,
+//                                      unsigned VGPRPressure) {
+//   Cand.SU = SU;
+//   Cand.AtTop = AtTop;
 
-  if (!DAG->isTrackingPressure())
-    return;
+//   if (!DAG->isTrackingPressure())
+//     return;
 
-  // getDownwardPressure() and getUpwardPressure() make temporary changes to
-  // the tracker, so we need to pass those function a non-const copy.
-  RegPressureTracker &TempTracker = const_cast<RegPressureTracker&>(RPTracker);
+//   // getDownwardPressure() and getUpwardPressure() make temporary changes to
+//   // the tracker, so we need to pass those function a non-const copy.
+//   RegPressureTracker &TempTracker = const_cast<RegPressureTracker&>(RPTracker);
 
-  Pressure.clear();
-  MaxPressure.clear();
+//   Pressure.clear();
+//   MaxPressure.clear();
 
-  if (AtTop)
-    TempTracker.getDownwardPressure(SU->getInstr(), Pressure, MaxPressure);
-  else {
-    // FIXME: I think for bottom up scheduling, the register pressure is cached
-    // and can be retrieved by DAG->getPressureDif(SU).
-    TempTracker.getUpwardPressure(SU->getInstr(), Pressure, MaxPressure);
-  }
+//   if (AtTop) {
+//     TempTracker.getDownwardPressure(SU->getInstr(), Pressure, MaxPressure);
+//     unsigned NewSGPRPressure = Pressure[AMDGPU::RegisterPressureSets::SReg_32];
+//     unsigned NewVGPRPressure = Pressure[AMDGPU::RegisterPressureSets::VGPR_32];
 
-  unsigned NewSGPRPressure = Pressure[AMDGPU::RegisterPressureSets::SReg_32];
-  unsigned NewVGPRPressure = Pressure[AMDGPU::RegisterPressureSets::VGPR_32];
+//     // If two instructions increase the pressure of different register sets
+//     // by the same amount, the generic scheduler will prefer to schedule the
+//     // instruction that increases the set with the least amount of registers,
+//     // which in our case would be SGPRs.  This is rarely what we want, so
+//     // when we report excess/critical register pressure, we do it either
+//     // only for VGPRs or only for SGPRs.
 
-  // If two instructions increase the pressure of different register sets
-  // by the same amount, the generic scheduler will prefer to schedule the
-  // instruction that increases the set with the least amount of registers,
-  // which in our case would be SGPRs.  This is rarely what we want, so
-  // when we report excess/critical register pressure, we do it either
-  // only for VGPRs or only for SGPRs.
+//     // FIXME: Better heuristics to determine whether to prefer SGPRs or VGPRs.
+//     const unsigned MaxVGPRPressureInc = 16;
+//     bool ShouldTrackVGPRs =
+//         VGPRPressure + MaxVGPRPressureInc >= VGPRExcessLimit;
+//     bool ShouldTrackSGPRs =
+//         !ShouldTrackVGPRs && SGPRPressure >= SGPRExcessLimit;
 
-  // FIXME: Better heuristics to determine whether to prefer SGPRs or VGPRs.
-  const unsigned MaxVGPRPressureInc = 16;
-  bool ShouldTrackVGPRs = VGPRPressure + MaxVGPRPressureInc >= VGPRExcessLimit;
-  bool ShouldTrackSGPRs = !ShouldTrackVGPRs && SGPRPressure >= SGPRExcessLimit;
+//     // FIXME: We have to enter REG-EXCESS before we reach the actual threshold
+//     // to increase the likelihood we don't go over the limits.  We should
+//     // improve the analysis to look through dependencies to find the path with
+//     // the least register pressure.
 
+//     // We only need to update the RPDelta for instructions that increase
+//     // register pressure. Instructions that decrease or keep reg pressure the
+//     // same will be marked as RegExcess in tryCandidate() when they are compared
+//     // with instructions that increase the register pressure.
+//     if (ShouldTrackVGPRs && NewVGPRPressure >= VGPRExcessLimit) {
+//       HasHighPressure = true;
+//       Cand.RPDelta.Excess =
+//           PressureChange(AMDGPU::RegisterPressureSets::VGPR_32);
+//       Cand.RPDelta.Excess.setUnitInc(NewVGPRPressure - VGPRExcessLimit);
+//     }
 
-  // FIXME: We have to enter REG-EXCESS before we reach the actual threshold
-  // to increase the likelihood we don't go over the limits.  We should improve
-  // the analysis to look through dependencies to find the path with the least
-  // register pressure.
+//     if (ShouldTrackSGPRs && NewSGPRPressure >= SGPRExcessLimit) {
+//       HasHighPressure = true;
+//       Cand.RPDelta.Excess =
+//           PressureChange(AMDGPU::RegisterPressureSets::SReg_32);
+//       Cand.RPDelta.Excess.setUnitInc(NewSGPRPressure - SGPRExcessLimit);
+//     }
 
-  // We only need to update the RPDelta for instructions that increase register
-  // pressure. Instructions that decrease or keep reg pressure the same will be
-  // marked as RegExcess in tryCandidate() when they are compared with
-  // instructions that increase the register pressure.
-  if (ShouldTrackVGPRs && NewVGPRPressure >= VGPRExcessLimit) {
-    HasHighPressure = true;
-    Cand.RPDelta.Excess = PressureChange(AMDGPU::RegisterPressureSets::VGPR_32);
-    Cand.RPDelta.Excess.setUnitInc(NewVGPRPressure - VGPRExcessLimit);
-  }
+//     // Register pressure is considered 'CRITICAL' if it is approaching a value
+//     // that would reduce the wave occupancy for the execution unit.  When
+//     // register pressure is 'CRITICAL', increasing SGPR and VGPR pressure both
+//     // has the same cost, so we don't need to prefer one over the other.
 
-  if (ShouldTrackSGPRs && NewSGPRPressure >= SGPRExcessLimit) {
-    HasHighPressure = true;
-    Cand.RPDelta.Excess = PressureChange(AMDGPU::RegisterPressureSets::SReg_32);
-    Cand.RPDelta.Excess.setUnitInc(NewSGPRPressure - SGPRExcessLimit);
-  }
+//     int SGPRDelta = NewSGPRPressure - SGPRCriticalLimit;
+//     int VGPRDelta = NewVGPRPressure - VGPRCriticalLimit;
 
-  // Register pressure is considered 'CRITICAL' if it is approaching a value
-  // that would reduce the wave occupancy for the execution unit.  When
-  // register pressure is 'CRITICAL', increasing SGPR and VGPR pressure both
-  // has the same cost, so we don't need to prefer one over the other.
-
-  int SGPRDelta = NewSGPRPressure - SGPRCriticalLimit;
-  int VGPRDelta = NewVGPRPressure - VGPRCriticalLimit;
-
-  if (SGPRDelta >= 0 || VGPRDelta >= 0) {
-    HasHighPressure = true;
-    if (SGPRDelta > VGPRDelta) {
-      Cand.RPDelta.CriticalMax =
-        PressureChange(AMDGPU::RegisterPressureSets::SReg_32);
-      Cand.RPDelta.CriticalMax.setUnitInc(SGPRDelta);
-    } else {
-      Cand.RPDelta.CriticalMax =
-        PressureChange(AMDGPU::RegisterPressureSets::VGPR_32);
-      Cand.RPDelta.CriticalMax.setUnitInc(VGPRDelta);
-    }
-  }
-}
+//     if (SGPRDelta >= 0 || VGPRDelta >= 0) {
+//       HasHighPressure = true;
+//       if (SGPRDelta > VGPRDelta) {
+//         Cand.RPDelta.CriticalMax =
+//             PressureChange(AMDGPU::RegisterPressureSets::SReg_32);
+//         Cand.RPDelta.CriticalMax.setUnitInc(SGPRDelta);
+//       } else {
+//         Cand.RPDelta.CriticalMax =
+//             PressureChange(AMDGPU::RegisterPressureSets::VGPR_32);
+//         Cand.RPDelta.CriticalMax.setUnitInc(VGPRDelta);
+//       }
+//     }
+//   } else {
+//     RPTracker.getUpwardPressureDelta(
+//         Cand.SU->getInstr(), DAG->getPressureDiff(Cand.SU), Cand.RPDelta,
+//         DAG->getRegionCriticalPSets(), DAG->getRegPressure().MaxSetPressure);
+//   }
+// }
 
 // This function is mostly cut and pasted from
 // GenericScheduler::pickNodeFromQueue()
@@ -213,8 +215,10 @@ void GCNSchedStrategy::pickNodeFromQueue(SchedBoundary &Zone,
   for (SUnit *SU : Q) {
 
     SchedCandidate TryCand(ZonePolicy);
-    initCandidate(TryCand, SU, Zone.isTop(), RPTracker, SRI,
-                  SGPRPressure, VGPRPressure);
+    // initCandidate(TryCand, SU, Zone.isTop(), RPTracker, SRI,
+    //               SGPRPressure, VGPRPressure);
+    RegPressureTracker &TempTracker = const_cast<RegPressureTracker&>(RPTracker);
+    initCandidate(TryCand, SU, Zone.isTop(), RPTracker, TempTracker);
     // Pass SchedBoundary only when comparing nodes from the same boundary.
     SchedBoundary *ZoneArg = Cand.AtTop == TryCand.AtTop ? &Zone : nullptr;
     tryCandidate(Cand, TryCand, ZoneArg);

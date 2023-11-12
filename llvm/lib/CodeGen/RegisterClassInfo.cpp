@@ -232,5 +232,8 @@ unsigned RegisterClassInfo::computePSetLimit(unsigned Idx) const {
   if (NAllocatableRegs == 0)
     return RegPressureSetLimit;
   unsigned NReserved = RC->getNumRegs() - NAllocatableRegs;
-  return RegPressureSetLimit - TRI->getRegClassWeight(RC).RegWeight * NReserved;
+  unsigned RCWeight = TRI->getRegClassWeight(RC).RegWeight;
+  if (NReserved * RCWeight > RegPressureSetLimit)
+    return RegPressureSetLimit;
+  return RegPressureSetLimit - RCWeight * NReserved;
 }

@@ -47,10 +47,10 @@ protected:
                          const RegPressureTracker &RPTracker,
                          SchedCandidate &Cand);
 
-  void initCandidate(SchedCandidate &Cand, SUnit *SU,
-                     bool AtTop, const RegPressureTracker &RPTracker,
-                     const SIRegisterInfo *SRI,
-                     unsigned SGPRPressure, unsigned VGPRPressure);
+  // void initCandidate(SchedCandidate &Cand, SUnit *SU,
+  //                    bool AtTop, const RegPressureTracker &RPTracker,
+  //                    const SIRegisterInfo *SRI,
+  //                    unsigned SGPRPressure, unsigned VGPRPressure);
 
   std::vector<unsigned> Pressure;
 
