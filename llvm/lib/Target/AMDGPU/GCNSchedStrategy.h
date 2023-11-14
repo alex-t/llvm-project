@@ -51,6 +51,8 @@ protected:
   //                    bool AtTop, const RegPressureTracker &RPTracker,
   //                    const SIRegisterInfo *SRI,
   //                    unsigned SGPRPressure, unsigned VGPRPressure);
+  virtual bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand,
+                            SchedBoundary *Zone) const override;
 
   std::vector<unsigned> Pressure;
 
