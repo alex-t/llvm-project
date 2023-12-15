@@ -1044,13 +1044,22 @@ GCNUserSGPRUsageInfo::GCNUserSGPRUsageInfo(const Function &F,
   const bool HasCalls = F.hasFnAttribute("amdgpu-calls");
   // FIXME: This attribute is a hack, we just need an analysis on the function
   // to look for allocas.
+  bool IsAmdHsaOrMesa = ST.isAmdHsaOrMesa(F);
   const bool HasStackObjects = F.hasFnAttribute("amdgpu-stack-objects");
+  // TODO: This could be refined a lot. The attribute is a poor way of
+  // detecting calls or stack objects that may require it before argument
+  // lowering.
+  if (ST.hasFlatAddressSpace() && AMDGPU::isEntryFunctionCC(CC) &&
+      (IsAmdHsaOrMesa || ST.enableFlatScratch()) &&
+      (HasCalls || HasStackObjects || ST.enableFlatScratch()) &&
+      !ST.flatScratchIsArchitected()) {
+    FlatScratchInit = true;
+  }
 
   if (IsKernel && (!F.arg_empty() || ST.getImplicitArgNumBytes(F) != 0))
     KernargSegmentPtr = true;
-
-  bool IsAmdHsaOrMesa = ST.isAmdHsaOrMesa(F);
-  if (IsAmdHsaOrMesa && !ST.enableFlatScratch())
+  
+  if (IsAmdHsaOrMesa && !ST.enableFlatScratch() && !hasFlatScratchInit())
     PrivateSegmentBuffer = true;
   else if (ST.isMesaGfxShader(F))
     ImplicitBufferPtr = true;
@@ -1067,15 +1076,6 @@ GCNUserSGPRUsageInfo::GCNUserSGPRUsageInfo(const Function &F,
       DispatchID = true;
   }
 
-  // TODO: This could be refined a lot. The attribute is a poor way of
-  // detecting calls or stack objects that may require it before argument
-  // lowering.
-  if (ST.hasFlatAddressSpace() && AMDGPU::isEntryFunctionCC(CC) &&
-      (IsAmdHsaOrMesa || ST.enableFlatScratch()) &&
-      (HasCalls || HasStackObjects || ST.enableFlatScratch()) &&
-      !ST.flatScratchIsArchitected()) {
-    FlatScratchInit = true;
-  }
 
   if (hasImplicitBufferPtr())
     NumUsedUserSGPRs += getNumUserSGPRForField(ImplicitBufferPtrID);

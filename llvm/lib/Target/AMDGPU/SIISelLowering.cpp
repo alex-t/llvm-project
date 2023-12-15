@@ -2476,6 +2476,11 @@ static void reservePrivateMemoryRegs(const TargetMachine &TM,
 
       Register PrivateSegmentBufferReg =
           Info.getPreloadedReg(AMDGPUFunctionArgInfo::PRIVATE_SEGMENT_BUFFER);
+      if (!PrivateSegmentBufferReg) {
+        Register FlatScratchReg = Info.getPreloadedReg(AMDGPUFunctionArgInfo::FLAT_SCRATCH_INIT);
+        PrivateSegmentBufferReg = TRI.getMatchingSuperReg(
+              FlatScratchReg, AMDGPU::sub0_sub1, &AMDGPU::SReg_128RegClass);
+      }
       Info.setScratchRSrcReg(PrivateSegmentBufferReg);
     } else {
       unsigned ReservedBufferReg = TRI.reservedPrivateSegmentBufferReg(MF);
