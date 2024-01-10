@@ -631,15 +631,22 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
   // uses of the SRSRC.
   Register ScratchRsrcReg;
 
-  Register FlatScratchReg = MFI->getPreloadedReg(AMDGPUFunctionArgInfo::FLAT_SCRATCH_INIT);
-  if (FlatScratchReg) {
-     ScratchRsrcReg = AMDGPU::SGPR0_SGPR1_SGPR2_SGPR3;
-     I = BuildMI(MBB, I, DL, TII->get(AMDGPU::COPY), TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub0_sub1))
-     .addReg(FlatScratchReg);
-     I = BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOVK_I32), TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub2))
-     .addImm(0);
-     I = BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOV_B32), TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub3))
-     .addImm(0xf000);
+  if (Register FlatScratchReg =
+          MFI->getPreloadedReg(AMDGPUFunctionArgInfo::FLAT_SCRATCH_INIT)) {
+    if (Register PreloadedScratchRsrcReg = MFI->getPreloadedReg(
+            AMDGPUFunctionArgInfo::PRIVATE_SEGMENT_BUFFER)) {
+
+      ScratchRsrcReg = PreloadedScratchRsrcReg;
+      I = BuildMI(MBB, I, DL, TII->get(AMDGPU::COPY),
+                  TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub0_sub1))
+              .addReg(FlatScratchReg);
+      I = BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOVK_I32),
+                  TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub2))
+              .addImm(0);
+      I = BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOV_B32),
+                  TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub3))
+              .addImm(0xf000);
+    }
   }
 
   if (!ST.enableFlatScratch() && !ScratchRsrcReg)
@@ -668,7 +675,10 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
     }
   }
 
+<<<<<<< HEAD
  
+=======
+>>>>>>> 617521d4db3f (SWDEV-409366_WIP)
   // We found the SRSRC first because it needs four registers and has an
   // alignment requirement. If the SRSRC that we found is clobbering with
   // the scratch wave offset, which may be in a fixed SGPR or a free SGPR
