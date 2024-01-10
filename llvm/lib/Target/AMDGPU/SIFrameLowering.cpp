@@ -675,10 +675,6 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
     }
   }
 
-<<<<<<< HEAD
- 
-=======
->>>>>>> 617521d4db3f (SWDEV-409366_WIP)
   // We found the SRSRC first because it needs four registers and has an
   // alignment requirement. If the SRSRC that we found is clobbering with
   // the scratch wave offset, which may be in a fixed SGPR or a free SGPR
