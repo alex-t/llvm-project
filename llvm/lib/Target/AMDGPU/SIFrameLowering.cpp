@@ -617,6 +617,11 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
 
   Register PreloadedScratchWaveOffsetReg = MFI->getPreloadedReg(
       AMDGPUFunctionArgInfo::PRIVATE_SEGMENT_WAVE_BYTE_OFFSET);
+  
+  // Debug location must be unknown since the first debug location is used to
+  // determine the end of the prologue.
+  DebugLoc DL;
+  MachineBasicBlock::iterator I = MBB.begin();
 
   // We need to do the replacement of the private segment buffer register even
   // if there are no stack objects. There could be stores to undef or a
@@ -625,7 +630,19 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
   // This will return `Register()` in cases where there are no actual
   // uses of the SRSRC.
   Register ScratchRsrcReg;
-  if (!ST.enableFlatScratch())
+
+  Register FlatScratchReg = MFI->getPreloadedReg(AMDGPUFunctionArgInfo::FLAT_SCRATCH_INIT);
+  if (FlatScratchReg) {
+     ScratchRsrcReg = AMDGPU::SGPR0_SGPR1_SGPR2_SGPR3;
+     I = BuildMI(MBB, I, DL, TII->get(AMDGPU::COPY), TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub0_sub1))
+     .addReg(FlatScratchReg);
+     I = BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOVK_I32), TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub2))
+     .addImm(0);
+     I = BuildMI(MBB, I, DL, TII->get(AMDGPU::S_MOV_B32), TRI->getSubReg(ScratchRsrcReg, AMDGPU::sub3))
+     .addImm(0xf000);
+  }
+
+  if (!ST.enableFlatScratch() && !ScratchRsrcReg)
     ScratchRsrcReg = getEntryFunctionReservedScratchRsrcReg(MF);
 
   // Make the selected register live throughout the function.
@@ -651,11 +668,7 @@ void SIFrameLowering::emitEntryFunctionPrologue(MachineFunction &MF,
     }
   }
 
-  // Debug location must be unknown since the first debug location is used to
-  // determine the end of the prologue.
-  DebugLoc DL;
-  MachineBasicBlock::iterator I = MBB.begin();
-
+ 
   // We found the SRSRC first because it needs four registers and has an
   // alignment requirement. If the SRSRC that we found is clobbering with
   // the scratch wave offset, which may be in a fixed SGPR or a free SGPR
