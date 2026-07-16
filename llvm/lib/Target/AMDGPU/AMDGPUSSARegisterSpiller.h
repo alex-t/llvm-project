@@ -169,6 +169,23 @@ class AMDGPUSSARegisterSpiller : public MachineFunctionPass {
   /// Uses IsVGPRPass class member (set before calling).
   bool processFunction(MachineFunction &MF, unsigned RPLimit);
 
+  /// ACL (around-call-liver) preserved-RP pass for the current file
+  /// (IsVGPRPass). For each call C in program order, if the width-weighted set
+  /// of pinned vregs live across C exceeds the callee-saved capacity k_cs, spill
+  /// the excess (clean candidates first, then farthest next use) by
+  /// store-at-def + free-across-C. The free point (KillIdx) is chosen per value:
+  ///   - if V has a use that dominates C (a pre-call use on the path to C), kill
+  ///     at the DEEPEST such use — V keeps its register up to there, is dead
+  ///     across C, and post-call uses reload after C;
+  ///   - otherwise (no C-dominating use) kill at C itself, which makes V dead
+  ///     exactly at C;
+  ///   - a value read AT C (call operand/target) is unspillable for C and only
+  ///     contributes to the infeasibility floor.
+  /// Runs before the ordinary total-RP processFunction pass for the same file.
+  /// Returns true if any spill was performed. Relies on PinnedVRegs / the k_cs
+  /// caps computed by computePinnedAndCap(MF).
+  bool processACLCalls(MachineFunction &MF);
+
   /// Validates that final register pressure is within limits after all
   /// spilling. This is a temporary validation check until we properly handle
   /// clean path reloads.
@@ -216,6 +233,15 @@ class AMDGPUSSARegisterSpiller : public MachineFunctionPass {
                       MachineBasicBlock::reverse_iterator I,
                       VRegMaskPairSet &Active, unsigned CurRP,
                       unsigned RPLimit);
+
+  /// Spill one value with a caller-chosen free point: store at its definition
+  /// (EXEC-safe), then free the register from \p KillIdx onward and place
+  /// reloads at the uses reachable from there (dominance-ordered, SSA repaired
+  /// inline). \p KillIdx is the sole knob that decides where the register
+  /// becomes free — the existing walk derives it from the high-pressure point;
+  /// the ACL per-call driver derives it relative to a call. Store placement is
+  /// always at the def and is never affected by \p KillIdx.
+  void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx);
 
   /// Stores register to stack slot right after its definition (when EXEC is
   /// full). This avoids EXEC drift issues by ensuring all lanes are stored

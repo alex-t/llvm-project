@@ -571,85 +571,6 @@ bool AMDGPUSSARegisterSpiller::processFunction(MachineFunction &MF,
         // contribution is removed from P forward. We continue walking forward
         // and will see lower pressure at subsequent instructions.
       }
-
-      // Preserved-register pressure gate (second RP dimension). A value that
-      // crosses ANY call is pinned to callee-saved registers for its whole live
-      // range. So at every point the number of such pinned values live here must
-      // fit the callee-saved capacity k_cs, independently of the total-RP gate
-      // above. This is a per-POINT subset pressure over the pinned set — not a
-      // per-call-slot snapshot (a long pinned range occupies a CSR far from any
-      // call). Spill furthest-next-use pinned values wherever preservedRP > k_cs.
-      if (unsigned PresRP =
-              EnableAMDGPUSSAACLColoring ? computePreservedRP(MI) : 0;
-          PresRP > PreservedLimit) {
-        LLVM_DEBUG(dbgs() << "  " << (IsVGPRPass ? "VGPR" : "SGPR")
-                          << " preserved-RP " << PresRP << " > k_cs "
-                          << PreservedLimit << ", spilling pinned values\n");
-        GCNRegPressure::RegKind Kind =
-            IsVGPRPass ? GCNRegPressure::VGPR : GCNRegPressure::SGPR;
-        SlotIndex Slot = LIS->getInstructionIndex(MI).getRegSlot();
-        VRegMaskPairSet PinnedLive =
-            convertLiveRegs(llvm::getLiveRegs(Slot, *LIS, *MRI, Kind));
-        PinnedLive.set_subtract(ReloadedRegs);
-        // Keep only pinned (crosses-a-call) values; drop this MI's defs.
-        VRegMaskPairSet Drop;
-        for (const VRegMaskPair &VMP : PinnedLive)
-          if (!PinnedVRegs.contains(VMP.getVReg()))
-            Drop.insert(VMP);
-        for (const MachineOperand &MO : MI.defs())
-          if (MO.getReg().isVirtual())
-            Drop.insert(VRegMaskPair(MO, TRI, MRI));
-        PinnedLive.set_subtract(Drop);
-
-        // [NEXTCALL] Geometry probe: at this trigger point, find the NEXT call
-        // downward (>= Slot) and count how many of the live-pinned candidates
-        // actually cross it (live at that call slot) and, of those, how many are
-        // "clean" for that call: no use in the window (Slot, callSlot] -> spilling
-        // removes the crossing in one shot. Confirms whether "next call downward"
-        // is a clean single target for the preserved-RP spill comparator.
-        LLVM_DEBUG({
-          SlotIndex NextCall;
-          const MachineInstr *NextCallMI = nullptr;
-          for (MachineBasicBlock &SB : MF)
-            for (MachineInstr &SI : SB) {
-              if (!SI.isCall())
-                continue;
-              SlotIndex CS = LIS->getInstructionIndex(SI).getRegSlot();
-              if (CS >= Slot && (!NextCallMI || CS < NextCall)) {
-                NextCall = CS;
-                NextCallMI = &SI;
-              }
-            }
-          if (NextCallMI) {
-            unsigned CrossN = 0, CleanN = 0;
-            for (const VRegMaskPair &VMP : PinnedLive) {
-              Register V = VMP.getVReg();
-              if (!LIS->getInterval(V).liveAt(NextCall))
-                continue;
-              unsigned W = VMP.getSizeInRegs(TRI);
-              CrossN += W;
-              bool UseInWindow = false;
-              for (MachineInstr &U : MRI->use_nodbg_instructions(V)) {
-                SlotIndex UI = LIS->getInstructionIndex(U).getRegSlot();
-                if (UI > Slot && UI <= NextCall) {
-                  UseInWindow = true;
-                  break;
-                }
-              }
-              if (!UseInWindow)
-                CleanN += W;
-            }
-            dbgs() << "  [NEXTCALL] trigger@" << Slot << " nextCall@" << NextCall
-                   << " pinnedLiveHere=" << PinnedLive.size()
-                   << " crossNextCall=" << CrossN << " cleanForNextCall=" << CleanN
-                   << " shedTarget=" << (PresRP - PreservedLimit) << "\n";
-          }
-        });
-
-        MachineBasicBlock::reverse_iterator ReverseI(std::next(I));
-        if (spillAndReload(*MBB, ReverseI, PinnedLive, PresRP, PreservedLimit))
-          Changed = true;
-      }
     }
   }
 
@@ -711,6 +632,156 @@ unsigned AMDGPUSSARegisterSpiller::maxPreservedClique() const {
     }
   }
   return Clique;
+}
+
+bool AMDGPUSSARegisterSpiller::processACLCalls(MachineFunction &MF) {
+  // Per-call preserved-RP (ACL) pass for the current file (IsVGPRPass). For each
+  // call C, the set of pinned vregs (crosses any call) live across C in this
+  // file must fit the callee-saved capacity k_cs. Where it does not, spill the
+  // excess by store-at-def + free-across-C, choosing the free point (KillIdx)
+  // relative to C so the spilled value stops occupying a register at C. See
+  // ACL_Pass_and_CallSite_Capacity.md "Part 1b".
+  if (PinnedVRegs.empty())
+    return false;
+
+  // SSA repair + RP tracking machinery, same as processFunction sets up. This
+  // pass runs before processFunction, so it must initialize them itself; both
+  // are recreated per pass by design (they cache per-run state).
+  SSAUpdater = std::make_unique<MachineLaneSSAUpdater>(MF, *LIS, *DT, *TRI);
+  RPTracker = std::make_unique<GCNUpwardRPTracker>(*LIS);
+  PreservedLimit = IsVGPRPass ? VGPRPreservedCap : SGPRPreservedCap;
+
+  const unsigned KCS = IsVGPRPass ? VGPRPreservedCap : SGPRPreservedCap;
+
+  // Collect call slots in program order (regmask calls only — the preserved-RP
+  // constraint is a real-call property; implicit clobbers are handled by the
+  // coloring IsFree legality check, not here).
+  SmallVector<std::pair<SlotIndex, MachineInstr *>, 8> Calls;
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB)
+      if (MI.isCall())
+        Calls.push_back({LIS->getInstructionIndex(MI).getRegSlot(), &MI});
+  llvm::sort(Calls, [](const auto &A, const auto &B) { return A.first < B.first; });
+
+  bool Changed = false;
+
+  auto Width = [&](Register V) {
+    return TRI->getRegSizeInBits(*MRI->getRegClass(V)) / 32u;
+  };
+  auto RightFile = [&](Register V) {
+    const TargetRegisterClass *RC = MRI->getRegClass(V);
+    return IsVGPRPass ? (TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC))
+                      : TRI->isSGPRClass(RC);
+  };
+
+  for (auto &[CS, CallMI] : Calls) {
+    // Candidate = pinned vreg of this file, live across C.
+    struct Cand {
+      Register V;
+      unsigned W;
+      bool Clean;           // every use is dominated by C (no pre-call/sibling use)
+      unsigned NextUseDist; // farthest-first ordering key
+    };
+    SmallVector<Cand, 16> Cands;
+    unsigned CrossRP = 0, FloorRP = 0;
+
+    // Values read AT the call (operands): unspillable for C.
+    DenseSet<Register> UsedAtC;
+    for (const MachineOperand &MO : CallMI->uses())
+      if (MO.isReg() && MO.getReg().isVirtual())
+        UsedAtC.insert(MO.getReg());
+
+    for (Register V : PinnedVRegs) {
+      if (!LIS->hasInterval(V) || !RightFile(V))
+        continue;
+      const LiveInterval &LI = LIS->getInterval(V);
+      if (!LI.liveAt(CS))
+        continue;
+      unsigned W = Width(V);
+      CrossRP += W;
+
+      if (UsedAtC.contains(V)) {
+        FloorRP += W; // read by the call itself -> cannot relieve C
+        continue;
+      }
+
+      // "clean for C" = every use is dominated by C, i.e. strictly after C on
+      // every path. Such a value has no pre-call or sibling-path register need,
+      // so freeing it across C reloads only post-call uses. A use NOT dominated
+      // by C (before C, or on a sibling branch) makes it "both-sides".
+      // Dominance -- NOT SlotIndex order, which is literal layout order and only
+      // meaningful within a single block.
+      bool Clean = true;
+      for (MachineInstr &U : MRI->use_nodbg_instructions(V))
+        if (!DT->dominates(CallMI, &U)) {
+          Clean = false;
+          break;
+        }
+      Cands.push_back({V, W, Clean, 0});
+    }
+
+    if (CrossRP <= KCS)
+      continue;
+
+    unsigned Excess = CrossRP - KCS;
+    if (FloorRP > KCS) {
+      LLVM_DEBUG(dbgs() << "  [ACL] call@" << CS << " INFEASIBLE: floorRP="
+                        << FloorRP << " > k_cs=" << KCS << " (unspillable "
+                        << "values used at the call exceed capacity)\n");
+      // No amount of spilling can relieve C; leave it and let later stages
+      // report. Do not loop.
+      continue;
+    }
+
+    // Order: clean first, then farthest-next-use (measured from C).
+    for (Cand &Cd : Cands)
+      Cd.NextUseDist = NU->getNextUseDistance(
+          CallMI->getIterator(),
+          VRegMaskPair(Cd.V, MRI->getMaxLaneMaskForVReg(Cd.V)));
+    llvm::sort(Cands, [](const Cand &A, const Cand &B) {
+      if (A.Clean != B.Clean)
+        return A.Clean; // clean candidates first
+      return A.NextUseDist > B.NextUseDist; // farthest next use first
+    });
+
+    LLVM_DEBUG(dbgs() << "  [ACL] call@" << CS << " crossRP=" << CrossRP
+                      << " k_cs=" << KCS << " excess=" << Excess
+                      << " floorRP=" << FloorRP << " cands=" << Cands.size()
+                      << "\n");
+
+    unsigned Shed = 0;
+    for (const Cand &Cd : Cands) {
+      if (Shed >= Excess)
+        break;
+
+      // Kill point relative to C. Killing at C's slot makes V dead exactly at C
+      // (measured: liveAt(CS) 1->0), which frees it across C. But if V has a use
+      // that DOMINATES C (a real pre-call use on the path to C), killing at C
+      // would also free the register before that use. So place the kill at the
+      // DEEPEST C-dominating use instead: V keeps its register up to that use,
+      // is dead across C, and post-call uses (dominated by C) reload after C.
+      // Uses that dominate C are totally ordered (they lie on one path to C), so
+      // "deepest" is well defined. If no use dominates C (clean, or the only
+      // non-post-call uses are on sibling paths), kill at C. Dominance -- never
+      // SlotIndex order.
+      MachineInstr *DeepestPre = nullptr;
+      for (MachineInstr &U : MRI->use_nodbg_instructions(Cd.V)) {
+        if (!DT->dominates(&U, CallMI))
+          continue; // not a pre-call use on the path to C
+        if (!DeepestPre || DT->dominates(DeepestPre, &U))
+          DeepestPre = &U; // U is at least as deep as the current best
+      }
+      SlotIndex KillIdx =
+          DeepestPre ? LIS->getInstructionIndex(*DeepestPre).getRegSlot() : CS;
+
+      VRegMaskPair VMP(Cd.V, MRI->getMaxLaneMaskForVReg(Cd.V));
+      spillOneVMP(VMP, KillIdx);
+      Shed += Cd.W;
+      Changed = true;
+    }
+  }
+
+  return Changed;
 }
 
 void AMDGPUSSARegisterSpiller::sortRegSetByNextUse(
@@ -1031,25 +1102,6 @@ bool AMDGPUSSARegisterSpiller::spillAndReload(
   // Step 2: For each selected VMP, perform atomic spill+reload+SSA repair
   // IMPORTANT: Process one VMP at a time to keep MIR valid
   for (const auto &VMP : ToSpill) {
-    Register VReg = VMP.getVReg();
-    LaneBitmask Mask = VMP.getLaneMask();
-
-    LLVM_DEBUG({
-      StringRef Name = MRI->getVRegName(VReg);
-      dbgs() << "\nspillAndReload(): Processing VMP ";
-      if (!Name.empty())
-        dbgs() << "%" << Name;
-      else
-        dbgs() << printReg(VReg, TRI);
-      dbgs() << " with mask " << PrintLaneMask(Mask) << "\n";
-    });
-
-    // Step 2a: Store register at definition point (when EXEC is full)
-    // This avoids EXEC drift issues by ensuring all lanes are stored before
-    // any divergent control flow can modify EXEC
-    MachineInstr *DefStoreMI = spillAtDefinition(VMP);
-    assert(DefStoreMI && "Virtual register must have a definition in SSA form");
-
     // Step 2b: Set virtual "spill point" at the high-pressure point
     // This is where RP exceeded, but we don't prune the LiveInterval here.
     // The LiveInterval will be shrunk later by shrinkToUses() after all reloads
@@ -1089,21 +1141,7 @@ bool AMDGPUSSARegisterSpiller::spillAndReload(
       }
     }
 
-    LLVM_DEBUG({
-      dbgs() << "spillAndReload(): Virtual spill point (KillIdx): " << KillIdx
-             << "\n";
-    });
-
-    // Step 2c: Get stack slot for reload phase
-    int FI = assignVirt2StackSlot(VMP);
-
-    // Step 2d: Build SpillInfo with dom-groups and emit reloads
-    SpillInfo Info;
-    Info.SpilledVMP = VMP;
-    Info.KillIdx = KillIdx;
-    Info.FrameIndex = FI;
-    buildDomGroupsForSpill(Info);
-    emitReloadsAndRepairSSA(Info);
+    spillOneVMP(VMP, KillIdx);
   }
 
   LLVM_DEBUG(dbgs() << "spillAndReload(): Completed, spilled " << ToSpill.size()
@@ -1111,6 +1149,41 @@ bool AMDGPUSSARegisterSpiller::spillAndReload(
   LLVM_DEBUG(dbgs() << "===================================\n\n");
 
   return true;
+}
+
+void AMDGPUSSARegisterSpiller::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx) {
+  LLVM_DEBUG({
+    Register VReg = VMP.getVReg();
+    StringRef Name = MRI->getVRegName(VReg);
+    dbgs() << "\nspillOneVMP(): Processing VMP ";
+    if (!Name.empty())
+      dbgs() << "%" << Name;
+    else
+      dbgs() << printReg(VReg, TRI);
+    dbgs() << " with mask " << PrintLaneMask(VMP.getLaneMask())
+           << ", KillIdx=" << KillIdx << "\n";
+  });
+
+  // Step 2a: Store register at definition point (when EXEC is full).
+  // This avoids EXEC drift issues by ensuring all lanes are stored before any
+  // divergent control flow can modify EXEC. Store placement is fixed at the def
+  // and is independent of KillIdx (which only decides where the reg is freed).
+  MachineInstr *DefStoreMI = spillAtDefinition(VMP);
+  assert(DefStoreMI && "Virtual register must have a definition in SSA form");
+  (void)DefStoreMI;
+
+  // Step 2c: Get stack slot for reload phase
+  int FI = assignVirt2StackSlot(VMP);
+
+  // Step 2d: Build SpillInfo with dom-groups and emit reloads. Reloads are
+  // placed at uses reachable from KillIdx (dominance-ordered), so uses above
+  // KillIdx keep the original register and are not reloaded.
+  SpillInfo Info;
+  Info.SpilledVMP = VMP;
+  Info.KillIdx = KillIdx;
+  Info.FrameIndex = FI;
+  buildDomGroupsForSpill(Info);
+  emitReloadsAndRepairSSA(Info);
 }
 
 // ============================================================================
@@ -2247,45 +2320,41 @@ bool AMDGPUSSARegisterSpiller::runOnMachineFunction(MachineFunction &MF) {
                     << ", SGPR=" << ST.getMaxNumSGPRs(MF) << ")\n");
 
   // Classify pinned (crosses-a-call) vregs and compute per-file callee-saved
-  // capacity k_cs, once per function. Drives the preserved-RP gate.
-  computePinnedAndCap(MF);
+  // capacity k_cs. Only the ACL passes consume this, so skip it entirely when
+  // ACL is off — the spiller then behaves exactly as the original two total-RP
+  // passes with no ACL-related work.
+  if (EnableAMDGPUSSAACLColoring)
+    computePinnedAndCap(MF);
 
   // Two-pass approach:
   // Pass 1: Process SGPRs (spilled to VGPR lanes if needed)
   // Pass 2: Process VGPRs (spilled to memory)
 
-  // Pass 1: SGPR Spilling
-  LLVM_DEBUG(dbgs() << "\n=== Pass 1: Processing SGPRs ===\n");
-  IsVGPRPass = false;
-  bool ChangedSGPR = processFunction(MF, SGPRLimit);
-  // Preserved-RP fixpoint: a spill inserts reload vregs, and a reload placed
-  // before a call whose use is after it *crosses* that call — so it is pinned
-  // too, but computePinnedAndCap ran before it existed. Re-classify (picking up
-  // the new reloads) and re-run the pass while the true pinned clique still
-  // exceeds k_cs. Without this the gate under-counts and leaves a violation the
-  // ACL-coloring phase cannot satisfy ("Failed to find free physreg"). Bounded
-  // by a small iteration cap: each pass either lowers the clique or converges.
-  if (EnableAMDGPUSSAACLColoring && EnablePreservedRPFixpoint) {
-    static constexpr unsigned MaxFixpointIters = 8;
-    unsigned Iter = 0;
-    for (; Iter < MaxFixpointIters; ++Iter) {
-      computePinnedAndCap(MF);
-      unsigned Clique = maxPreservedClique();
-      LLVM_DEBUG(dbgs() << "  [PRESRP-FIXPOINT] SGPR iter=" << Iter
-                        << " pinnedClique=" << Clique
-                        << " k_cs=" << SGPRPreservedCap << "\n");
-      if (Clique <= SGPRPreservedCap)
-        break;
-      ChangedSGPR |= processFunction(MF, SGPRLimit);
-    }
-    LLVM_DEBUG(if (Iter == MaxFixpointIters) dbgs()
-                   << "  [PRESRP-FIXPOINT] SGPR hit iteration cap; residual "
-                      "preserved-RP may remain\n");
+  // Four-pass structure when ACL is enabled (mirrors the coloring side, which
+  // colors ACL then ordinary):
+  //   1. ACL_SGPR   preserved-RP, SGPR   (processACLCalls)  -> spills to lanes
+  //   2. main_SGPR  total-RP, SGPR       (processFunction)  -> more lanes
+  //      -- count SGPR-spill lanes; debit VGPR total (and preserved) budget --
+  //   3. ACL_VGPR   preserved-RP, VGPR   (processACLCalls)
+  //   4. main_VGPR  total-RP, VGPR       (processFunction)
+  // When ACL is off, this reduces to the original two total-RP passes.
+
+  // Pass 1: ACL_SGPR — spill SGPR around-call-livers to fit callee-saved
+  // capacity, before ordinary SGPR spilling sees them.
+  bool ChangedSGPR = false;
+  if (EnableAMDGPUSSAACLColoring) {
+    IsVGPRPass = false;
+    ChangedSGPR |= processACLCalls(MF);
   }
 
+  // Pass 2: main_SGPR — ordinary total-RP SGPR spilling.
+  LLVM_DEBUG(dbgs() << "\n=== Pass 2: Processing SGPRs (total-RP) ===\n");
+  IsVGPRPass = false;
+  ChangedSGPR |= processFunction(MF, SGPRLimit);
+
   // Account for VGPRs consumed by SGPR-spill-to-lane and shrink the VGPR
-  // budget for Pass 2. Actual lowering happens later (at SGPR coloring).
-  // SGPR spills materialize as WWM VGPR lanes (added later by
+  // budget for the VGPR passes. Actual lowering happens later (at SGPR
+  // coloring). SGPR spills materialize as WWM VGPR lanes (added later by
   // SILowerSGPRSpills), which need physical VGPRs on top of the per-thread
   // allocation. Reserve them only when we actually spilled SGPRs, and credit
   // the proportional margin that is already held back: if the margin
@@ -2300,28 +2369,27 @@ bool AMDGPUSSARegisterSpiller::runOnMachineFunction(MachineFunction &MF) {
     VGPRLimit -= ExtraReserve;
   }
 
-  // Pass 2: VGPR Spilling
-  LLVM_DEBUG(dbgs() << "\n=== Pass 2: Processing VGPRs ===\n");
-  IsVGPRPass = true;
-  bool ChangedVGPR = processFunction(MF, VGPRLimit);
-  // Preserved-RP fixpoint for the VGPR file (see the SGPR loop above for why).
-  if (EnableAMDGPUSSAACLColoring && EnablePreservedRPFixpoint) {
-    static constexpr unsigned MaxFixpointIters = 8;
-    unsigned Iter = 0;
-    for (; Iter < MaxFixpointIters; ++Iter) {
-      computePinnedAndCap(MF);
-      unsigned Clique = maxPreservedClique();
-      LLVM_DEBUG(dbgs() << "  [PRESRP-FIXPOINT] VGPR iter=" << Iter
-                        << " pinnedClique=" << Clique
-                        << " k_cs=" << VGPRPreservedCap << "\n");
-      if (Clique <= VGPRPreservedCap)
-        break;
-      ChangedVGPR |= processFunction(MF, VGPRLimit);
-    }
-    LLVM_DEBUG(if (Iter == MaxFixpointIters) dbgs()
-                   << "  [PRESRP-FIXPOINT] VGPR hit iteration cap; residual "
-                      "preserved-RP may remain\n");
+  // Recompute the pinned set / caps for the VGPR file: the SGPR passes created
+  // reload vregs and (via SGPR->lane spills) new VGPR around-call-livers, none
+  // of which the initial computePinnedAndCap saw. ACL_VGPR needs the fresh set.
+  // NOTE: debiting VGPRPreservedCap by the call-crossing spill lanes is a
+  // separate follow-up (see ACL_Pass_and_CallSite_Capacity.md Part 1b) — this
+  // recompute picks up reload-vreg pins but not the not-yet-materialized lanes.
+  if (EnableAMDGPUSSAACLColoring)
+    computePinnedAndCap(MF);
+
+  // Pass 3: ACL_VGPR — spill VGPR around-call-livers to fit callee-saved
+  // capacity, before ordinary VGPR spilling.
+  bool ChangedVGPR = false;
+  if (EnableAMDGPUSSAACLColoring) {
+    IsVGPRPass = true;
+    ChangedVGPR |= processACLCalls(MF);
   }
+
+  // Pass 4: main_VGPR — ordinary total-RP VGPR spilling.
+  LLVM_DEBUG(dbgs() << "\n=== Pass 4: Processing VGPRs (total-RP) ===\n");
+  IsVGPRPass = true;
+  ChangedVGPR |= processFunction(MF, VGPRLimit);
 
   LLVM_DEBUG(dbgs() << "\nAMDGPUSSARegisterSpiller: Completed processing "
                     << MF.getName() << "\n");
