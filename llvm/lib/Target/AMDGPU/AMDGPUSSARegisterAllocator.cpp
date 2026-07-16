@@ -13,13 +13,51 @@
 #include "SIInstrInfo.h"
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/LiveIntervals.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/InitializePasses.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "amdgpu-ssa-register-allocator"
+
+// Master switch for the around-call-liver (ACL) work: the allocator's two-phase
+// (ACL-first) coloring walk AND the spiller's preserved-RP (callee-saved
+// capacity) gate. This work is uncommitted/unproven and currently regresses the
+// corpus (malformed MIR out of the two-phase walk on call functions). Default
+// OFF so the tree matches the committed `ssara` baseline; flip on to develop it.
+// The spiller reads this via a declaration in AMDGPUSSARegisterSpiller.cpp.
+namespace llvm {
+cl::opt<bool> EnableAMDGPUSSAACLColoring(
+    "amdgpu-ssa-acl-coloring",
+    cl::desc("Enable around-call-liver two-phase coloring and the spiller's "
+             "preserved-register-pressure gate (default off; work in progress)"),
+    cl::init(false), cl::Hidden);
+} // namespace llvm
+
+// Step-0 PHI-copy metric (see PHI_Coalescer design section 9). Counted at the
+// copy-vs-fixed-point decision in lowerPHIs(); pure instrumentation, no MIR
+// change. Baseline for the coalescer and regression guard for every later step.
+#define PHI_METRIC_DEBUG_TYPE "amdgpu-phi-metric"
+STATISTIC(NumPhiOperands, "PHI operands examined at SSA destruction");
+STATISTIC(NumPhiCopies, "PHI operands lowered to a copy (not a fixed point)");
+STATISTIC(NumPhiFixedPoints, "PHI operands already fixed points (Src==Dst)");
+STATISTIC(NumPhiUndefEdges, "PHI operands with an undef source (no copy needed)");
+STATISTIC(NumPhiCopyWeight, "Sum of 2^loopdepth over PHI-copy operands");
+// Feasibility-ceiling split of the remaining copies (whole-register sources
+// only): a copy can EVER become a fixed point only if the operand does not
+// interfere with the PHI result. Infeasible copies are the ceiling residue no
+// coalescer can remove; feasible copies are what a fixed-point coalescer
+// (Option A) could still convert beyond greedy affinity (Option B).
+STATISTIC(NumPhiCopyFeasible,
+          "PHI-copy operands with no read-lane/result interference (coalescable)");
+STATISTIC(NumPhiCopyInfeasible,
+          "PHI-copy operands whose read lane interferes with the result (ceiling)");
+STATISTIC(NumPhiCopySubreg,
+          "PHI-copy operands with a sub-register source (context tally; overlaps "
+          "the feasible/infeasible split, now lane-classified)");
 
 char AMDGPUSSARegisterAllocator::ID = 0;
 
@@ -28,6 +66,7 @@ INITIALIZE_PASS_BEGIN(AMDGPUSSARegisterAllocator, DEBUG_TYPE,
 INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(SlotIndexesWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_END(AMDGPUSSARegisterAllocator, DEBUG_TYPE,
                     "AMDGPU SSA Register Allocator", false, false)
 
@@ -60,9 +99,117 @@ void AMDGPUSSARegisterAllocator::markFree(MCRegister PhysReg) {
     OccupiedRegUnits.reset(Unit);
 }
 
+void AMDGPUSSARegisterAllocator::dumpOccupancyMap(const TargetRegisterClass *RC,
+                                                  SlotIndex SI, const char *Tag,
+                                                  const LiveInterval *VI) const {
+  // Two occupancy views, to expose disagreements:
+  //  Occ    = the LIVE OccupiedRegUnits bitvector pickFreePhysReg actually
+  //           consults (running seed + mark/kill state at this program point).
+  //  OccCM  = freshly rebuilt from ColorMap vregs live at SI.
+  // If a reg is set in Occ but not OccCM, it is occupied by something NOT a
+  // ColorMap-vreg-live-at-SI: a physreg live-in, a dead def still marked, or a
+  // stale running-state bit — the exact thing to diagnose.
+  const BitVector &Occ = OccupiedRegUnits;
+  BitVector OccCM(TRI->getNumRegUnits());
+  for (const auto &[VReg, PhysReg] : ColorMap)
+    if (LIS->hasInterval(VReg) && LIS->getInterval(VReg).liveAt(SI))
+      for (MCRegUnit U : TRI->regunits(PhysReg))
+        OccCM.set(U);
+
+  // A reg is clobbered for VI if some call VI is live across clobbers it.
+  auto Clobbered = [&](MCRegister PR) -> bool {
+    if (!VI)
+      return false;
+    for (const auto &[CS, CMI] : CallSites) {
+      if (!VI->liveAt(CS))
+        continue;
+      if (CMI->modifiesRegister(PR, TRI))
+        return true;
+      for (const MachineOperand &MO : CMI->operands())
+        if (MO.isRegMask() && MO.clobbersPhysReg(PR))
+          return true;
+    }
+    return false;
+  };
+
+  std::string Map;
+  SmallVector<MCRegister, 128> Order;
+  unsigned FreeUsable = 0, FreeClobbered = 0, Occupied = 0;
+  // Registers set in Occ (running state) but NOT in OccCM (ColorMap-live): the
+  // "phantom" occupancy the map used to miss. Also collect the truly-usable regs.
+  SmallVector<MCRegister, 8> Phantom, Usable;
+  for (MCRegister PR : RegClassInfo.getOrder(RC)) {
+    bool O = false, OCM = false;
+    for (MCRegUnit U : TRI->regunits(PR)) {
+      if (Occ.test(U)) O = true;
+      if (OccCM.test(U)) OCM = true;
+    }
+    if (O) {
+      Map.push_back('#');
+      ++Occupied;
+      if (!OCM)
+        Phantom.push_back(PR); // occupied by running-state but no live ColorMap vreg
+    } else if (Clobbered(PR)) {
+      Map.push_back('x');
+      ++FreeClobbered;
+    } else {
+      Map.push_back('.');
+      ++FreeUsable;
+      Usable.push_back(PR);
+    }
+    Order.push_back(PR);
+  }
+  dbgs() << "  [OCCMAP " << Tag << "] " << TRI->getRegClassName(RC) << " @" << SI
+         << "  usable=" << FreeUsable << " clobbered=" << FreeClobbered
+         << " occupied=" << Occupied << " total=" << Order.size() << "\n"
+         << "    " << Map << "\n";
+  if (!Order.empty())
+    dbgs() << "    (" << TRI->getName(Order.front()) << " .. "
+           << TRI->getName(Order.back()) << ")  legend: # occ, x clobbered, . usable\n";
+  // The key question: registers occupied by running-state but with NO live
+  // ColorMap vreg (physreg live-ins, dead defs, or stale bits).
+  if (!Phantom.empty()) {
+    dbgs() << "    phantom-occupied (Occ set, no live ColorMap vreg):";
+    for (MCRegister PR : Phantom)
+      dbgs() << " " << TRI->getName(PR);
+    dbgs() << "\n";
+  }
+  if (!Usable.empty()) {
+    dbgs() << "    usable regs:";
+    for (MCRegister PR : Usable)
+      dbgs() << " " << TRI->getName(PR);
+    dbgs() << "\n";
+    // For each usable reg, find WIDER ColorMap values whose whole interval
+    // OVERLAPS VI (pickFreePhysReg's OccupiedAtDef augmentation, lines ~195).
+    // This is the occupancy the liveAt(SI) map view misses.
+    if (VI) {
+      unsigned VIWidth = TRI->getRegSizeInBits(*RC);
+      for (MCRegister PR : Usable) {
+        for (const auto &[WReg, WPhys] : ColorMap) {
+          if (TRI->getRegSizeInBits(*MRI->getRegClass(WReg)) <= VIWidth)
+            continue;
+          bool hitsPR = false;
+          for (MCRegUnit U : TRI->regunits(WPhys))
+            for (MCRegUnit PU : TRI->regunits(PR))
+              if (U == PU) { hitsPR = true; break; }
+          if (hitsPR && LIS->getInterval(WReg).overlaps(*VI)) {
+            dbgs() << "      " << TRI->getName(PR) << " blocked by wider "
+                   << printReg(WReg, TRI) << "->" << TRI->getName(WPhys)
+                   << " (interval overlaps VI but not live@SI)\n";
+            dbgs() << "        VI  " << printReg(VI->reg(), TRI) << ": " << *VI
+                   << "\n        blk " << printReg(WReg, TRI) << ": "
+                   << LIS->getInterval(WReg) << "\n";
+          }
+        }
+      }
+    }
+  }
+}
+
 MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     const TargetRegisterClass *RC, const LiveInterval &VI,
-    ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs) {
+    ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs,
+    ArrayRef<MCRegister> Hints) {
   LLVM_DEBUG({
     dbgs() << "    Allocation order for " << TRI->getRegClassName(RC) << ":";
     for (MCRegister PR : RegClassInfo.getOrder(RC))
@@ -92,36 +239,128 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     }
   }
 
-  for (MCRegister PR : RegClassInfo.getOrder(RC)) {
-    bool Free = true;
+  // Shared legality test: a candidate PR is usable iff none of its reg units are
+  // occupied at this def AND it is not clobbered by any call VI is live across.
+  // A value live across a call cannot occupy a register the call clobbers
+  // (regmask-clobbered caller-saved regs, or an explicit def such as the
+  // return-address $sgpr30_sgpr31) - it would be undefined after the call.
+  auto IsFree = [&](MCRegister PR) -> bool {
     for (MCRegUnit Unit : TRI->regunits(PR))
-      if (OccupiedAtDef.test(Unit)) {
-        Free = false;
+      if (OccupiedAtDef.test(Unit))
+        return false;
+    for (const auto &[CallIdx, CallMI] : CallSites) {
+      if (!VI.liveAt(CallIdx))
+        continue;
+      if (CallMI->modifiesRegister(PR, TRI))
+        return false;
+      for (const MachineOperand &MO : CallMI->operands())
+        if (MO.isRegMask() && MO.clobbersPhysReg(PR))
+          return false;
+    }
+    return true;
+  };
+
+  // Option B: prefer a phi-partner's color if it is a legal member of RC and
+  // free. Hints are pre-ordered hottest-first by collectPhiHints; take the first
+  // that fits. RC->contains guards against a partner whose class differs from RC.
+  for (MCRegister Hint : Hints) {
+    if (!Hint || !RC->contains(Hint))
+      continue;
+    if (IsFree(Hint)) {
+      LLVM_DEBUG(dbgs() << "    phi-affinity hint taken: " << TRI->getName(Hint)
+                        << "\n");
+      return Hint;
+    }
+  }
+
+  for (MCRegister PR : RegClassInfo.getOrder(RC))
+    if (IsFree(PR))
+      return PR;
+  return MCRegister();
+}
+
+// Option B affinity hint collection. See header comment.
+SmallVector<MCRegister, 4>
+AMDGPUSSARegisterAllocator::collectPhiHints(Register VReg,
+                                            const TargetRegisterClass *RC) {
+  // (physreg, weight) candidates; dedup + weight-sort before returning.
+  SmallVector<std::pair<MCRegister, uint64_t>, 4> Cand;
+
+  // Turn a colored φ partner into a candidate color for VReg. SubIdx is the
+  // sub-register index relating the two values; PartnerIsSub says which side it
+  // slices:
+  //   - PartnerIsSub == false (Direction A): VReg is the sub-register, reading
+  //     Partner.SubIdx (a lane φ reading %593.sub3 of a wide colored operand).
+  //     VReg's color is that SLICE of Partner's color -> getSubReg().
+  //   - PartnerIsSub == true  (Direction B): Partner is the sub-register; the φ
+  //     reads VReg.SubIdx into the narrow result Partner (a loop-carried tuple
+  //     whose header result is colored before the wide latch operand VReg).
+  //     VReg's color is the SUPER-register whose SubIdx slice is Partner's
+  //     color -> getMatchingSuperReg().
+  // Either composition must land in RC (VReg's class) to be a legal hint.
+  auto AddPartner = [&](Register Partner, unsigned SubIdx, bool PartnerIsSub,
+                        MachineBasicBlock *EdgeBlock) {
+    if (!Partner.isVirtual())
+      return;
+    auto It = ColorMap.find(Partner);
+    if (It == ColorMap.end())
+      return; // partner not colored yet -- nothing to align to
+    MCRegister PR = It->second;
+    if (SubIdx) {
+      PR = PartnerIsSub ? TRI->getMatchingSuperReg(PR, SubIdx, RC)
+                        : TRI->getSubReg(PR, SubIdx);
+      if (!PR)
+        return; // no such slice/super in the physreg or class
+    }
+    if (!RC->contains(PR))
+      return; // class/width mismatch after composition
+    unsigned Depth = EdgeBlock ? MLI->getLoopDepth(EdgeBlock) : 0;
+    uint64_t W = Depth < 63 ? (uint64_t(1) << Depth) : ~uint64_t(0);
+    Cand.push_back({PR, W});
+  };
+
+  MachineInstr *Def = MRI->getUniqueVRegDef(VReg);
+
+  // Direction A -- VReg is a phi result: align to its (colored) operands. If an
+  // operand reads a slice (%wide.subN), VReg's color is that slice of the
+  // operand's color (PartnerIsSub = false).
+  if (Def && Def->isPHI()) {
+    for (unsigned I = 1, E = Def->getNumOperands(); I < E; I += 2) {
+      MachineOperand &Src = Def->getOperand(I);
+      if (Src.isUndef() || !Src.isReg())
+        continue;
+      AddPartner(Src.getReg(), Src.getSubReg(), /*PartnerIsSub=*/false,
+                 Def->getOperand(I + 1).getMBB());
+    }
+  }
+
+  // Direction B -- VReg feeds one or more phi results: align to the (colored)
+  // result. The incoming edge for weighting is VReg's own def block. When the φ
+  // reads VReg via a sub-register (result is narrower than VReg -- the
+  // loop-carried tuple case, where the header result is colored before this
+  // wide latch operand), VReg's color is the super-register whose SubN slice is
+  // the result's color (PartnerIsSub = true).
+  MachineBasicBlock *DefBlock = Def ? Def->getParent() : nullptr;
+  for (MachineInstr &UseMI : MRI->use_nodbg_instructions(VReg)) {
+    if (!UseMI.isPHI())
+      continue;
+    for (unsigned I = 1, E = UseMI.getNumOperands(); I < E; I += 2) {
+      MachineOperand &Src = UseMI.getOperand(I);
+      if (Src.isReg() && Src.getReg() == VReg) {
+        AddPartner(UseMI.getOperand(0).getReg(), Src.getSubReg(),
+                   /*PartnerIsSub=*/true, DefBlock);
         break;
       }
-    // A value live across a call cannot occupy a register the call clobbers
-    // (regmask-clobbered caller-saved regs, or an explicit def such as the
-    // return-address $sgpr30_sgpr31) - it would be undefined after the call.
-    if (Free)
-      for (const auto &[CallIdx, CallMI] : CallSites) {
-        if (!VI.liveAt(CallIdx))
-          continue;
-        bool Clob = CallMI->modifiesRegister(PR, TRI);
-        if (!Clob)
-          for (const MachineOperand &MO : CallMI->operands())
-            if (MO.isRegMask() && MO.clobbersPhysReg(PR)) {
-              Clob = true;
-              break;
-            }
-        if (Clob) {
-          Free = false;
-          break;
-        }
-      }
-    if (Free)
-      return PR;
+    }
   }
-  return MCRegister();
+
+  // Hottest-first, deduped (keep max weight per physreg).
+  llvm::stable_sort(Cand, [](auto &A, auto &B) { return A.second > B.second; });
+  SmallVector<MCRegister, 4> Hints;
+  for (auto &[PR, W] : Cand)
+    if (!llvm::is_contained(Hints, PR))
+      Hints.push_back(PR);
+  return Hints;
 }
 
 void AMDGPUSSARegisterAllocator::seedOccupiedAtBBEntry(MachineBasicBlock *MBB) {
@@ -257,19 +496,72 @@ void AMDGPUSSARegisterAllocator::color() {
         } else if (MO.isReg() && MO.isDef() && MO.isImplicit() &&
                    MO.getReg().isPhysical() &&
                    MRI->isAllocatable(MO.getReg().asMCReg())) {
-          // Only an implicit def of an ALLOCATABLE physreg matters: a value
-          // live across it could be colored onto that reg and would be
-          // clobbered (e.g. an inline-asm register clobber). Non-allocatable
-          // implicit defs -- notably implicit-def $scc/$vcc on ordinary ALU ops
-          // (S_CMP, S_ADD, ...) -- can never hold an allocated vreg, so tracking
-          // them only bloats CallSites and slows pickFreePhysReg's O(sites) scan
-          // without ever changing a decision.
+          // An implicit def of an ALLOCATABLE physreg is a clobber site: a value
+          // live across it colored onto that reg would be destroyed (e.g. an
+          // inline-asm register clobber, or an implicit-def $vcc on V_ADD_CO /
+          // V_CMP -- VCC *is* allocatable on AMDGPU). This holds even for a DEAD
+          // def: "dead" means the defined value is unused, but the register write
+          // still happens, so a crossing value in that reg is still clobbered.
+          // Non-allocatable defs (implicit-def $scc) can never hold an allocated
+          // vreg and are excluded by isAllocatable. NB: these sites drive only
+          // the exact per-register IsFree legality check, NOT the ACL priority
+          // set (which is narrowed to real regmask calls below) -- so the flood
+          // of VCC defs no longer perturbs coloring priority on call-free code.
           IsClobberSite = true;
         }
       }
       if (IsClobberSite)
         CallSites.push_back({LIS->getInstructionIndex(MI).getRegSlot(), &MI});
     }
+  LLVM_DEBUG(dbgs() << "CallSites (regmask + allocatable implicit-def): "
+                    << CallSites.size() << "\n");
+
+  // Around-call-liver (ACL) set: vregs whose live interval spans a real CALL
+  // (regmask site). These must go in registers the crossed call preserves
+  // (enforced per-call by the IsFree regmask check). They are colored in a
+  // SEPARATE, EARLIER width-descending walk (phase 0) over the whole function,
+  // before ordinary vregs (phase 1). Priority — not just legality — is the
+  // point: in a single combined walk an ordinary vreg defined before/between
+  // calls grabs a preserved register first, leaving a later-crossing ACL with
+  // nothing free even though IsFree would have allowed it. Coloring all ACLs
+  // first reserves the preserved registers they need across the whole function.
+  //
+  // Only REGMASK (call) sites drive this priority set, NOT every clobber site.
+  // A regmask clobbers a large caller-saved partition, so a value crossing it is
+  // genuinely squeezed into the preserved subset and benefits from priority. A
+  // lone implicit physreg def (e.g. a live implicit-def $vcc on V_ADD_CO) only
+  // clobbers that ONE register; the exact per-register IsFree check already
+  // rejects that single reg for a crossing value, and no phase-0 priority is
+  // warranted. Including such sites floods the ACL set on call-free code
+  // (V_ADD_CO/V_CMP emit VCC defs everywhere), needlessly reorders coloring, and
+  // has triggered downstream SSA-destruction crashes. IsFree still consults ALL
+  // of CallSites for legality — only the ACL priority membership is narrowed.
+  DenseSet<Register> ACLSet;
+  if (EnableAMDGPUSSAACLColoring) {
+    SmallVector<SlotIndex, 8> CallOnlySites;
+    for (const auto &[CallIdx, CallMI] : CallSites)
+      if (CallMI->isCall())
+        CallOnlySites.push_back(CallIdx);
+    if (!CallOnlySites.empty())
+      for (unsigned I = 0, E = MRI->getNumVirtRegs(); I < E; ++I) {
+        Register VReg = Register::index2VirtReg(I);
+        if (MRI->reg_nodbg_empty(VReg) || !LIS->hasInterval(VReg))
+          continue;
+        const LiveInterval &LI = LIS->getInterval(VReg);
+        for (SlotIndex CS : CallOnlySites)
+          if (LI.liveAt(CS)) {
+            ACLSet.insert(VReg);
+            break;
+          }
+      }
+  }
+  LLVM_DEBUG(dbgs() << "ACL set: " << ACLSet.size()
+                    << " vregs live across calls\n");
+
+  // Phase 0 = ACL vregs, phase 1 = ordinary. Skip phase 0 when no ACLs exist.
+  for (unsigned Phase = (ACLSet.empty() ? 1 : 0); Phase < 2; ++Phase) {
+    LLVM_DEBUG(dbgs() << "\n=== Coloring phase " << Phase << " ("
+                      << (Phase == 0 ? "ACL" : "ordinary") << ") ===\n");
 
   for (unsigned Width : ColoringOrder) {
     for (auto *Node : depth_first(MDT->getRootNode())) {
@@ -385,6 +677,17 @@ void AMDGPUSSARegisterAllocator::color() {
             continue;
           }
 
+          // Phase filter: phase 0 colors only ACL vregs, phase 1 only the rest.
+          // A def for the other phase is skipped; if already colored in phase 0
+          // (an ACL def revisited in phase 1), mark its physreg occupied at its
+          // def so phase-1 values do not reuse it (kill path frees it at its last
+          // use, exactly as for a wider already-colored def).
+          if (ACLSet.contains(Reg) != (Phase == 0)) {
+            if (auto It = ColorMap.find(Reg); It != ColorMap.end())
+              markOccupied(It->second);
+            continue;
+          }
+
           MCRegister Chosen;
           unsigned UseOpIdx;
           bool IsTied = MI.isRegTiedToUseOperand(MO.getOperandNo(), &UseOpIdx);
@@ -419,8 +722,27 @@ void AMDGPUSSARegisterAllocator::color() {
           } else if (IsTied) {
             llvm_unreachable("Tied use must be colored already or undef");
           } else {
+            SmallVector<MCRegister, 4> Hints =
+                collectPhiHints(Reg, MRI->getRegClass(Reg));
             Chosen = pickFreePhysReg(MRI->getRegClass(Reg),
-                                     LIS->getInterval(Reg), WiderDefs);
+                                     LIS->getInterval(Reg), WiderDefs, Hints);
+            if (!Chosen) {
+              const LiveInterval &FVI = LIS->getInterval(Reg);
+              dbgs() << "!!! COLORFAIL " << printReg(Reg, TRI) << " " << FVI
+                     << " class=" << TRI->getRegClassName(MRI->getRegClass(Reg))
+                     << "\n";
+              // Every already-colored value whose interval OVERLAPS %308, with
+              // its physreg + interval. These are the true blockers.
+              dbgs() << "  overlapping colored values (blockers):\n";
+              for (const auto &[V, P] : ColorMap) {
+                if (!LIS->hasInterval(V))
+                  continue;
+                const LiveInterval &OVI = LIS->getInterval(V);
+                if (OVI.overlaps(FVI))
+                  dbgs() << "    " << printReg(V, TRI) << " -> "
+                         << TRI->getName(P) << "  " << OVI << "\n";
+              }
+            }
             assert(Chosen && "Failed to find free physreg");
             LLVM_DEBUG(dbgs() << "    color: " << printReg(Reg, TRI) << " -> "
                               << TRI->getName(Chosen) << "\n");
@@ -460,7 +782,8 @@ void AMDGPUSSARegisterAllocator::color() {
           markFree(PR);
       }
     }
-  }
+  } // width loop
+  } // phase loop
 
   LLVM_DEBUG({
     dbgs() << "\nColoring result:\n";
@@ -736,6 +1059,12 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
 
   SmallVector<MachineInstr *, 16> PHIsToErase;
 
+  // Step-0 metric accumulators (see PHI_Coalescer section 9). Function-local;
+  // folded into the STATISTIC counters as we go so -debug-only can print a
+  // per-function line without disturbing the global totals.
+  unsigned FnCopies = 0, FnFixed = 0, FnUndef = 0;
+  uint64_t FnWeight = 0;
+
   for (MachineBasicBlock &MBB : MF) {
     if (MBB.empty() || !MBB.front().isPHI())
       continue;
@@ -761,6 +1090,7 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
       for (unsigned I = 1, E = MI.getNumOperands(); I < E; I += 2) {
         MachineOperand &SrcMO = MI.getOperand(I);
         MachineBasicBlock *Pred = MI.getOperand(I + 1).getMBB();
+        ++NumPhiOperands;
 
         // An undef incoming value needs no copy, but DstPhys must still be
         // defined so it is live-out of Pred (DstPhys is a live-in of MBB).
@@ -769,6 +1099,8 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
         // PHIElimination does for undef PHI operands).
         if (SrcMO.isUndef()) {
           PredCopies[Pred].push_back({MCRegister(), DstPhys});
+          ++NumPhiUndefEdges;
+          ++FnUndef;
           continue;
         }
 
@@ -783,8 +1115,55 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
           assert(SrcPhys && "Invalid subreg index on PHI source");
         }
 
-        if (SrcPhys != DstPhys)
+        if (SrcPhys != DstPhys) {
           PredCopies[Pred].push_back({SrcPhys, DstPhys});
+          // Not a fixed point: a copy will be emitted on this edge. Weight it
+          // by 2^loopdepth(Pred) so loop-carried copies dominate the cost, per
+          // the paper's cost_f (eq.1).
+          ++NumPhiCopies;
+          ++FnCopies;
+          unsigned Depth = MLI->getLoopDepth(Pred);
+          uint64_t W = Depth < 63 ? (uint64_t(1) << Depth) : ~uint64_t(0);
+          NumPhiCopyWeight += W;
+          FnWeight += W;
+          // Feasibility ceiling: a copy can only ever become a fixed point if
+          // the operand does not interfere with the PHI result. The operand may
+          // read only a slice of a wider value (e.g. %x.sub0), so interference
+          // must be tested at LANE granularity, not whole-vreg: a sibling lane
+          // of the source can be live across the result's range while the READ
+          // lane is not. Restrict the source interval to the operand's lane mask
+          // (subranges are always present -- GCN enables subreg liveness
+          // unconditionally) and overlap only those lanes with the result.
+          const LiveInterval &SrcLI = LIS->getInterval(SrcMO.getReg());
+          const LiveInterval &DstLI = LIS->getInterval(DstVReg);
+          LaneBitmask ReadMask =
+              SrcMO.getSubReg()
+                  ? TRI->getSubRegIndexLaneMask(SrcMO.getSubReg())
+                  : MRI->getMaxLaneMaskForVReg(SrcMO.getReg());
+          bool Interferes;
+          if (SrcLI.hasSubRanges()) {
+            Interferes = false;
+            for (const LiveInterval::SubRange &S : SrcLI.subranges())
+              if ((S.LaneMask & ReadMask).any() && S.overlaps(DstLI)) {
+                Interferes = true;
+                break;
+              }
+          } else {
+            // Whole-register value (no subranges): the read covers all lanes.
+            Interferes = SrcLI.overlaps(DstLI);
+          }
+          if (Interferes)
+            ++NumPhiCopyInfeasible;
+          else
+            ++NumPhiCopyFeasible;
+          if (SrcMO.getSubReg())
+            ++NumPhiCopySubreg; // keep the tuple-source tally for context
+        } else {
+          // SrcPhys == DstPhys: already a fixed point, no copy. This is exactly
+          // what Option B / the coalescer manufactures.
+          ++NumPhiFixedPoints;
+          ++FnFixed;
+        }
       }
 
       PHIsToErase.push_back(&MI);
@@ -825,6 +1204,15 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
     PHI->eraseFromParent();
 
   LLVM_DEBUG(dbgs() << "  Erased " << PHIsToErase.size() << " PHIs\n");
+
+  // Per-function metric line (opt-in): a diff of two llc runs is a diff of these
+  // lines. Gated on its own debug type so it is independent of the pass's
+  // verbose -debug-only=amdgpu-ssa-register-allocator output.
+  DEBUG_WITH_TYPE(PHI_METRIC_DEBUG_TYPE,
+                  dbgs() << "phi-metric " << MF.getName() << ": copies="
+                         << FnCopies << " fixed=" << FnFixed
+                         << " undef=" << FnUndef << " weighted=" << FnWeight
+                         << "\n");
 }
 
 void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF) {
@@ -1013,6 +1401,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   ST = &MF.getSubtarget<GCNSubtarget>();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   LIS = &getAnalysis<LiveIntervalsWrapperPass>().getLIS();
+  MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   RegClassInfo.runOnMachineFunction(MF);
   DynVGPRBlockSize =
       ST->isDynamicVGPREnabled() ? ST->getDynamicVGPRBlockSize() : 0;

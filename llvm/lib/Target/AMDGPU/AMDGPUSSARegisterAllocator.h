@@ -24,6 +24,7 @@
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
@@ -41,6 +42,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   MachineRegisterInfo *MRI = nullptr;
   MachineDominatorTree *MDT = nullptr;
   LiveIntervals *LIS = nullptr;
+  MachineLoopInfo *MLI = nullptr;
   const GCNSubtarget *ST = nullptr;
   RegisterClassInfo RegClassInfo;
 
@@ -68,9 +70,34 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
                       ArrayRef<std::pair<MCRegister, MCRegister>> Copies) const;
   void markOccupied(MCRegister PhysReg);
   void markFree(MCRegister PhysReg);
+
+  /// Debug: print \p RC's allocation order at slot \p SI as an occupancy map,
+  /// one char per register in order:
+  ///   '.' free and usable    '#' occupied (ColorMap vreg live at SI)
+  ///   'x' free but CLOBBERED by a call \p VI is live across (unusable by a
+  ///       value pinned to callee-saved) — only marked when \p VI is given.
+  /// So "####xxxx####" shows callee-saved full ('#') with only caller-saved
+  /// ('x') free — the classic pinned-value exhaustion. Occupancy is derived by
+  /// walking ColorMap for vregs live at SI. \p Tag labels the line.
+  void dumpOccupancyMap(const TargetRegisterClass *RC, SlotIndex SI,
+                        const char *Tag, const LiveInterval *VI = nullptr) const;
+
   MCRegister pickFreePhysReg(
       const TargetRegisterClass *RC, const LiveInterval &VI,
-      ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs);
+      ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs,
+      ArrayRef<MCRegister> Hints = {});
+
+  // Option B affinity: collect already-colored phi-partner physregs for VReg
+  // (phi results it feeds, and -- if VReg is a phi result -- its operands),
+  // ordered by 2^loopdepth of the incoming edge (hottest first). Sub-register
+  // relationships compose both ways: a phi-result VReg reading a slice of a
+  // wider operand takes that slice of the operand's color (getSubReg); a wide
+  // VReg feeding a narrow result via VReg.subN takes the super-register whose
+  // slice is the result's color (getMatchingSuperReg -- the loop-carried tuple
+  // case). Class-compatible partners only. Returns [] when VReg touches no
+  // colored phi partner.
+  SmallVector<MCRegister, 4> collectPhiHints(Register VReg,
+                                             const TargetRegisterClass *RC);
 
   // === SSA Destruction + Operand Rewrite ===
   bool hasCFPseudos(MachineFunction &MF) const;
@@ -101,6 +128,8 @@ public:
     AU.addRequired<LiveIntervalsWrapperPass>();
     AU.addRequired<SlotIndexesWrapperPass>();
     AU.addRequired<MachineDominatorTreeWrapperPass>();
+    AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.addPreserved<MachineLoopInfoWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 };

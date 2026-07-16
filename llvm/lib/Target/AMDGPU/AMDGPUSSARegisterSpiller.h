@@ -104,6 +104,31 @@ class AMDGPUSSARegisterSpiller : public MachineFunctionPass {
   unsigned VGPRLimit = 0;
   unsigned SGPRLimit = 0;
 
+  // Second RP dimension: values that cross ANY call are pinned to callee-saved
+  // registers for their whole range, so a per-point "preserved-RP" over the
+  // pinned set must fit the callee-saved capacity k_cs (per file). See the
+  // preserved-RP gate in processFunction and ACL_Pass_and_CallSite_Capacity.
+  DenseSet<Register> PinnedVRegs;           // vregs crossing any call
+  unsigned VGPRPreservedCap = 0;            // k_cs for VGPR file
+  unsigned SGPRPreservedCap = 0;            // k_cs for SGPR file
+  unsigned PreservedLimit = 0;              // k_cs for the current pass's file
+
+  /// Classify PinnedVRegs (crosses any call) and compute VGPR/SGPRPreservedCap
+  /// (min preserved allocatable count over the function's calls). Called before
+  /// the first spill pass and re-run by the fixpoint loop after each pass, since
+  /// spilling creates reload vregs that themselves cross calls (and are pinned).
+  void computePinnedAndCap(MachineFunction &MF);
+
+  /// True max width-weighted clique over the *current* PinnedVRegs of this
+  /// pass's file, via an endpoint sweep over their live intervals. This is the
+  /// authoritative preserved-RP the allocator will face after spilling; the
+  /// fixpoint loop re-runs the pass while it exceeds PreservedLimit.
+  unsigned maxPreservedClique() const;
+
+  /// preserved-RP at \p MI: 32-bit-slot count of pinned vregs of the current
+  /// pass's file live across \p MI.
+  unsigned computePreservedRP(const MachineInstr &MI);
+
   // Current pass type for RP calculation.
   bool IsVGPRPass = false;
 
@@ -114,8 +139,11 @@ class AMDGPUSSARegisterSpiller : public MachineFunctionPass {
   // Reload optimizer: cached max RP per block (cleared per spill analysis)
   DenseMap<MachineBasicBlock *, unsigned> MaxRPCache;
 
-  // Track reloads per block to avoid duplicates
-  DenseMap<std::pair<MachineBasicBlock *, Register>, Register> BlockReloadCache;
+  // Track reloads per block to avoid duplicates. Keyed by (block, reloaded
+  // VReg+mask) so a narrow sub-slice reload and a wider reload of the same vreg
+  // in one block are distinct cache entries.
+  DenseMap<std::pair<MachineBasicBlock *, VRegMaskPair>, Register>
+      BlockReloadCache;
 
   // TODO: Add tracking for spilled/reloaded registers if needed for
   // verification
@@ -219,9 +247,15 @@ class AMDGPUSSARegisterSpiller : public MachineFunctionPass {
   /// If InsertBefore is provided, inserts before that instruction.
   /// Otherwise inserts at block end (before terminator) and caches the result.
   /// Returns {ReloadReg, ReloadMI}. ReloadMI is nullptr if using cached reload.
+  /// \p ReloadMask selects which of SpilledVMP's lanes to actually reload now
+  /// (default: all of them). The stack slot is always the full SpilledVMP slot;
+  /// only the reloaded sub-slice (dest subreg, class, and in-slot offset) is
+  /// narrowed, so a use that reads a few lanes does not pull the whole tuple
+  /// back into registers.
   std::pair<Register, MachineInstr *>
   getOrCreateReloadInBlock(MachineBasicBlock *BB, VRegMaskPair SpilledVMP,
-                           MachineInstr *InsertBefore = nullptr);
+                           MachineInstr *InsertBefore = nullptr,
+                           LaneBitmask ReloadMask = LaneBitmask::getAll());
 
   /// Insert reload for a use instruction. For PHI uses, inserts in predecessor
   /// blocks. For non-PHI uses, handles loop adjustment.

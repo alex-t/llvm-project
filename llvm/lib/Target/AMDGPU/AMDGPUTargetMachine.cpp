@@ -595,6 +595,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUSSARegisterSpillerPass(*PR);
   initializeAMDGPUSSARegisterAllocatorPass(*PR);
   initializeAMDGPURebuildSSALegacyPass(*PR);
+  initializeAMDGPUPHICoalescerPass(*PR);
   initializeAMDGPURewriteUndefForPHILegacyPass(*PR);
   initializeSIAnnotateControlFlowLegacyPass(*PR);
   initializeAMDGPUInsertDelayAluLegacyPass(*PR);
@@ -1715,6 +1716,13 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
 
   if (EnableSSARegAlloc) {
     addPass(createAMDGPURebuildSSALegacyPass());
+    // Undef-aware PHI coalescing: fold diamond-merge "one real operand, rest
+    // undef" PHIs so the spiller sees ordinary spillable ranges instead of
+    // un-spillable φ-operands, and all-undef placeholders stop reserving
+    // registers. Standalone so it survives the eventual removal of the
+    // temporary RebuildSSA bridge -- it must remain the last pass before the
+    // spiller.
+    addPass(createAMDGPUPHICoalescerPass());
     addPass(createAMDGPUSSARegisterSpillerPass());
     // The spiller's reloads redefine OrigVReg but it repairs SSA inline
     // (reaching-VNI reconstruction) and returns SSA MIR, so no second
