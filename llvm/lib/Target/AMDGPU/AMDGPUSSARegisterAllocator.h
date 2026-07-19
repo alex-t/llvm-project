@@ -28,6 +28,8 @@
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include "SSASpillEmitter.h"
+#include <memory>
 #include <set>
 
 namespace llvm {
@@ -41,6 +43,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   const SIInstrInfo *TII = nullptr;
   MachineRegisterInfo *MRI = nullptr;
   MachineDominatorTree *MDT = nullptr;
+  SlotIndexes *Indexes = nullptr;
   LiveIntervals *LIS = nullptr;
   MachineLoopInfo *MLI = nullptr;
   const GCNSubtarget *ST = nullptr;
@@ -57,9 +60,33 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   SmallVector<std::pair<SlotIndex, const MachineInstr *>, 8> CallSites;
   unsigned DynVGPRBlockSize = 0;
 
+  // Exec-safe spill/reload emitter, shared with the spiller pass. Used by the
+  // approach-A spill-on-coloring-failure path: when color() cannot place a
+  // value, the driver spills it here (store-at-def + dominance reloads) and
+  // recolors. Created per function in runOnMachineFunction.
+  std::unique_ptr<SSASpillEmitter> Emitter;
+
+  // Values that color() could not place (no physreg free across their whole
+  // range — the %560/%1072 long-liver class). color() collects ALL of them and
+  // finishes the walk (coloring everything else normally), rather than bailing
+  // on the first, so that after the driver spills these the ONLY uncolored
+  // vregs left are the short reload remainders — which provably settle.
+  SmallVector<Register, 8> UncolorableVRegs;
+
   // === Coloring ===
   void classifyVRegs();
+  /// Run a full coloring walk. Colors every placeable value into ColorMap;
+  /// appends any value it cannot place to UncolorableVRegs and skips it (does
+  /// not occupy a register for it) so the rest of the walk proceeds as if that
+  /// value were absent. Does not assert on failure.
   void color();
+  /// Color a single value \p R in place against the CURRENT ColorMap /
+  /// OccupiedRegUnits, without disturbing any existing assignment. Seeds
+  /// occupancy from the colored values whose live range overlaps R's, then picks
+  /// a free physreg across R's (short) range. Used to place reload remainders
+  /// after a coloring-failure spill. Returns false if no register is free
+  /// (should not happen for a width-1 reload — point pressure ≤ limit < file).
+  bool colorOneInPlace(Register R);
   void seedOccupiedAtBBEntry(MachineBasicBlock *MBB);
   // True if the parallel PHI edge-copies for Pred->MBB cannot be safely placed
   // at Pred's terminator (they would clobber a value live into a sibling

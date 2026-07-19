@@ -279,6 +279,54 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
   return MCRegister();
 }
 
+bool AMDGPUSSARegisterAllocator::colorOneInPlace(Register R) {
+  // Color R against the CURRENT ColorMap without disturbing any assignment.
+  // R is a reload remainder: a short interval [reload, use]. Seed occupancy
+  // from exactly the colored values whose live range OVERLAPS R's range — that
+  // is "what is live during R's span", i.e. the point-pressure at R expressed
+  // as interval overlap (which also handles the endpoints: a value dying at R's
+  // start or born at R's end does not block R). Any register left free is free
+  // across all of R. For a width-1 reload one always exists: point pressure at
+  // the use ≤ RPLimit < file size (the spiller's margin guarantees it).
+  const TargetRegisterClass *RC = MRI->getRegClass(R);
+  const LiveInterval &RI = LIS->getInterval(R);
+
+  // pickFreePhysReg reads OccupiedRegUnits (same-or-narrower blockers) and scans
+  // ColorMap itself for WIDER overlapping values. So seed OccupiedRegUnits with
+  // the same-or-narrower colored values overlapping RI; let pickFreePhysReg
+  // handle wider ones. WiderDefs is empty — the ColorMap scan inside
+  // pickFreePhysReg already covers cross-block wider defs.
+  unsigned RWidth = TRI->getRegSizeInBits(*RC);
+  OccupiedRegUnits.reset();
+  for (const auto &[VReg, PhysReg] : ColorMap) {
+    if (VReg == R || !LIS->hasInterval(VReg))
+      continue;
+    if (TRI->getRegSizeInBits(*MRI->getRegClass(VReg)) > RWidth)
+      continue; // wider: handled by pickFreePhysReg's own overlap scan
+    if (LIS->getInterval(VReg).overlaps(RI))
+      markOccupied(PhysReg);
+  }
+
+  MCRegister Chosen = pickFreePhysReg(RC, RI, /*WiderDefs=*/{});
+  if (!Chosen)
+    return false;
+
+  ColorMap[R] = Chosen;
+  unsigned Idx = TRI->getHWRegIndex(Chosen);
+  unsigned W = RWidth / 32;
+  const TargetRegisterClass *PhysRC = TRI->getPhysRegBaseClass(Chosen);
+  if (TRI->isVGPRClass(PhysRC))
+    MaxVGPRIdx = std::max(MaxVGPRIdx, Idx + W);
+  else if (TRI->isAGPRClass(PhysRC))
+    MaxAGPRIdx = std::max(MaxAGPRIdx, Idx + W);
+  else if (TRI->isSGPRClass(PhysRC))
+    MaxSGPRIdx = std::max(MaxSGPRIdx, Idx + W);
+
+  LLVM_DEBUG(dbgs() << "  in-place color: " << printReg(R, TRI) << " -> "
+                    << TRI->getName(Chosen) << "\n");
+  return true;
+}
+
 // Option B affinity hint collection. See header comment.
 SmallVector<MCRegister, 4>
 AMDGPUSSARegisterAllocator::collectPhiHints(Register VReg,
@@ -715,7 +763,11 @@ void AMDGPUSSARegisterAllocator::color() {
             // use (same vreg), preserving two-address form.
             Chosen = pickFreePhysReg(MRI->getRegClass(Reg),
                                      LIS->getInterval(Reg), WiderDefs);
-            assert(Chosen && "Failed to find free physreg");
+            if (!Chosen) {
+              // Collect-and-skip, as at the main pick site below.
+              UncolorableVRegs.push_back(Reg);
+              continue;
+            }
             LLVM_DEBUG(dbgs() << "    color (undef self-tie): "
                               << printReg(Reg, TRI) << " -> "
                               << TRI->getName(Chosen) << "\n");
@@ -727,23 +779,31 @@ void AMDGPUSSARegisterAllocator::color() {
             Chosen = pickFreePhysReg(MRI->getRegClass(Reg),
                                      LIS->getInterval(Reg), WiderDefs, Hints);
             if (!Chosen) {
-              const LiveInterval &FVI = LIS->getInterval(Reg);
-              dbgs() << "!!! COLORFAIL " << printReg(Reg, TRI) << " " << FVI
-                     << " class=" << TRI->getRegClassName(MRI->getRegClass(Reg))
-                     << "\n";
-              // Every already-colored value whose interval OVERLAPS %308, with
-              // its physreg + interval. These are the true blockers.
-              dbgs() << "  overlapping colored values (blockers):\n";
-              for (const auto &[V, P] : ColorMap) {
-                if (!LIS->hasInterval(V))
-                  continue;
-                const LiveInterval &OVI = LIS->getInterval(V);
-                if (OVI.overlaps(FVI))
-                  dbgs() << "    " << printReg(V, TRI) << " -> "
-                         << TRI->getName(P) << "  " << OVI << "\n";
-              }
+              // No physreg is free across this value's whole range (the
+              // %1072/%560 long-liver-through-tuple-churn case). Do NOT assert
+              // and do NOT bail: record it and SKIP it (occupy nothing for it),
+              // so the rest of the walk colors normally as if this value were
+              // absent. The driver spills all collected values afterward, then
+              // colors the short reload remainders in place. Skipping is correct
+              // because the value is about to be spilled — it holds no register.
+              LLVM_DEBUG({
+                const LiveInterval &FVI = LIS->getInterval(Reg);
+                dbgs() << "!!! COLORFAIL " << printReg(Reg, TRI) << " " << FVI
+                       << " class="
+                       << TRI->getRegClassName(MRI->getRegClass(Reg)) << "\n";
+                dbgs() << "  overlapping colored values (blockers):\n";
+                for (const auto &[V, P] : ColorMap) {
+                  if (!LIS->hasInterval(V))
+                    continue;
+                  const LiveInterval &OVI = LIS->getInterval(V);
+                  if (OVI.overlaps(FVI))
+                    dbgs() << "    " << printReg(V, TRI) << " -> "
+                           << TRI->getName(P) << "  " << OVI << "\n";
+                }
+              });
+              UncolorableVRegs.push_back(Reg);
+              continue;
             }
-            assert(Chosen && "Failed to find free physreg");
             LLVM_DEBUG(dbgs() << "    color: " << printReg(Reg, TRI) << " -> "
                               << TRI->getName(Chosen) << "\n");
           }
@@ -1409,16 +1469,88 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "AMDGPUSSARegisterAllocator: Processing " << MF.getName()
                     << "\n");
 
+  // Approach-A emitter: spill values that coloring cannot place.
+  Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
+  Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT, MLI);
+
   classifyVRegs();
   OccupiedRegUnits.clear();
   OccupiedRegUnits.resize(TRI->getNumRegUnits());
-
   ColorMap.clear();
   MaxVGPRIdx = 0;
   MaxSGPRIdx = 0;
   MaxAGPRIdx = 0;
-
+  UncolorableVRegs.clear();
   color();
+
+  // Spill-on-coloring-failure (approach A). A pure Hack coloring can fail on
+  // AMDGPU even at RP ≤ limit (the %1072/%560 long-liver-through-tuple-churn
+  // class): no single physreg is free across the value's whole range. color()
+  // collected every such value in UncolorableVRegs and skipped it, so ColorMap
+  // now holds a valid assignment for EVERYTHING ELSE — untouched from here on.
+  //
+  // For each collected value: spill it (store-at-def + reload-at-use), which
+  // replaces its one long range with short reload ranges, then color those
+  // reload remainders IN PLACE against the frozen ColorMap. We never re-color
+  // an already-placed value, so no successfully-colored value can be perturbed
+  // into a new failure (the reason we do NOT recolor from clean). Each width-1
+  // reload provably settles: point pressure at the use ≤ RPLimit < file size.
+  if (!UncolorableVRegs.empty()) {
+    for (Register Failed : UncolorableVRegs) {
+      // GATE: only width-1 (single-lane) values are spilled here. A wider tuple
+      // that cannot be colored means the widest tier is over the limit — the
+      // program is uncolorable by ANY allocator, so that is the up-front
+      // spiller's responsibility, not a reactive coloring-time spill. Surface it
+      // loudly rather than paper over it.
+      const TargetRegisterClass *RC = MRI->getRegClass(Failed);
+      assert(TRI->getRegSizeInBits(*RC) == 32 &&
+             "coloring-time spill is width-1 only; wider failure = up-front "
+             "spiller under-spilled");
+
+      MachineInstr *DefMI = MRI->getVRegDef(Failed);
+      assert(DefMI && "uncolorable value must have a def in SSA");
+      SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
+      bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+      unsigned RPLimit =
+          IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+      LLVM_DEBUG(dbgs() << "SSA RA: spilling uncolorable " << printReg(Failed,
+                                                                       TRI)
+                        << " (kill-at-def) and coloring reloads in place\n");
+
+      // Reload vregs created by this spill are exactly the new names appended to
+      // the emitter's reloaded set. Snapshot the prior size so we color only the
+      // fresh remainders (not reloads from an earlier failed value).
+      Emitter->beginPass(IsVGPR);
+      Emitter->spillOneVMP(
+          VRegMaskPair(Failed, MRI->getMaxLaneMaskForVReg(Failed)), KillIdx,
+          RPLimit);
+
+      // Color the remainders in place. Two kinds, both short-lived after the
+      // spill and both provably settleable (point pressure ≤ limit < file):
+      //   (1) the original value's surviving STUB — store-at-def leaves Failed
+      //       live from its def to the store (and to any use the reaching-VNI
+      //       repair mapped back to Failed itself); reloadedRegs() reports only
+      //       the FRESH reload names, so Failed must be colored explicitly.
+      //   (2) the fresh reload redef vregs the SSA repair renamed Failed to.
+      // Order is irrelevant: colorOneInPlace seeds occupancy by INTERVAL OVERLAP
+      // (symmetric — two overlapping remainders each see the other and take
+      // distinct registers), and the proof guarantees enough free registers for
+      // all simultaneously-live remainders. (No dominance/slot sort — a
+      // cross-block slot-index comparison would be meaningless anyway.)
+      auto ColorInPlace = [&](Register R) {
+        if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
+            MRI->reg_nodbg_empty(R))
+          return;
+        bool OK = colorOneInPlace(R);
+        assert(OK && "width-1 remainder must be colorable");
+        (void)OK;
+      };
+      ColorInPlace(Failed); // (1) original value's surviving stub
+      for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+        ColorInPlace(VMP.getVReg()); // (2) fresh reload redefs
+    }
+  }
+
   destroySSAAndRewrite(MF);
 
   return true;
