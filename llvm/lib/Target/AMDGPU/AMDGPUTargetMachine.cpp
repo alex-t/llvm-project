@@ -594,6 +594,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUNextUseAnalysisWrapperPass(*PR);
   initializeAMDGPUSSARegisterSpillerPass(*PR);
   initializeAMDGPUSSARegisterAllocatorPass(*PR);
+  initializeAMDGPUVerifyPhysRegLivenessPass(*PR);
   initializeAMDGPURebuildSSALegacyPass(*PR);
   initializeAMDGPUPHICoalescerPass(*PR);
   initializeAMDGPURewriteUndefForPHILegacyPass(*PR);
@@ -1728,6 +1729,9 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
     // (reaching-VNI reconstruction) and returns SSA MIR, so no second
     // RebuildSSA is needed here.
     addPass(createAMDGPUSSARegisterAllocatorPass());
+    // Independent post-allocation physreg-liveness check (SSARA correctness
+    // gate). No-op unless -amdgpu-verify-physreg-liveness is given.
+    addPass(createAMDGPUVerifyPhysRegLivenessPass());
     return true;
   }
 

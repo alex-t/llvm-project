@@ -112,6 +112,9 @@ MachineFunctionPass *createAMDGPUPHICoalescerPass();
 void initializeAMDGPUPHICoalescerPass(PassRegistry &);
 extern char &AMDGPUPHICoalescerID;
 
+MachineFunctionPass *createAMDGPUVerifyPhysRegLivenessPass();
+void initializeAMDGPUVerifyPhysRegLivenessPass(PassRegistry &);
+
 MachineFunctionPass *createAMDGPUSSARegisterAllocatorPass();
 void initializeAMDGPUSSARegisterAllocatorPass(PassRegistry &);
 extern char &AMDGPUSSARegisterAllocatorID;
