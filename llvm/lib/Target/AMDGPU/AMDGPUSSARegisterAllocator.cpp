@@ -1318,8 +1318,14 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
   // Src and Dst share the same width here.
   SmallVector<std::pair<MCRegister, MCRegister>, 8> DwordCopies;
   for (auto &[Src, Dst] : Copies) {
-    unsigned W = TRI->getRegSizeInBits(*TRI->getPhysRegBaseClass(Dst)) / 32;
-    if (W == 1) {
+    unsigned Bits = TRI->getRegSizeInBits(*TRI->getPhysRegBaseClass(Dst));
+    unsigned W = Bits / 32;
+    // A copy that is at most one dword wide (W <= 1, including sub-dword 16-bit
+    // true16 lo16/hi16 slices where Bits==16 and W==0) has no wider sibling to
+    // alias, so it is already atomic — pass it through unchanged. Only genuinely
+    // multi-dword copies (W > 1) need splitting so a wide write cannot hide a
+    // write-after-read hazard against a narrower copy of the same dword.
+    if (W <= 1) {
       DwordCopies.push_back({Src, Dst});
       continue;
     }
