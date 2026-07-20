@@ -1864,11 +1864,26 @@ void AMDGPUSSARegisterAllocator::snapshotValueFlow(MachineFunction &MF) {
   VFIntent.clear();
   VFUF.clear();
   VFColor.clear();
+  VFDefinedLane.clear();
   for (auto &[V, P] : ColorMap)
     VFColor[V] = P;
 
   auto Lanes = [&](Register R) {
     return TRI->getRegSizeInBits(*MRI->getRegClass(R)) / 32;
+  };
+  // Record the lanes of a def operand that receive a REAL value. A whole-reg def
+  // covers all lanes; a sub-register def covers [channel, +subLanes). An `undef`
+  // def contributes NOTHING (its lanes stay don't-care).
+  auto markDefined = [&](const MachineOperand &MO) {
+    if (MO.isUndef())
+      return;
+    Register R = MO.getReg();
+    unsigned Base = MO.getSubReg() ? TRI->getChannelFromSubReg(MO.getSubReg()) : 0;
+    unsigned N = MO.getSubReg()
+                     ? TRI->getSubRegIdxSize(MO.getSubReg()) / 32
+                     : Lanes(R);
+    for (unsigned K = 0; K < std::max(1u, N); ++K)
+      VFDefinedLane.insert(vfKey(R.id(), Base + K));
   };
 
   for (MachineBasicBlock &MBB : MF)
@@ -1894,24 +1909,44 @@ void AMDGPUSSARegisterAllocator::snapshotValueFlow(MachineFunction &MF) {
         if (!D.isVirtual())
           continue;
         for (unsigned I = 1; I + 1 < MI.getNumOperands(); I += 2) {
-          Register S = MI.getOperand(I).getReg();
+          const MachineOperand &SrcMO = MI.getOperand(I);
+          Register S = SrcMO.getReg();
           if (!S.isVirtual())
             continue;
           unsigned Base =
               TRI->getChannelFromSubReg(MI.getOperand(I + 1).getImm());
-          for (unsigned K = 0, E = Lanes(S); K < E; ++K)
-            vfUnion(vfKey(D.id(), Base + K), vfKey(S.id(), K));
+          // The source may itself read a sub-register (e.g. `%84.sub1`): its
+          // lanes start at that channel, not lane 0. The slice width is the
+          // dest sub-register's size.
+          unsigned SrcBase =
+              SrcMO.getSubReg() ? TRI->getChannelFromSubReg(SrcMO.getSubReg())
+                                : 0;
+          unsigned N = TRI->getSubRegIdxSize(MI.getOperand(I + 1).getImm()) / 32;
+          for (unsigned K = 0, E = std::max(1u, N); K < E; ++K)
+            vfUnion(vfKey(D.id(), Base + K), vfKey(S.id(), SrcBase + K));
         }
         continue;
       }
       // Ordinary instruction: record which value each vreg operand should carry,
       // by the STABLE MachineInstr* (survives rewriteOperands, which edits in
-      // place). Skip undef operands (don't-care value).
+      // place). Skip fully-undef operands (don't-care value); record which lanes
+      // each def really writes (markDefined skips undef defs).
       auto &Ops = VFIntent[&MI];
-      for (const MachineOperand &MO : MI.operands())
-        if (MO.isReg() && MO.getReg().isVirtual() && !MO.isUndef())
-          Ops.push_back({MO.getReg().id(), MO.getSubReg(), MO.isDef()});
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual() || MO.isUndef())
+          continue;
+        Ops.push_back({MO.getReg().id(), MO.getSubReg(), MO.isDef()});
+        if (MO.isDef())
+          markDefined(MO);
+      }
     }
+
+  // Canonicalize the defined-lane set: a use lane is checkable iff SOME lane in
+  // its union class (PHI/REG_SEQUENCE-merged) received a real def.
+  DenseSet<uint64_t> Canon;
+  for (uint64_t K : VFDefinedLane)
+    Canon.insert(vfFind(K));
+  VFDefinedLane = std::move(Canon);
 }
 
 bool AMDGPUSSARegisterAllocator::verifyValueFlow(MachineFunction &MF) {
@@ -1979,6 +2014,12 @@ bool AMDGPUSSARegisterAllocator::verifyValueFlow(MachineFunction &MF) {
         unsigned K = 0;
         for (MCRegUnit U : dwordKeys(P)) {
           uint64_t Want = vfFind(vfKey(O.VReg, Base + K));
+          // Skip lanes that never received a real def (partial/undef value): a
+          // read of such a lane is a don't-care, not a clobber.
+          if (!VFDefinedLane.count(Want)) {
+            ++K;
+            continue;
+          }
           auto A = Actual.find(U);
           if (A == Actual.end() || A->second != Want) {
             errs() << "[value-flow] CLOBBER: " << printRegUnit(U, TRI)

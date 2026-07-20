@@ -20,6 +20,7 @@
 
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -179,6 +180,11 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   DenseMap<const MachineInstr *, SmallVector<VFOp, 4>> VFIntent;
   DenseMap<Register, MCRegister> VFColor; // ColorMap frozen pre-destruction
   DenseMap<uint64_t, uint64_t> VFUF;      // union-find over (vreg,lane) keys
+  // (vreg,lane) keys that receive a REAL (non-undef) definition. A use only
+  // checks lanes in this set: a partial def `undef %V.sub0 = ...` leaves other
+  // lanes intentionally undefined (don't-care), and a later read of %V must not
+  // demand a value token for those lanes (else false clobber).
+  DenseSet<uint64_t> VFDefinedLane;
   uint64_t vfFind(uint64_t X);
   void vfUnion(uint64_t A, uint64_t B);
   void snapshotValueFlow(MachineFunction &MF); // call BEFORE lowerPHIs
