@@ -1016,7 +1016,8 @@ void AMDGPUSSARegisterAllocator::color() {
             auto It = ColorMap.find(Reg);
             if (It == ColorMap.end())
               continue;
-            if (!LIS->getInterval(Reg).liveAt(NextSI)) {
+            const LiveInterval &LI = LIS->getInterval(Reg);
+            if (!LI.liveAt(NextSI)) {
               if (HasEC) {
                 DeferredFree.push_back(It->second);
               } else {
@@ -1024,6 +1025,33 @@ void AMDGPUSSARegisterAllocator::color() {
                 LLVM_DEBUG(dbgs()
                            << "    kill: " << printReg(Reg, TRI) << " free "
                            << TRI->getName(It->second) << "\n");
+              }
+            } else if (LI.hasSubRanges()) {
+              // PARTIAL KILL: the whole value is still live, but some sub-lanes
+              // are dead here — e.g. after the spiller stored sub0..sub2 of a
+              // vreg_128, only sub3 remains live, yet the value is colored to the
+              // whole tuple. Holding the dead lanes occupied is a soundness bug:
+              // spilling N lanes must drop RP by N*32. Free the physreg units of
+              // each subrange NOT live at NextSI so a narrower/aligned value can
+              // use them.
+              for (const LiveInterval::SubRange &S : LI.subranges()) {
+                if (S.liveAt(NextSI))
+                  continue;
+                for (unsigned Ch = 0; Ch < 8; ++Ch) {
+                  unsigned SubIdx = SIRegisterInfo::getSubRegFromChannel(Ch);
+                  if ((TRI->getSubRegIndexLaneMask(SubIdx) & S.LaneMask).none())
+                    continue;
+                  if (MCRegister Sub = TRI->getSubReg(It->second, SubIdx)) {
+                    if (HasEC)
+                      for (MCRegUnit U : TRI->regunits(Sub))
+                        DeferredUnits.push_back(U);
+                    else
+                      markFree(Sub);
+                    LLVM_DEBUG(dbgs() << "    partial-kill: " << printReg(Reg, TRI)
+                                      << " free dead " << TRI->getName(Sub)
+                                      << "\n");
+                  }
+                }
               }
             }
           }
