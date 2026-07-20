@@ -73,10 +73,21 @@ class AMDGPUVerifyPhysRegLiveness : public MachineFunctionPass {
   // Per-block "defined-out" reg-unit sets, indexed by MBB number.
   DenseMap<unsigned, BitVector> DefinedOut;
 
-  // Mark all allocatable units of PhysReg into BV.
+  // Mark all units of PhysReg (any width, incl. wide tuples) into BV. Used for
+  // both defs and live-ins: a live-in tuple like $sgpr0_..._sgpr7 must mark ALL
+  // its sub-units defined, so callers must NOT gate this on trackReg of the whole
+  // tuple (a wide tuple's base class may report non-allocatable, which would drop
+  // every sub-unit and falsely flag a later use of one). Marking units of a
+  // reserved reg here is harmless: use sites are filtered by trackReg(usereg).
   void markUnits(BitVector &BV, MCRegister PhysReg) const {
     for (MCRegUnit U : TRI->regunits(PhysReg))
       BV.set(U);
+  }
+
+  // Seed BV with every live-in of MBB (unconditionally — see markUnits).
+  void markLiveIns(BitVector &BV, const MachineBasicBlock &MBB) const {
+    for (const auto &LI : MBB.liveins())
+      markUnits(BV, LI.PhysReg);
   }
 
   // Is this a unit we track (belongs to an allocatable reg; skip exec/scc/etc.)?
@@ -130,22 +141,17 @@ public:
       Changed = false;
       for (MachineBasicBlock *MBB : RPOT) {
         BitVector In(NumUnits, false);
-        if (MBB->pred_empty()) {
-          // Entry (or unreachable): seed from block live-ins.
-          for (const auto &LI : MBB->liveins())
-            if (trackReg(LI.PhysReg))
-              markUnits(In, LI.PhysReg);
-        } else {
-          In.resize(NumUnits, true); // start full, intersect preds
+        if (!MBB->pred_empty()) {
+          // Non-entry: a unit is defined-in only if defined on ALL preds. Start
+          // from all-set and intersect (In was constructed all-false, so set it
+          // full first — resize to the same size would be a no-op).
+          In.set();
           for (MachineBasicBlock *P : MBB->predecessors())
             In &= DefinedOut[P->getNumber()];
         }
-        // Also honor explicit block liveins (physregs declared live-in are
-        // defined on entry regardless of the intersection — they were produced
-        // upstream / are ABI live-ins).
-        for (const auto &LI : MBB->liveins())
-          if (trackReg(LI.PhysReg))
-            markUnits(In, LI.PhysReg);
+        // Honor explicit block live-ins (ABI/entry args and values produced
+        // upstream are defined on entry regardless of the pred intersection).
+        markLiveIns(In, *MBB);
 
         BitVector Cur = In;
         for (MachineInstr &MI : *MBB) {
@@ -186,18 +192,12 @@ public:
     // Reporting pass: with defined-out stable, re-scan and flag undefined uses.
     for (MachineBasicBlock *MBB : RPOT) {
       BitVector Cur(NumUnits, false);
-      if (MBB->pred_empty()) {
-        for (const auto &LI : MBB->liveins())
-          if (trackReg(LI.PhysReg))
-            markUnits(Cur, LI.PhysReg);
-      } else {
-        Cur.resize(NumUnits, true);
+      if (!MBB->pred_empty()) {
+        Cur.set();
         for (MachineBasicBlock *P : MBB->predecessors())
           Cur &= DefinedOut[P->getNumber()];
       }
-      for (const auto &LI : MBB->liveins())
-        if (trackReg(LI.PhysReg))
-          markUnits(Cur, LI.PhysReg);
+      markLiveIns(Cur, *MBB);
 
       for (MachineInstr &MI : *MBB) {
         for (const MachineOperand &MO : MI.operands()) {
