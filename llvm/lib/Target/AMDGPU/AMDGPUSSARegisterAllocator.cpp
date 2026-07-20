@@ -2203,9 +2203,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
     for (Register Failed : UncolorableVRegs) {
       // GATE: only width-1 (single-lane) values are spilled here. A wider tuple
       // that cannot be colored means the widest tier is over the limit — the
-      // program is uncolorable by ANY allocator, so that is the up-front
-      // spiller's responsibility, not a reactive coloring-time spill. Surface it
-      // loudly rather than paper over it.
+      // up-front spiller's responsibility, not a reactive coloring-time spill.
       const TargetRegisterClass *RC = MRI->getRegClass(Failed);
       assert(TRI->getRegSizeInBits(*RC) == 32 &&
              "coloring-time spill is width-1 only; wider failure = up-front "
@@ -2221,26 +2219,14 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
                                                                        TRI)
                         << " (kill-at-def) and coloring reloads in place\n");
 
-      // Reload vregs created by this spill are exactly the new names appended to
-      // the emitter's reloaded set. Snapshot the prior size so we color only the
-      // fresh remainders (not reloads from an earlier failed value).
+      // RP-gated reload placement (SSASpillEmitter NeedsReload) keeps each reload
+      // from spanning an RP-tight region, so the freed pressure is real and the
+      // remainders settle in place.
       Emitter->beginPass(IsVGPR);
       Emitter->spillOneVMP(
           VRegMaskPair(Failed, MRI->getMaxLaneMaskForVReg(Failed)), KillIdx,
           RPLimit);
 
-      // Color the remainders in place. Two kinds, both short-lived after the
-      // spill and both provably settleable (point pressure ≤ limit < file):
-      //   (1) the original value's surviving STUB — store-at-def leaves Failed
-      //       live from its def to the store (and to any use the reaching-VNI
-      //       repair mapped back to Failed itself); reloadedRegs() reports only
-      //       the FRESH reload names, so Failed must be colored explicitly.
-      //   (2) the fresh reload redef vregs the SSA repair renamed Failed to.
-      // Order is irrelevant: colorOneInPlace seeds occupancy by INTERVAL OVERLAP
-      // (symmetric — two overlapping remainders each see the other and take
-      // distinct registers), and the proof guarantees enough free registers for
-      // all simultaneously-live remainders. (No dominance/slot sort — a
-      // cross-block slot-index comparison would be meaningless anyway.)
       auto ColorInPlace = [&](Register R) {
         if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
             MRI->reg_nodbg_empty(R))

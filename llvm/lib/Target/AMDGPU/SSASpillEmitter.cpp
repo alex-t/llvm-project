@@ -629,8 +629,18 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
       if (!AtUse)
         return true;
       if (MachineInstr *DMI = LIS->getInstructionFromIndex(AtUse->def))
-        if (DMI->getParent() == B)
+        if (DMI->getParent() == B) {
+          // A same-block reaching def normally covers U with no new reload. But
+          // if the reaching value's live range [DMI, U] SPANS an RP-tight region
+          // (max RP between them exceeds the limit), reusing it keeps a register
+          // pinned across that region — the exact C1 pathology (a reload live
+          // across a high-pressure INLINEASM etc. that never lowers RP there and
+          // makes coloring fail). Force a fresh reload right before U instead, so
+          // the reaching value's range ends before the tight point.
+          if (CurRPLimit && maxRPBetween(DMI, U) > CurRPLimit)
+            return true;
           return false;
+        }
       for (MachineBasicBlock *P : B->predecessors())
         if (!LR.getVNInfoBefore(LIS->getMBBEndIdx(P)))
           return true;
@@ -752,6 +762,35 @@ unsigned SSASpillEmitter::getMaxRPForBlock(MachineBasicBlock *MBB) {
   }
 
   MaxRPCache[MBB] = MaxRP;
+  return MaxRP;
+}
+
+unsigned SSASpillEmitter::maxRPBetween(MachineInstr *DefMI,
+                                       MachineInstr *UseMI) {
+  // Max RP (current pass's file) at the program points strictly between DefMI
+  // and UseMI in the same block, inclusive of the span the reaching value would
+  // occupy. Used to decide whether a same-block reaching reload SPANS an
+  // RP-tight region: if so, the shared reload must not be reused across it — a
+  // fresh reload is forced right before UseMI so the span ends before the tight
+  // point (C1: a reload live across a pressure region does not lower RP there).
+  MachineBasicBlock *MBB = UseMI->getParent();
+  if (!DefMI || DefMI->getParent() != MBB)
+    return 0;
+  const GCNSubtarget &ST = MBB->getParent()->getSubtarget<GCNSubtarget>();
+  GCNUpwardRPTracker Tracker(*LIS);
+  Tracker.reset(*UseMI);
+  unsigned MaxRP = 0;
+  for (auto It = UseMI->getReverseIterator(); It != MBB->rend(); ++It) {
+    MachineInstr &MI = *It;
+    if (MI.isDebugInstr())
+      continue;
+    Tracker.recede(MI);
+    GCNRegPressure P = Tracker.getPressure();
+    unsigned RP = IsVGPRPass ? P.getVGPRNum(ST.hasGFX90AInsts()) : P.getSGPRNum();
+    MaxRP = std::max(MaxRP, RP);
+    if (&MI == DefMI)
+      break; // reached the reaching def; span is [DefMI, UseMI]
+  }
   return MaxRP;
 }
 

@@ -162,6 +162,9 @@ class SSASpillEmitter {
                       MachineBasicBlock *KillBB, Register SpilledReg);
   unsigned getMaxRPForBlock(MachineBasicBlock *MBB);
   unsigned getMaxRPInBlockDownTo(MachineBasicBlock *MBB, MachineInstr *StopMI);
+  // Max RP (current file) over the same-block span [DefMI, UseMI]; 0 if not same
+  // block. Decides whether a same-block reaching reload spans an RP-tight region.
+  unsigned maxRPBetween(MachineInstr *DefMI, MachineInstr *UseMI);
   bool canHoistReloadTo(MachineBasicBlock *NCD, MachineInstr *InsertPoint,
                         unsigned RPLimit, Register SpilledReg);
   bool walkPathsToUses(
