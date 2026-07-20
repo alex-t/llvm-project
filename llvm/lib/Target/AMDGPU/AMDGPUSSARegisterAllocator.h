@@ -52,6 +52,49 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   std::set<unsigned, std::greater<unsigned>> ColoringOrder;
   DenseMap<Register, MCRegister> ColorMap;
   BitVector OccupiedRegUnits;
+
+  // Width-tiered coloring (experiment, -amdgpu-ssa-virgin-order). Per tier the
+  // explicit VIRGIN allocation order — aligned tuples of that (pool, width) that
+  // NO already-allocated wider value of the SAME pool occupies anywhere in the
+  // function. A value colored into one of these cannot interfere with any wider
+  // value, so the tier is Hack-compliant BY CONSTRUCTION (auditable: this vector
+  // IS the proof — no interference test needed within it). SGPR and VGPR pools
+  // are disjoint, so a single pass could handle both; they are kept SEPARATE
+  // tiers purely for transparency. Key = (isVector?1:0, widthBits) — unsigned,
+  // not bool, since DenseMap's pair key needs a hashable integral. Built once
+  // per tier in color()'s width loop.
+  DenseMap<std::pair<unsigned, unsigned>, SmallVector<MCRegister, 64>>
+      VirginTierOrder;
+  void buildVirginTierOrder(bool IsVector, unsigned WidthBits);
+
+  // Per-tier pick tallies (experiment). Keyed like VirginTierOrder, incremented
+  // in pickFreePhysReg when a value of that (pool,width) is placed from the
+  // virgin order vs the gap-scan. analyzeTierRank reads AND resets the key it
+  // reports, so each entry counts exactly one (phase,pool,width) tier walk.
+  DenseMap<std::pair<unsigned, unsigned>, unsigned> VirginPickByTier;
+  DenseMap<std::pair<unsigned, unsigned>, unsigned> GapPickByTier;
+
+  // Forensic (post-pass) feasibility analysis: over the vregs a tier actually
+  // colored (\p TierVRegs) PLUS the ones it could not color (\p FailedVRegs —
+  // they still competed for the same virgin pool, so they belong in the rank),
+  // compute the tier's interference-graph rank via LIS and compare to the virgin
+  // pool size. Emits one [TIERPROOF] line (via errs(), so it survives a
+  // downstream crash) whose verdict separates colorer-fault from
+  // spiller-under-spill:
+  //   rank <= pool, no gap, no fail  -> HACK-OK (pure Hack held — the proof)
+  //   rank <= pool, but gap or fail  -> COLORER fault (feasible yet Hack missed)
+  //   rank >  pool, fail > 0         -> SPILLER under-spilled (infeasible tier)
+  // NOT on the coloring decision path.
+  void analyzeTierRank(unsigned Phase, bool IsVector, unsigned WidthBits,
+                       ArrayRef<Register> TierVRegs,
+                       ArrayRef<Register> FailedVRegs);
+
+  // Gap-scan fallback (virgin exhausted): find a PR of \p RC whose colored
+  // occupants' live intervals do NOT overlap \p VI along VI's whole range
+  // (queried via LIS) — a gap opened by an occupant's death that we may reuse.
+  // Returns 0 if none.
+  MCRegister findNonInterferingGap(const TargetRegisterClass *RC,
+                                   const LiveInterval &VI);
   unsigned MaxVGPRIdx = 0;
   unsigned MaxSGPRIdx = 0;
   unsigned MaxAGPRIdx = 0;
@@ -75,6 +118,16 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
 
   // === Coloring ===
   void classifyVRegs();
+  // On unified-file targets (gfx90a/gfx942: VALU reads/writes AGPRs directly),
+  // widen each VGPR-class vreg to the equivalent vector super-class (av_*) when
+  // EVERY operand constraint already admits AGPRs. This lets a narrow value draw
+  // the virgin AGPR tuples that wider VGPR tuples left free (the Greedy
+  // spill-to-AGPR rescue, done as a sound up-front regclass widen rather than a
+  // pick-time fallback — keeps each Hack tier drawing from one unified order).
+  // Conservative: a sub-register operand blocks the widen (the whole-reg operand
+  // constraint test does not apply to a subreg slice). Behind -amdgpu-ssa-agpr-
+  // rescue. Must run before classifyVRegs so widened widths feed ColoringOrder.
+  void widenToAVOnUnified();
   /// Run a full coloring walk. Colors every placeable value into ColorMap;
   /// appends any value it cannot place to UncolorableVRegs and skips it (does
   /// not occupy a register for it) so the rest of the walk proceeds as if that

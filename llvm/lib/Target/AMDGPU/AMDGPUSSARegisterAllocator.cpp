@@ -37,6 +37,34 @@ cl::opt<bool> EnableAMDGPUSSAACLColoring(
     cl::init(false), cl::Hidden);
 } // namespace llvm
 
+// Width-tiered coloring experiment: in a narrower width tier, prefer aligned
+// tuples VIRGIN across the whole function (no wider value ever occupies them) —
+// a value placed in a virgin tuple cannot interfere with any wider value, so the
+// tier's sub-walk stays chordal/Hack-fast. Falls back to the ordinary
+// getOrder scan (hole-scan with interference check) for the rest. Off by default
+// so we can A/B against current behavior.
+static cl::opt<bool> EnableVirginOrder(
+    "amdgpu-ssa-virgin-order", cl::Hidden, cl::init(false),
+    cl::desc("Width-tiered coloring: scan whole-function-virgin aligned tuples "
+             "first in pickFreePhysReg (SSARA experiment)"));
+
+static cl::opt<bool> EnableExperimentBail(
+    "amdgpu-ssa-experiment-bail", cl::Hidden, cl::init(false),
+    cl::desc("Forensic mode: when width-tiered coloring cannot place a value, "
+             "bail early (leave it uncolored, skip spill+SSA-destruction) so "
+             "[TIERPROOF]/-stats data is collected for every function instead "
+             "of aborting on the first hard one. Produces INVALID output (a "
+             "later NoVRegs pass will abort) — for measurement only. Off = the "
+             "real width-1 spill path runs and the function completes."));
+
+static cl::opt<bool> EnableAGPRRescue(
+    "amdgpu-ssa-agpr-rescue", cl::Hidden, cl::init(false),
+    cl::desc("On unified-file targets, widen VGPR-class vregs to the av_ vector "
+             "super-class up front when every operand constraint admits AGPRs, "
+             "so narrow values can draw the virgin AGPR tuples left free by "
+             "wider VGPR tuples (Greedy-style AGPR rescue, done as a sound "
+             "regclass widen rather than a pick-time fallback)"));
+
 // Step-0 PHI-copy metric (see PHI_Coalescer design section 9). Counted at the
 // copy-vs-fixed-point decision in lowerPHIs(); pure instrumentation, no MIR
 // change. Baseline for the coalescer and regression guard for every later step.
@@ -58,6 +86,24 @@ STATISTIC(NumPhiCopyInfeasible,
 STATISTIC(NumPhiCopySubreg,
           "PHI-copy operands with a sub-register source (context tally; overlaps "
           "the feasible/infeasible split, now lane-classified)");
+
+// Width-tiered coloring experiment (-amdgpu-ssa-virgin-order) outcome tally: how
+// often each per-value pick lands on the pure-Hack virgin path vs the gap-scan
+// fallback vs spill. These three answer "do the Hack tiers win as designed?".
+STATISTIC(NumVirginPicks, "Width-tiered: values colored from the virgin order "
+                          "(pure Hack path)");
+STATISTIC(NumGapPicks, "Width-tiered: values colored by ColorMap gap-scan "
+                       "(virgin pool exhausted)");
+STATISTIC(NumTierSpills, "Width-tiered: values that reached spill (no virgin "
+                         "tuple and no reusable gap)");
+// Per-tier feasibility (IG rank vs virgin pool size): separates colorer-fault
+// from spiller-under-spill. rank<=pool => Hack must succeed; rank>pool => tier
+// needs gap/spill and (if a wider tier) the spiller under-spilled.
+STATISTIC(NumTiersFeasible,
+          "Width-tiered: tiers whose IG rank fits the virgin pool (Hack-safe)");
+STATISTIC(NumTiersInfeasible,
+          "Width-tiered: tiers whose IG rank exceeds the virgin pool "
+          "(needs gap/spill; wider => spiller under-spilled)");
 
 char AMDGPUSSARegisterAllocator::ID = 0;
 
@@ -87,6 +133,50 @@ void AMDGPUSSARegisterAllocator::classifyVRegs() {
       dbgs() << " " << W;
     dbgs() << "\n";
   });
+}
+
+void AMDGPUSSARegisterAllocator::widenToAVOnUnified() {
+  if (!ST->hasGFX90AInsts()) // unified vector file only
+    return;
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I < E; ++I) {
+    Register VReg = Register::index2VirtReg(I);
+    if (MRI->reg_nodbg_empty(VReg))
+      continue;
+    const TargetRegisterClass *RC = MRI->getRegClass(VReg);
+    // Only widen plain VGPR classes (av_ already unified; AGPR/SGPR untouched).
+    if (!TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC))
+      continue;
+    unsigned Bits = TRI->getRegSizeInBits(*RC);
+    const TargetRegisterClass *AV = TRI->getVectorSuperClassForBitWidth(Bits);
+    if (!AV || AV == RC)
+      continue;
+    // LEGALITY: AV must be a subclass of every operand's required class, i.e.
+    // every instruction touching VReg must already accept an AGPR in that slot.
+    // A sub-register operand blocks it (the whole-reg constraint test below does
+    // not apply to a sub-register slice — conservative, revisit with
+    // getMatchingSuperRegClass if wide subreg cases justify it).
+    bool Legal = true;
+    for (MachineOperand &MO : MRI->reg_nodbg_operands(VReg)) {
+      if (MO.getSubReg()) {
+        Legal = false;
+        break;
+      }
+      MachineInstr *MI = MO.getParent();
+      const TargetRegisterClass *OpRC =
+          TII->getRegClass(MI->getDesc(), MO.getOperandNo(), TRI);
+      if (!OpRC)
+        continue; // COPY/PHI/REG_SEQUENCE: no encoding constraint
+      if (TRI->getCommonSubClass(AV, OpRC) != AV) {
+        Legal = false;
+        break;
+      }
+    }
+    if (Legal) {
+      MRI->setRegClass(VReg, AV);
+      LLVM_DEBUG(dbgs() << "  [AV-WIDEN] " << printReg(VReg, TRI) << " -> "
+                        << TRI->getRegClassName(AV) << "\n");
+    }
+  }
 }
 
 void AMDGPUSSARegisterAllocator::markOccupied(MCRegister PhysReg) {
@@ -206,6 +296,191 @@ void AMDGPUSSARegisterAllocator::dumpOccupancyMap(const TargetRegisterClass *RC,
   }
 }
 
+void AMDGPUSSARegisterAllocator::buildVirginTierOrder(bool IsVector,
+                                                      unsigned WidthBits) {
+  // Build the VIRGIN allocation order for the (pool, width) tier: aligned tuples
+  // of WidthBits, enumerated from the POOL's widest class — vector super class
+  // (av_*, spanning VGPR and, on unified targets, AGPR) for the vector pool, or
+  // the SGPR class of that width for the scalar pool — kept only if NO
+  // already-allocated wider value occupies any of their units anywhere in the
+  // function. Since we color width-descending, everything in ColorMap now is
+  // wider; SGPR and VGPR are disjoint sets, so wider vector regs never alias
+  // scalar tuples and vice versa (the units simply won't intersect), letting one
+  // UsedByWider bitvector serve both pools. A value's own RC filters this order
+  // at pick time (RC->contains). Called once per tier; virgin is defined vs
+  // WIDER tiers (already complete) so it is stable across this tier's coloring.
+  SmallVector<MCRegister, 64> &Order =
+      VirginTierOrder[{IsVector ? 1u : 0u, WidthBits}];
+  Order.clear();
+
+  BitVector UsedByWider(TRI->getNumRegUnits());
+  for (const auto &[VReg, PhysReg] : ColorMap)
+    for (MCRegUnit U : TRI->regunits(PhysReg))
+      UsedByWider.set(U);
+
+  const TargetRegisterClass *PoolRC =
+      IsVector ? TRI->getVectorSuperClassForBitWidth(WidthBits)
+               : SIRegisterInfo::getSGPRClassForBitWidth(WidthBits);
+  if (!PoolRC)
+    return; // no aligned tuple class for this (pool, width)
+
+  for (MCRegister PR : RegClassInfo.getOrder(PoolRC)) {
+    bool Virgin = true;
+    for (MCRegUnit U : TRI->regunits(PR))
+      if (UsedByWider.test(U)) {
+        Virgin = false;
+        break;
+      }
+    if (Virgin)
+      Order.push_back(PR);
+  }
+  LLVM_DEBUG(dbgs() << "  [VIRGIN " << (IsVector ? "V" : "S") << WidthBits
+                    << "b] " << Order.size() << " virgin tuples in "
+                    << TRI->getRegClassName(PoolRC) << "\n");
+}
+
+void AMDGPUSSARegisterAllocator::analyzeTierRank(
+    unsigned Phase, bool IsVector, unsigned WidthBits,
+    ArrayRef<Register> TierVRegs, ArrayRef<Register> FailedVRegs) {
+  // FORENSIC (post-pass) feasibility analysis — not on the coloring decision
+  // path. Because a tier colors ONLY into virgin tuples (disjoint from every
+  // wider value), it is a self-contained coloring problem: its values interfere
+  // only with EACH OTHER over a clean pool. Hack then guarantees success iff the
+  // tier's own interference-graph rank (max number of this-tier values live
+  // simultaneously; all same width = one tuple each) is <= the virgin pool size.
+  //
+  // Rank is computed over the tier's colored vregs UNION the ones it could not
+  // color (FailedVRegs): a failed value still competed for the same virgin pool,
+  // so excluding it would understate the true simultaneous-live count and let a
+  // genuinely over-pressure tier masquerade as a colorer bug.
+  //
+  // Verdict (the two checks this experiment must deliver):
+  //   rank <= pool, gap=0, fail=0  -> HACK-OK: pure Hack held. THE PROOF.
+  //   rank <= pool, gap>0 or fail>0-> COLORER fault: feasible, yet pure Hack did
+  //                                   not place it (gap-scan needed, or failed).
+  //   rank >  pool, fail>0         -> SPILLER under-spilled: the tier is
+  //                                   infeasible for its virgin pool; the up-front
+  //                                   spiller should have spilled it. NOT a
+  //                                   colorer bug. (Answers "is the spiller the
+  //                                   culprit for those we cannot color even with
+  //                                   scan and spill.")
+  //   rank >  pool, fail=0         -> GAP-RESCUED: over pool but gap-scan placed
+  //                                   everything without spilling.
+  // Uses LIS as the interference oracle (NOT raw slot arithmetic). SSA IG is
+  // chordal, so the max clique is realized at some value's def: for each tier
+  // vreg count tier vregs live at its def; the max is the rank. Emits one
+  // [TIERPROOF] line via errs() so the record survives a downstream pass crash
+  // (a bailed, incompletely-colored function aborts later passes and never
+  // reaches the -stats atexit flush).
+  std::pair<unsigned, unsigned> Key{IsVector ? 1u : 0u, WidthBits};
+  unsigned VirginPicks = VirginPickByTier.lookup(Key);
+  unsigned GapPicks = GapPickByTier.lookup(Key);
+  VirginPickByTier.erase(Key);
+  GapPickByTier.erase(Key);
+
+  if (TierVRegs.empty() && FailedVRegs.empty())
+    return;
+
+  SmallVector<Register, 128> All(TierVRegs.begin(), TierVRegs.end());
+  All.append(FailedVRegs.begin(), FailedVRegs.end());
+
+  unsigned PoolSize = VirginTierOrder.lookup(Key).size();
+  unsigned Rank = 0;
+  for (Register V : All) {
+    SlotIndex DefIdx = LIS->getInterval(V).beginIndex();
+    unsigned LiveHere = 0;
+    for (Register W : All)
+      if (LIS->getInterval(W).liveAt(DefIdx))
+        ++LiveHere;
+    Rank = std::max(Rank, LiveHere);
+  }
+
+  unsigned Fails = FailedVRegs.size();
+  bool OverPool = Rank > PoolSize;
+  if (OverPool)
+    ++NumTiersInfeasible;
+  else
+    ++NumTiersFeasible;
+
+  const char *Verdict;
+  if (!OverPool && GapPicks == 0 && Fails == 0)
+    Verdict = "HACK-OK"; // pure Hack held — the proof
+  else if (!OverPool)
+    Verdict = "COLORER-FAULT"; // feasible yet virgin path missed it
+  else if (Fails > 0)
+    Verdict = "SPILLER-UNDERSPILL"; // infeasible tier — up-front spill needed
+  else
+    Verdict = "GAP-RESCUED"; // over pool but gap-scan covered it
+
+  errs() << "[TIERPROOF] " << (Phase == 0 ? "ACL " : "ORD ")
+         << (IsVector ? "VEC" : "SGPR") << " w" << WidthBits << " rank=" << Rank
+         << " pool=" << PoolSize << " vregs=" << All.size()
+         << " virgin=" << VirginPicks << " gap=" << GapPicks
+         << " fail=" << Fails << "  " << Verdict << "\n";
+}
+
+MCRegister
+AMDGPUSSARegisterAllocator::findNonInterferingGap(const TargetRegisterClass *RC,
+                                                  const LiveInterval &VI) {
+  // Gap-scan (virgin pool exhausted). Scan RC's aligned tuples for one whose
+  // colored occupants are all DEAD across VI's whole live range — a gap opened
+  // by an occupant's death that VI may reuse. This is the full-live-interval
+  // interference test (LIS->getInterval(occupant).overlaps(VI)), which catches
+  // SAME-width gaps that a point-occupancy check misses. (A never-assigned reg
+  // would already be a virgin tuple, so every candidate here is occupied by some
+  // colored value — we test whether that value's range overlaps VI.) Call
+  // legality (a value live across a call must avoid clobbered regs) is still
+  // enforced, matching pickFreePhysReg's IsFree.
+  for (MCRegister PR : RegClassInfo.getOrder(RC)) {
+    // Call-clobber legality: VI cannot occupy a reg any call it crosses clobbers.
+    bool CallClobbered = false;
+    for (const auto &[CallIdx, CallMI] : CallSites) {
+      if (!VI.liveAt(CallIdx))
+        continue;
+      if (CallMI->modifiesRegister(PR, TRI)) {
+        CallClobbered = true;
+        break;
+      }
+      for (const MachineOperand &MO : CallMI->operands())
+        if (MO.isRegMask() && MO.clobbersPhysReg(PR)) {
+          CallClobbered = true;
+          break;
+        }
+      if (CallClobbered)
+        break;
+    }
+    if (CallClobbered)
+      continue;
+
+    // Does any colored value occupying PR's units overlap VI along its range?
+    bool Interferes = false;
+    for (const auto &[WReg, WPhysReg] : ColorMap) {
+      // Only occupants that actually touch PR's units.
+      bool TouchesPR = false;
+      for (MCRegUnit WU : TRI->regunits(WPhysReg)) {
+        for (MCRegUnit PU : TRI->regunits(PR))
+          if (WU == PU) {
+            TouchesPR = true;
+            break;
+          }
+        if (TouchesPR)
+          break;
+      }
+      if (!TouchesPR)
+        continue;
+      if (LIS->hasInterval(WReg) && LIS->getInterval(WReg).overlaps(VI)) {
+        Interferes = true;
+        break;
+      }
+    }
+    if (!Interferes) {
+      LLVM_DEBUG(dbgs() << "    gap pick (LIS): " << TRI->getName(PR) << "\n");
+      return PR;
+    }
+  }
+  return MCRegister();
+}
+
 MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     const TargetRegisterClass *RC, const LiveInterval &VI,
     ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs,
@@ -271,6 +546,35 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
                         << "\n");
       return Hint;
     }
+  }
+
+  if (EnableVirginOrder) {
+    // Width-tiered pick.
+    // (1) HACK PATH: scan this tier's VIRGIN order — aligned tuples untouched by
+    // any wider value, so guaranteed non-interfering by construction. Filter to
+    // RC->contains (a VReg value skips AGPR tuples of the vector super class,
+    // etc.). IsFree still enforces call-clobber legality and same-tier
+    // occupancy; virgin guarantees no WIDER interference.
+    bool IsVector = !TRI->isSGPRClass(RC);
+    auto It = VirginTierOrder.find({IsVector ? 1u : 0u, VIWidth});
+    if (It != VirginTierOrder.end()) {
+      for (MCRegister PR : It->second)
+        if (RC->contains(PR) && IsFree(PR)) {
+          LLVM_DEBUG(dbgs() << "    virgin pick: " << TRI->getName(PR) << "\n");
+          ++NumVirginPicks;
+          ++VirginPickByTier[{IsVector ? 1u : 0u, VIWidth}];
+          return PR;
+        }
+    }
+    // (2) GAP-SCAN: virgin exhausted — reuse a slot whose colored occupants are
+    // dead across VI's whole range (full-LIS-interval test).
+    if (MCRegister Gap = findNonInterferingGap(RC, VI)) {
+      ++NumGapPicks;
+      ++GapPickByTier[{IsVector ? 1u : 0u, VIWidth}];
+      return Gap;
+    }
+    // (3) None: caller spills (width-1 only).
+    return MCRegister();
   }
 
   for (MCRegister PR : RegClassInfo.getOrder(RC))
@@ -612,6 +916,28 @@ void AMDGPUSSARegisterAllocator::color() {
                       << (Phase == 0 ? "ACL" : "ordinary") << ") ===\n");
 
   for (unsigned Width : ColoringOrder) {
+    // Build this width's explicit virgin allocation orders once — one per pool
+    // (vector + scalar), since a width tier may hold values of either. Kept as
+    // separate tiers for transparency (SGPR/VGPR are disjoint sets). Only when
+    // the experiment is on.
+    if (EnableVirginOrder) {
+      buildVirginTierOrder(/*IsVector=*/true, Width);
+      buildVirginTierOrder(/*IsVector=*/false, Width);
+    }
+
+    // Forensic: the vregs this tier actually colors, split by pool, collected as
+    // we go and analyzed (rank vs virgin pool) after the width's block walk.
+    // TierVec/SgprFailed mirror them for values this tier could NOT color — they
+    // still competed for the virgin pool, so they belong in the rank.
+    SmallVector<Register, 64> TierVecVRegs, TierSgprVRegs;
+    SmallVector<Register, 8> TierVecFailed, TierSgprFailed;
+    auto RecordFail = [&](Register R) {
+      if (TRI->isSGPRClass(MRI->getRegClass(R)))
+        TierSgprFailed.push_back(R);
+      else
+        TierVecFailed.push_back(R);
+    };
+
     for (auto *Node : depth_first(MDT->getRootNode())) {
       MachineBasicBlock *MBB = Node->getBlock();
 
@@ -766,6 +1092,8 @@ void AMDGPUSSARegisterAllocator::color() {
             if (!Chosen) {
               // Collect-and-skip, as at the main pick site below.
               UncolorableVRegs.push_back(Reg);
+              if (EnableVirginOrder)
+                RecordFail(Reg);
               continue;
             }
             LLVM_DEBUG(dbgs() << "    color (undef self-tie): "
@@ -802,6 +1130,8 @@ void AMDGPUSSARegisterAllocator::color() {
                 }
               });
               UncolorableVRegs.push_back(Reg);
+              if (EnableVirginOrder)
+                RecordFail(Reg);
               continue;
             }
             LLVM_DEBUG(dbgs() << "    color: " << printReg(Reg, TRI) << " -> "
@@ -809,6 +1139,14 @@ void AMDGPUSSARegisterAllocator::color() {
           }
 
           ColorMap[Reg] = Chosen;
+          // Forensic collection: record the vreg this tier just colored, by
+          // pool, for the post-pass rank analysis.
+          if (EnableVirginOrder) {
+            if (TRI->isSGPRClass(MRI->getRegClass(Reg)))
+              TierSgprVRegs.push_back(Reg);
+            else
+              TierVecVRegs.push_back(Reg);
+          }
           // A dead def (e.g. the unused carry-out of V_ADD_CO_U32_e64) is not
           // live past this instruction, so it must not reserve a register going
           // forward. Marking it occupied would leak: the kill path only frees
@@ -841,6 +1179,14 @@ void AMDGPUSSARegisterAllocator::color() {
         for (MCRegister PR : DeferredFree)
           markFree(PR);
       }
+    } // block walk
+
+    // Forensic post-pass rank analysis for this width's two pool tiers.
+    if (EnableVirginOrder) {
+      analyzeTierRank(Phase, /*IsVector=*/true, Width, TierVecVRegs,
+                      TierVecFailed);
+      analyzeTierRank(Phase, /*IsVector=*/false, Width, TierSgprVRegs,
+                      TierSgprFailed);
     }
   } // width loop
   } // phase loop
@@ -959,9 +1305,37 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
   if (Copies.empty())
     return;
 
+  // Decompose every copy wider than one dword into per-dword (src.subK ->
+  // dst.subK) copies BEFORE building the dependence map. DstToSrc/SrcRefCount
+  // key on whole-MCRegister identity, which is blind to sub-register aliasing:
+  // a parallel assignment mixing a wide slice with narrow slices over the SAME
+  // physical dwords (e.g. v[0:3]<-v[28:31] together with v28<-v0, v29<-v1, ...)
+  // looks like unrelated map entries, so the write-after-read hazard between the
+  // wide write and a narrow read of the same dword goes undetected and the naive
+  // Phase-1 chain drain emits copies in an order that clobbers live values. At
+  // dword granularity aliasing becomes identity, so the hazard/cycle logic below
+  // is exact. Src is already narrowed to the slice width by every caller, so
+  // Src and Dst share the same width here.
+  SmallVector<std::pair<MCRegister, MCRegister>, 8> DwordCopies;
+  for (auto &[Src, Dst] : Copies) {
+    unsigned W = TRI->getRegSizeInBits(*TRI->getPhysRegBaseClass(Dst)) / 32;
+    if (W == 1) {
+      DwordCopies.push_back({Src, Dst});
+      continue;
+    }
+    for (unsigned K = 0; K < W; ++K) {
+      unsigned SubIdx = SIRegisterInfo::getSubRegFromChannel(K);
+      MCRegister S = TRI->getSubReg(Src, SubIdx);
+      MCRegister D = TRI->getSubReg(Dst, SubIdx);
+      assert(S && D && "per-dword subregister must exist");
+      if (S != D) // a slice already in place needs no copy
+        DwordCopies.push_back({S, D});
+    }
+  }
+
   DenseMap<MCRegister, MCRegister> DstToSrc;
   DenseMap<MCRegister, unsigned> SrcRefCount;
-  for (auto &[Src, Dst] : Copies) {
+  for (auto &[Src, Dst] : DwordCopies) {
     DstToSrc[Dst] = Src;
     SrcRefCount[Src]++;
   }
@@ -1473,6 +1847,8 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
   Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT, MLI);
 
+  if (EnableAGPRRescue)
+    widenToAVOnUnified(); // before classifyVRegs: widened widths feed the order
   classifyVRegs();
   OccupiedRegUnits.clear();
   OccupiedRegUnits.resize(TRI->getNumRegUnits());
@@ -1495,7 +1871,28 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // an already-placed value, so no successfully-colored value can be perturbed
   // into a new failure (the reason we do NOT recolor from clean). Each width-1
   // reload provably settles: point pressure at the use ≤ RPLimit < file size.
+  if (!UncolorableVRegs.empty() && EnableExperimentBail) {
+    // EXPERIMENT MODE: do NOT attempt the (possibly-crashing) spill+recolor.
+    // The forensic data we care about (per-tier rank vs virgin pool, virgin/gap/
+    // spill counts) is already collected during color(). Classify each failed
+    // value by width so the run terminates cleanly and -stats flushes, giving us
+    // the rank/feasibility verdict on ALL tests instead of aborting on the first.
+    NumTierSpills += UncolorableVRegs.size();
+    for (Register Failed : UncolorableVRegs) {
+      const TargetRegisterClass *RC = MRI->getRegClass(Failed);
+      LLVM_DEBUG(dbgs() << "  [EXPERIMENT] uncolorable " << printReg(Failed, TRI)
+                        << " width=" << TRI->getRegSizeInBits(*RC)
+                        << (TRI->getRegSizeInBits(*RC) == 32
+                                ? "  (width-1: spiller under-spilled its pool)"
+                                : "  (WIDE: spiller under-spilled a tuple)")
+                        << "\n");
+    }
+    // Bail cleanly — no destroySSA on an incompletely-colored function.
+    return true;
+  }
+
   if (!UncolorableVRegs.empty()) {
+    NumTierSpills += UncolorableVRegs.size();
     for (Register Failed : UncolorableVRegs) {
       // GATE: only width-1 (single-lane) values are spilled here. A wider tuple
       // that cannot be colored means the widest tier is over the limit — the
