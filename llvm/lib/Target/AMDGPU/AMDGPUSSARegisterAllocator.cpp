@@ -1776,6 +1776,12 @@ void AMDGPUSSARegisterAllocator::eliminateRegSequences(MachineFunction &MF) {
       // the copies naively in operand order corrupts such overlaps.
       SmallVector<std::pair<MCRegister, MCRegister>, 4> Copies;
       for (unsigned I = 1, E = MI.getNumOperands(); I < E; I += 2) {
+        // An undef source slice (e.g. `undef %175.sub0`) is a don't-care: the
+        // destination lanes it would fill are never read, so emit no copy.
+        // Lowering it would COPY from the undef value's physreg, which is never
+        // defined -> "Using an undefined physical register".
+        if (MI.getOperand(I).isUndef())
+          continue;
         MCRegister Src = MI.getOperand(I).getReg().asMCReg();
         unsigned SubIdx = MI.getOperand(I + 1).getImm();
         // The source class may be wider than the slice it fills (e.g. a 64-bit
