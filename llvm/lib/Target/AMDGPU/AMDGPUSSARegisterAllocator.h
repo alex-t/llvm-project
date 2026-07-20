@@ -162,6 +162,28 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void dumpOccupancyMap(const TargetRegisterClass *RC, SlotIndex SI,
                         const char *Tag, const LiveInterval *VI = nullptr) const;
 
+  // === Value-flow correctness verifier (-amdgpu-ssa-verify-value-flow) ===
+  // Certifies SSA-destruction + physreg assignment preserved VALUE IDENTITY:
+  // every physreg use holds the SSA value its vreg operand named. Catches the
+  // clobber-while-live class (a live value overwritten in its register) that
+  // liveness / reaching-def cannot see (both only tell "is there A value", never
+  // "is it THE value"). Ground truth = a snapshot taken PRE-destruction, while
+  // values are still vregs. v1 certifies single-basic-block functions (~92% of
+  // the corpus green set); multi-block functions are reported SKIP (uncertified)
+  // pending the meet-at-joins + dominance-rescue layer.
+  struct VFOp {
+    unsigned VReg;
+    unsigned SubReg;
+    bool IsDef;
+  };
+  DenseMap<const MachineInstr *, SmallVector<VFOp, 4>> VFIntent;
+  DenseMap<Register, MCRegister> VFColor; // ColorMap frozen pre-destruction
+  DenseMap<uint64_t, uint64_t> VFUF;      // union-find over (vreg,lane) keys
+  uint64_t vfFind(uint64_t X);
+  void vfUnion(uint64_t A, uint64_t B);
+  void snapshotValueFlow(MachineFunction &MF); // call BEFORE lowerPHIs
+  bool verifyValueFlow(MachineFunction &MF);   // call AFTER finalizeProperties
+
   MCRegister pickFreePhysReg(
       const TargetRegisterClass *RC, const LiveInterval &VI,
       ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs,

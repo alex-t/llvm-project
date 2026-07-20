@@ -57,6 +57,15 @@ static cl::opt<bool> EnableExperimentBail(
              "later NoVRegs pass will abort) — for measurement only. Off = the "
              "real width-1 spill path runs and the function completes."));
 
+static cl::opt<bool> EnableVerifyValueFlow(
+    "amdgpu-ssa-verify-value-flow", cl::Hidden, cl::init(false),
+    cl::desc("Certify every physreg use holds the SSA value its vreg named "
+             "(catches clobber-while-live; single-block functions in v1)"));
+
+static cl::opt<bool> VerifyValueFlowFatal(
+    "amdgpu-ssa-verify-value-flow-fatal", cl::Hidden, cl::init(false),
+    cl::desc("Abort on a value-flow violation (default: warn to stderr)"));
+
 static cl::opt<bool> EnableAGPRRescue(
     "amdgpu-ssa-agpr-rescue", cl::Hidden, cl::init(false),
     cl::desc("On unified-file targets, widen VGPR-class vregs to the av_ vector "
@@ -1823,6 +1832,247 @@ void AMDGPUSSARegisterAllocator::eliminateRegSequences(MachineFunction &MF) {
   }
 }
 
+// (vreg, dword-lane) packed into one key. 20 bits of lane is ample (max tuple is
+// 32 dwords). vreg index fits the upper bits.
+static uint64_t vfKey(unsigned VReg, unsigned Lane) {
+  return (uint64_t(VReg) << 20) | (Lane & 0xFFFFF);
+}
+
+uint64_t AMDGPUSSARegisterAllocator::vfFind(uint64_t X) {
+  auto It = VFUF.find(X);
+  if (It == VFUF.end()) {
+    VFUF[X] = X;
+    return X;
+  }
+  // Iterative find + path compression (no deep recursion on long value chains).
+  uint64_t R = X;
+  while (VFUF[R] != R)
+    R = VFUF[R];
+  while (VFUF[X] != R) {
+    uint64_t Next = VFUF[X];
+    VFUF[X] = R;
+    X = Next;
+  }
+  return R;
+}
+
+void AMDGPUSSARegisterAllocator::vfUnion(uint64_t A, uint64_t B) {
+  VFUF[vfFind(A)] = vfFind(B);
+}
+
+void AMDGPUSSARegisterAllocator::snapshotValueFlow(MachineFunction &MF) {
+  VFIntent.clear();
+  VFUF.clear();
+  VFColor.clear();
+  for (auto &[V, P] : ColorMap)
+    VFColor[V] = P;
+
+  auto Lanes = [&](Register R) {
+    return TRI->getRegSizeInBits(*MRI->getRegClass(R)) / 32;
+  };
+
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB) {
+      // PHI and REG_SEQUENCE are DISSOLVED by SSA destruction; their result is
+      // the SAME value as their operands (per lane). Merge the value classes so
+      // the final walk treats them as one token.
+      if (MI.isPHI()) {
+        Register R = MI.getOperand(0).getReg();
+        if (!R.isVirtual())
+          continue;
+        for (unsigned I = 1; I + 1 < MI.getNumOperands(); I += 2) {
+          Register Op = MI.getOperand(I).getReg();
+          if (!Op.isVirtual())
+            continue;
+          for (unsigned K = 0, E = Lanes(R); K < E; ++K)
+            vfUnion(vfKey(R.id(), K), vfKey(Op.id(), K));
+        }
+        continue;
+      }
+      if (MI.isRegSequence()) {
+        Register D = MI.getOperand(0).getReg();
+        if (!D.isVirtual())
+          continue;
+        for (unsigned I = 1; I + 1 < MI.getNumOperands(); I += 2) {
+          Register S = MI.getOperand(I).getReg();
+          if (!S.isVirtual())
+            continue;
+          unsigned Base =
+              TRI->getChannelFromSubReg(MI.getOperand(I + 1).getImm());
+          for (unsigned K = 0, E = Lanes(S); K < E; ++K)
+            vfUnion(vfKey(D.id(), Base + K), vfKey(S.id(), K));
+        }
+        continue;
+      }
+      // Ordinary instruction: record which value each vreg operand should carry,
+      // by the STABLE MachineInstr* (survives rewriteOperands, which edits in
+      // place). Skip undef operands (don't-care value).
+      auto &Ops = VFIntent[&MI];
+      for (const MachineOperand &MO : MI.operands())
+        if (MO.isReg() && MO.getReg().isVirtual() && !MO.isUndef())
+          Ops.push_back({MO.getReg().id(), MO.getSubReg(), MO.isDef()});
+    }
+}
+
+bool AMDGPUSSARegisterAllocator::verifyValueFlow(MachineFunction &MF) {
+  // v1: single-basic-block functions only. Multi-block needs the token-meet at
+  // joins (+ dominance rescue on the ⊤ residue) — reported SKIP for now.
+  if (MF.size() != 1) {
+    LLVM_DEBUG(dbgs() << "[value-flow] SKIP multi-block " << MF.getName()
+                      << "\n");
+    return false;
+  }
+  MachineBasicBlock &MBB = MF.front();
+
+  // Value tokens are tracked per 32-bit DWORD, not per reg-unit: on true16
+  // targets a VGPR_32 has TWO reg-units (lo16/hi16) but exactly one value; and
+  // the vfKey lane space is dwords. dwordKeys(P) returns one stable key per
+  // dword of P — the first reg-unit of that dword's sub-register — so Actual and
+  // the vfKey lane index agree at dword granularity.
+  auto dwordKeys = [&](MCRegister P) {
+    SmallVector<MCRegUnit, 8> Keys;
+    unsigned NW = TRI->getRegSizeInBits(*TRI->getPhysRegBaseClass(P)) / 32;
+    if (NW <= 1) {
+      Keys.push_back(*TRI->regunits(P).begin());
+      return Keys;
+    }
+    for (unsigned K = 0; K < NW; ++K) {
+      MCRegister D = TRI->getSubReg(P, SIRegisterInfo::getSubRegFromChannel(K));
+      Keys.push_back(*TRI->regunits(D).begin());
+    }
+    return Keys;
+  };
+
+  // Actual[dwordKey] = canonical value token currently held. High-bit spaces are
+  // used for "unknown but consistent" seeds so they never collide with vfKey
+  // value tokens.
+  DenseMap<MCRegUnit, uint64_t> Actual;
+  for (const auto &LI : MBB.liveins())
+    for (MCRegUnit U : dwordKeys(LI.PhysReg))
+      Actual[U] = (uint64_t(3) << 40) | U; // live-in: its own stable token
+
+  // Map an original operand's (vreg, subreg) to its physical (sub)register and
+  // the per-lane canonical token, using the frozen ColorMap.
+  auto physOf = [&](const VFOp &O) -> MCRegister {
+    MCRegister P = VFColor.lookup(O.VReg);
+    if (O.SubReg && P)
+      P = TRI->getSubReg(P, O.SubReg);
+    return P;
+  };
+  auto laneBase = [&](unsigned SubReg) -> unsigned {
+    return SubReg ? TRI->getChannelFromSubReg(SubReg) : 0;
+  };
+
+  unsigned Violations = 0;
+  for (MachineInstr &MI : MBB) {
+    auto It = VFIntent.find(&MI);
+    if (It != VFIntent.end()) {
+      // ORIGINAL instruction: check every use holds its intended value, THEN
+      // apply defs (a two-address def reads its use first).
+      for (const VFOp &O : It->second) {
+        if (O.IsDef)
+          continue;
+        MCRegister P = physOf(O);
+        if (!P)
+          continue;
+        unsigned Base = laneBase(O.SubReg);
+        unsigned K = 0;
+        for (MCRegUnit U : dwordKeys(P)) {
+          uint64_t Want = vfFind(vfKey(O.VReg, Base + K));
+          auto A = Actual.find(U);
+          if (A == Actual.end() || A->second != Want) {
+            errs() << "[value-flow] CLOBBER: " << printRegUnit(U, TRI)
+                   << " holds wrong value for " << printReg(O.VReg, TRI)
+                   << " at:  " << MI;
+            ++Violations;
+            break; // one report per operand
+          }
+          ++K;
+        }
+      }
+      for (const VFOp &O : It->second) {
+        if (!O.IsDef)
+          continue;
+        MCRegister P = physOf(O);
+        if (!P)
+          continue;
+        unsigned Base = laneBase(O.SubReg);
+        unsigned K = 0;
+        for (MCRegUnit U : dwordKeys(P))
+          Actual[U] = vfFind(vfKey(O.VReg, Base + K++));
+      }
+      continue;
+    }
+
+    // INSERTED instruction (COPY / V_SWAP_B32 / spill save-restore / reg move):
+    // propagate tokens. Read ALL sources from the pre-instruction state, then
+    // apply ALL writes atomically (so a swap/permutation re-homes tokens without
+    // a spurious mid-step "no holder" state).
+    SmallVector<std::pair<MCRegUnit, uint64_t>, 8> Writes;
+    auto tokOf = [&](MCRegUnit U) -> uint64_t {
+      auto A = Actual.find(U);
+      return A == Actual.end() ? 0 : A->second; // 0 = unknown/⊤
+    };
+    if (MI.isCopy()) {
+      MCRegister D = MI.getOperand(0).getReg();
+      MCRegister S = MI.getOperand(1).getReg();
+      if (unsigned Sub = MI.getOperand(1).getSubReg())
+        S = TRI->getSubReg(S, Sub);
+      if (unsigned Sub = MI.getOperand(0).getSubReg())
+        D = TRI->getSubReg(D, Sub);
+      if (D && S) {
+        SmallVector<MCRegUnit, 8> DK = dwordKeys(D), SK = dwordKeys(S);
+        for (unsigned K = 0; K < DK.size(); ++K)
+          Writes.push_back({DK[K], K < SK.size() ? tokOf(SK[K]) : 0});
+      }
+    } else {
+      // General reg-to-reg case (V_SWAP_B32, V_MOV_B32/B64 reg, etc.): match def
+      // operands to explicit reg-use operands positionally, per dword. Reads are
+      // snapshotted before writes are applied (atomic).
+      SmallVector<MCRegister, 4> Defs, Uses;
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg() || !MO.getReg() || !MO.getReg().isPhysical())
+          continue;
+        if (MO.isDef())
+          Defs.push_back(MO.getReg());
+        else if (MO.readsReg() && !MO.isImplicit())
+          Uses.push_back(MO.getReg());
+      }
+      // Only handle the shapes SSA-destruction emits: N defs paired with N uses
+      // (swap: 2/2; move: 1/1). Anything else → treat defs as fresh unknowns
+      // (a later original use against them carries real intent and will report if
+      // genuinely wrong; fresh is only reached for opaque inserts).
+      if (!Defs.empty() && Defs.size() == Uses.size()) {
+        SmallVector<SmallVector<uint64_t, 4>, 4> SrcToks;
+        for (MCRegister S : Uses) {
+          SrcToks.emplace_back();
+          for (MCRegUnit U : dwordKeys(S))
+            SrcToks.back().push_back(tokOf(U));
+        }
+        for (unsigned I = 0; I < Defs.size(); ++I) {
+          unsigned J = 0;
+          for (MCRegUnit DK : dwordKeys(Defs[I]))
+            Writes.push_back({DK, J < SrcToks[I].size() ? SrcToks[I][J++] : 0});
+        }
+      } else {
+        for (MCRegister D : Defs)
+          for (MCRegUnit DK : dwordKeys(D))
+            Writes.push_back({DK, (uint64_t(7) << 40) | DK}); // fresh unknown
+      }
+    }
+    for (auto &[U, T] : Writes)
+      Actual[U] = T;
+  }
+
+  if (Violations) {
+    errs() << "[value-flow] " << Violations << " violation(s) in "
+           << MF.getName() << "\n";
+    if (VerifyValueFlowFatal)
+      report_fatal_error("value-flow violations detected");
+  }
+  return false;
+}
+
 void AMDGPUSSARegisterAllocator::destroySSAAndRewrite(MachineFunction &MF) {
   if (hasCFPseudos(MF)) {
     LLVM_DEBUG(dbgs() << "SSA Destruction: skipped — "
@@ -1830,11 +2080,15 @@ void AMDGPUSSARegisterAllocator::destroySSAAndRewrite(MachineFunction &MF) {
     return;
   }
 
+  if (EnableVerifyValueFlow)
+    snapshotValueFlow(MF); // BEFORE lowerPHIs: values still SSA vregs
   lowerPHIs(MF);
   rewriteOperands(MF);
   eliminateRegSequences(MF);
   addPhysRegLiveIns(MF);
   finalizeProperties(MF);
+  if (EnableVerifyValueFlow)
+    verifyValueFlow(MF); // AFTER: everything physical
 }
 
 // === Main entry point ===
