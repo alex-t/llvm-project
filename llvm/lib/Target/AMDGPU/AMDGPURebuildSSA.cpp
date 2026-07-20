@@ -90,8 +90,18 @@ bool AMDGPURebuildSSALegacy::runOnMachineFunction(MachineFunction &MF) {
 
   for (auto &B : MF) {
     for (auto &I : B) {
-      for (auto Def : I.defs()) {
-        if (!Def.isReg() || !Def.getReg().isVirtual())
+      // Iterate ALL operands filtered by the isDef flag rather than I.defs():
+      // the defs() range helper returns only the leading explicit defs
+      // ([0, getNumExplicitDefs())), which is EMPTY for INLINEASM (its def
+      // operands sit after the asm string and flag immediates, not leading). So
+      // I.defs() misses a vreg defined only by INLINEASM (e.g. two INLINEASM
+      // lane-defs building a tuple: `def undef %V.sub1` + `def %V.sub0`), leaving
+      // it with two subreg defs and never converted to SSA -> MachineVerifier
+      // "Multiple virtual register defs in SSA form". Flag-based filtering visits
+      // every real def regardless of operand position. (Same fix as
+      // AMDGPUSSARegisterAllocator.cpp's def walk.)
+      for (MachineOperand &Def : I.operands()) {
+        if (!Def.isReg() || !Def.isDef() || !Def.getReg().isVirtual())
           continue;
 
         Register VReg = Def.getReg();
