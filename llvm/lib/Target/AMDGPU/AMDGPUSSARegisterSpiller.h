@@ -191,6 +191,17 @@ class AMDGPUSSARegisterSpiller : public MachineFunctionPass {
                       VRegMaskPairSet &Active, unsigned CurRP,
                       unsigned RPLimit);
 
+  /// After a wide value has a STRICT SUBSET of its lanes spilled (the "candidate
+  /// too large" split in getVMPsToSpill spills only enough lanes to hit the RP
+  /// number), the un-spilled remnant lanes stay bound to the WIDE vreg — so
+  /// coloring still pins an aligned tuple for what is now a narrow value,
+  /// blocking aligned placement of other wide values. Extract the contiguous
+  /// remnant into a fresh narrow vreg (COPY <wide>.subN -> %new after the wide
+  /// def; rewrite downstream uses of that sub-range to %new), so the wide vreg
+  /// fully vacates its tuple. \p Spilled is the set just spilled this step.
+  /// Returns true if any remnant was narrowed.
+  bool narrowSpilledRemnants(const VRegMaskPairSet &Spilled);
+
   /// Debug helper: dumps a register set to dbgs().
   void dumpRegSet(const VRegMaskPairSet &Regs) const;
 

@@ -136,6 +136,96 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
   emitReloadsAndRepairSSA(Info);
 }
 
+bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
+                                            LaneBitmask RemnantMask) {
+  MachineInstr *DefMI = MRI->getVRegDef(WideVReg);
+  if (!DefMI)
+    return false;
+  const TargetRegisterClass *RC = MRI->getRegClass(WideVReg);
+  const TargetRegisterClass *SubRC = TRI->getSubRegisterClass(RC, SubIdx);
+  if (!SubRC)
+    return false;
+
+  // Capture the remnant into an INDEPENDENT narrow vreg right after the wide def:
+  //   %new:SubRC = COPY WideVReg.SubIdx
+  // %new is a distinct value that happens to equal WideVReg's remnant lanes at
+  // this point. We then redirect the remnant-lane USES of WideVReg to %new. Once
+  // its last remnant use is redirected, WideVReg is live only [def, this copy],
+  // so its wide aligned tuple frees for the rest of the range.
+  MachineBasicBlock &MBB = *DefMI->getParent();
+  // Insert after the def. If the def is a PHI, all PHIs must stay contiguous at
+  // the block top, so insert after the last PHI (getFirstNonPHI), not
+  // immediately after this PHI (which would put a non-PHI COPY between PHIs ->
+  // "PHI after non-PHI" verifier error).
+  MachineBasicBlock::iterator InsertPt =
+      DefMI->isPHI() ? MBB.getFirstNonPHI() : std::next(DefMI->getIterator());
+  Register NewReg = MRI->createVirtualRegister(SubRC);
+  MachineInstr *CopyMI = BuildMI(MBB, InsertPt, DefMI->getDebugLoc(),
+                                 TII->get(TargetOpcode::COPY), NewReg)
+                             .addReg(WideVReg, 0, SubIdx);
+  LIS->InsertMachineInstrInMaps(*CopyMI);
+  SlotIndex CopySlot = LIS->getInstructionIndex(*CopyMI).getRegSlot();
+
+  // Redirect WideVReg's remnant-lane uses to %new — but ONLY those whose
+  // REACHING value is WideVReg's ORIGINAL def (the value the COPY captured).
+  // Dominance alone is unsound here (a use may be dominated yet its reaching VNI
+  // be a PHI merge or another def); the codebase deliberately uses reaching-VNI
+  // ownership, so mirror it: query WideVReg's LiveInterval for the VNInfo
+  // reaching each use and only rewrite when it is the COPY's source VNI. Only
+  // the remnant-mask lanes of the operand are eligible.
+  const LiveInterval &LI = LIS->getInterval(WideVReg);
+  VNInfo *SrcVNI = LI.getVNInfoBefore(CopySlot); // value the COPY read
+  bool Changed = false;
+  for (MachineOperand &MO :
+       llvm::make_early_inc_range(MRI->use_operands(WideVReg))) {
+    MachineInstr *UseMI = MO.getParent();
+    if (UseMI == CopyMI || UseMI->isDebugInstr() || isSpillInstr(UseMI))
+      continue;
+    // Operand must read only lanes within the remnant (a use of a spilled lane
+    // is served by a reload; a use spanning spilled+remnant is left alone —
+    // conservative, its reload path handles it).
+    LaneBitmask OpMask = MO.getSubReg()
+                             ? TRI->getSubRegIndexLaneMask(MO.getSubReg())
+                             : MRI->getMaxLaneMaskForVReg(WideVReg);
+    if ((OpMask & ~RemnantMask).any())
+      continue;
+    // Reaching-VNI gate: this use must read the same value the COPY captured.
+    SlotIndex UseSlot = LIS->getInstructionIndex(*UseMI).getRegSlot();
+    VNInfo *AtUse = LI.getVNInfoBefore(UseSlot);
+    if (!AtUse || AtUse != SrcVNI)
+      continue;
+    // The operand read exactly the remnant (SubIdx) lanes -> it maps to all of
+    // %new (SubReg 0). (Guaranteed: OpMask ⊆ RemnantMask and we only narrow a
+    // single contiguous remnant; a strict sub-slice would need a re-based
+    // sub-index, left for the updater-API version.)
+    if (OpMask != RemnantMask)
+      continue;
+    MO.setReg(NewReg);
+    MO.setSubReg(AMDGPU::NoRegister);
+    Changed = true;
+  }
+
+  if (!Changed) {
+    // No use was redirected; the copy is dead. Remove it and report no-op.
+    LIS->RemoveMachineInstrFromMaps(*CopyMI);
+    CopyMI->eraseFromParent();
+    if (LIS->hasInterval(NewReg))
+      LIS->removeInterval(NewReg);
+    return false;
+  }
+
+  LIS->createAndComputeVirtRegInterval(NewReg);
+  if (LIS->hasInterval(WideVReg))
+    LIS->removeInterval(WideVReg);
+  LIS->createAndComputeVirtRegInterval(WideVReg);
+
+  LLVM_DEBUG(dbgs() << "narrowRemnantToNewReg(): " << printReg(WideVReg, TRI)
+                    << " remnant " << PrintLaneMask(RemnantMask) << " -> "
+                    << printReg(NewReg, TRI) << " ("
+                    << TRI->getRegClassName(SubRC) << ")\n");
+  return true;
+}
+
 MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
   if (MachineInstr *Existing = StoredAtDefinition.lookup(VMP)) {
     LLVM_DEBUG({

@@ -196,6 +196,16 @@ public:
   /// and repair SSA inline. \p RPLimit bounds reload-hoist decisions.
   void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx, unsigned RPLimit);
 
+  /// After a partial spill leaves \p WideVReg with only its \p RemnantMask lanes
+  /// live (a contiguous sub-register named by \p SubIdx), extract that remnant
+  /// into a fresh narrow vreg so WideVReg vacates its aligned tuple. Inserts
+  /// `%new:SubRC = COPY WideVReg.SubIdx` right after WideVReg's def and uses the
+  /// SSA updater's rewriteDominatedUses to redirect the remnant-lane uses to
+  /// %new (dominance- and subreg-policy-correct, composing REG_SEQUENCEs where a
+  /// use spans the split). Returns true if the remnant was narrowed.
+  bool narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
+                             LaneBitmask RemnantMask);
+
   /// Reload vregs created so far (fresh names from SSA repair). Policy layers
   /// subtract these from their spill-candidate sets so a reload is never
   /// immediately re-spilled.

@@ -42,6 +42,13 @@ static cl::opt<bool>
                            cl::init(false), cl::Hidden);
 
 // ============================================================================
+static cl::opt<bool> EnableNarrowRemnant(
+    "amdgpu-ssa-narrow-spill-remnant", cl::init(true), cl::Hidden,
+    cl::desc("After a partial (strict-subset) spill of a wide value, extract the "
+             "un-spilled remnant lanes into a fresh narrow vreg so the wide vreg "
+             "vacates its aligned tuple (unblocks aligned placement)"));
+
+// ============================================================================
 static cl::opt<cl::boolOrDefault> VerifyFinalRP(
     "amdgpu-ssa-spiller-verify-rp",
     cl::desc("Verify final register pressure stays within the limit after SSA "
@@ -1140,11 +1147,65 @@ bool AMDGPUSSARegisterSpiller::spillAndReload(
     Emitter->spillOneVMP(VMP, KillIdx, RPLimit);
   }
 
+  // If a wide value had only a STRICT SUBSET of its lanes spilled, its remnant
+  // still occupies the wide (aligned-tuple) vreg. Narrow it so the tuple frees.
+  if (EnableNarrowRemnant)
+    narrowSpilledRemnants(ToSpill);
+
   LLVM_DEBUG(dbgs() << "spillAndReload(): Completed, spilled " << ToSpill.size()
                     << " VMP(s)\n");
   LLVM_DEBUG(dbgs() << "===================================\n\n");
 
   return true;
+}
+
+bool AMDGPUSSARegisterSpiller::narrowSpilledRemnants(
+    const VRegMaskPairSet &Spilled) {
+  // Aggregate the spilled lane mask per wide vreg.
+  DenseMap<Register, LaneBitmask> SpilledMask;
+  for (const auto &VMP : Spilled)
+    SpilledMask[VMP.getVReg()] |= VMP.getLaneMask();
+
+  bool Changed = false;
+  for (auto &[VReg, Mask] : SpilledMask) {
+    if (!VReg.isVirtual() || !LIS->hasInterval(VReg))
+      continue;
+    const TargetRegisterClass *RC = MRI->getRegClass(VReg);
+    if (!inCurrentFile(RC))
+      continue;
+    LaneBitmask Full = MRI->getMaxLaneMaskForVReg(VReg);
+    LaneBitmask Remnant = Full & ~Mask;
+    // Only act on a PARTIAL spill (some lanes spilled, a remnant survives) of a
+    // genuinely wide value.
+    if (Remnant.none() || Remnant == Full)
+      continue;
+    if (TRI->getRegSizeInBits(*RC) <= 32)
+      continue;
+
+    // Only narrow when the remnant is a SINGLE 32-bit lane. That is the case that
+    // actually relieves aligned-tuple pressure: a lone surviving lane still pins
+    // the wide value's aligned slot, blocking a wider value that needs it (the
+    // %123.sub3 case). A still-wide remnant (e.g. 6 of 8 dwords) gains nothing
+    // from being copied to another equally-wide vreg — worse, it just relocates
+    // the aligned-tuple burden and can itself become uncolorable (regressed
+    // schedule-amdgpu-tracker-physreg-crash: a VReg_192 remnant copied to a fresh
+    // VReg_192 that then failed coloring). So restrict to width-1 remnants.
+    if (TRI->getNumCoveredRegs(Remnant) != 1)
+      continue;
+
+    // The remnant must be a single contiguous sub-register we can name and copy.
+    unsigned SubIdx = TRI->getSubRegIndexForLaneMask(Remnant);
+    if (!SubIdx)
+      continue;
+
+    // Delegate the actual COPY + SSA-correct use rewrite to the emitter, which
+    // owns the MachineLaneSSAUpdater. It inserts `%new = COPY VReg.SubIdx` at the
+    // def and calls rewriteDominatedUses(VReg, %new, Remnant) — dominance- and
+    // subreg-policy-aware, composing REG_SEQUENCEs where a use spans the split.
+    if (Emitter->narrowRemnantToNewReg(VReg, SubIdx, Remnant))
+      Changed = true;
+  }
+  return Changed;
 }
 
 void AMDGPUSSARegisterSpiller::dumpRegSet(const VRegMaskPairSet &Regs) const {
