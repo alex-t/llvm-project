@@ -226,6 +226,62 @@ bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
   return true;
 }
 
+Register SSASpillEmitter::splitLiveRangeAt(Register V,
+                                           MachineBasicBlock::iterator SplitPt) {
+  if (!LIS->hasInterval(V))
+    return Register();
+  MachineBasicBlock &MBB = *SplitPt->getParent();
+  const TargetRegisterClass *RC = MRI->getRegClass(V);
+
+  // Insert %new = COPY %v just before SplitPt. SplitPt is required to be a
+  // non-PHI mid-block position, so no getFirstNonPHI dance is needed.
+  Register NewReg = MRI->createVirtualRegister(RC);
+  MachineInstr *CopyMI = BuildMI(MBB, SplitPt, SplitPt->getDebugLoc(),
+                                 TII->get(TargetOpcode::COPY), NewReg)
+                             .addReg(V);
+  LIS->InsertMachineInstrInMaps(*CopyMI);
+  SlotIndex CopySlot = LIS->getInstructionIndex(*CopyMI).getRegSlot();
+
+  // Redirect uses of %v that (a) sit at-or-after the copy and (b) read the same
+  // value the copy captured. Reaching-VNI ownership (not dominance) mirrors
+  // narrowRemnantToNewReg: a use may be dominated yet reach a different VNI
+  // (PHI merge / another def), so query %v's interval for the VNInfo reaching
+  // each use and only rewrite when it is the copy's source VNI.
+  const LiveInterval &LI = LIS->getInterval(V);
+  VNInfo *SrcVNI = LI.getVNInfoBefore(CopySlot);
+  bool Changed = false;
+  for (MachineOperand &MO : llvm::make_early_inc_range(MRI->use_operands(V))) {
+    MachineInstr *UseMI = MO.getParent();
+    if (UseMI == CopyMI || UseMI->isDebugInstr() || isSpillInstr(UseMI))
+      continue;
+    SlotIndex UseSlot = LIS->getInstructionIndex(*UseMI).getRegSlot();
+    if (UseSlot < CopySlot)
+      continue; // before the split: keeps reading %v
+    VNInfo *AtUse = LI.getVNInfoBefore(UseSlot);
+    if (!AtUse || AtUse != SrcVNI)
+      continue; // different reaching value: leave alone
+    MO.setReg(NewReg); // sub-register index (if any) preserved unchanged
+    Changed = true;
+  }
+
+  if (!Changed) {
+    LIS->RemoveMachineInstrFromMaps(*CopyMI);
+    CopyMI->eraseFromParent();
+    if (LIS->hasInterval(NewReg))
+      LIS->removeInterval(NewReg);
+    return Register();
+  }
+
+  LIS->createAndComputeVirtRegInterval(NewReg);
+  if (LIS->hasInterval(V))
+    LIS->removeInterval(V);
+  LIS->createAndComputeVirtRegInterval(V);
+
+  LLVM_DEBUG(dbgs() << "splitLiveRangeAt(): " << printReg(V, TRI) << " @ "
+                    << CopySlot << " -> " << printReg(NewReg, TRI) << "\n");
+  return NewReg;
+}
+
 MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
   if (MachineInstr *Existing = StoredAtDefinition.lookup(VMP)) {
     LLVM_DEBUG({

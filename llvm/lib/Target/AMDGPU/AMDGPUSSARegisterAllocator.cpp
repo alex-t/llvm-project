@@ -30,6 +30,10 @@ using namespace llvm;
 // OFF so the tree matches the committed `ssara` baseline; flip on to develop it.
 // The spiller reads this via a declaration in AMDGPUSSARegisterSpiller.cpp.
 namespace llvm {
+// Defined in AMDGPUSSARegisterSpiller.cpp; the allocator's coloring-time split
+// path reads it to gate blocker-splitting on the same flag as the spiller side.
+extern cl::opt<bool> EnableSplitLiveRanges;
+
 cl::opt<bool> EnableAMDGPUSSAACLColoring(
     "amdgpu-ssa-acl-coloring",
     cl::desc("Enable around-call-liver two-phase coloring and the spiller's "
@@ -47,6 +51,11 @@ static cl::opt<bool> EnableVirginOrder(
     "amdgpu-ssa-virgin-order", cl::Hidden, cl::init(false),
     cl::desc("Width-tiered coloring: scan whole-function-virgin aligned tuples "
              "first in pickFreePhysReg (SSARA experiment)"));
+
+static cl::opt<bool> EnableSlotDelta(
+    "amdgpu-ssa-slot-delta", cl::Hidden, cl::init(false),
+    cl::desc("Dump per-value theoretical-vs-factual free-slot delta per width "
+             "over [def, LI.end()) (SSARA fragmentation/threading experiment)"));
 
 static cl::opt<bool> EnableExperimentBail(
     "amdgpu-ssa-experiment-bail", cl::Hidden, cl::init(false),
@@ -490,10 +499,114 @@ AMDGPUSSARegisterAllocator::findNonInterferingGap(const TargetRegisterClass *RC,
   return MCRegister();
 }
 
+// Experiment probe: for the value VI (RC), over its whole span [def, LI.end()),
+// compare the OPTIMISTIC free-slot count floor(span_free/W) against the FACTUAL
+// count of aligned all-free W-windows. span_free = through-lanes (no colored
+// occupant overlaps VI along its range, minus call-clobbers). Emits [SLOTDELTA].
+void AMDGPUSSARegisterAllocator::dumpSpanWidthDelta(const TargetRegisterClass *RC,
+                                                    const LiveInterval &VI) {
+  // File selection: the width-1 base RC gives the dword lane enumeration.
+  const TargetRegisterClass *BaseRC =
+      TRI->isSGPRClass(RC)   ? &AMDGPU::SGPR_32RegClass
+      : TRI->isAGPRClass(RC) ? &AMDGPU::AGPR_32RegClass
+                             : &AMDGPU::VGPR_32RegClass;
+  ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(BaseRC);
+  const unsigned N = Order.size(); // budget in dwords (respects wave limit)
+
+  // Free[i] = dword lane i is a through-lane across all of VI. Index i is the
+  // position in the allocation order (contiguous 0..N-1), so aligned-window
+  // arithmetic below matches HW tuple alignment.
+  SmallVector<bool, 256> Free(N, true);
+  for (unsigned i = 0; i < N; ++i) {
+    MCRegister PR = Order[i];
+    // (a) call-clobber: VI live across a call that clobbers this lane.
+    for (const auto &[CallIdx, CallMI] : CallSites) {
+      if (!VI.liveAt(CallIdx))
+        continue;
+      if (CallMI->modifiesRegister(PR, TRI)) {
+        Free[i] = false;
+        break;
+      }
+      for (const MachineOperand &MO : CallMI->operands())
+        if (MO.isRegMask() && MO.clobbersPhysReg(PR)) {
+          Free[i] = false;
+          break;
+        }
+    }
+    if (!Free[i])
+      continue;
+    // (b) span interference: any colored occupant touching PR overlaps VI.
+    for (const auto &[WReg, WPhys] : ColorMap) {
+      if (!LIS->hasInterval(WReg))
+        continue;
+      bool Touches = false;
+      for (MCRegUnit WU : TRI->regunits(WPhys)) {
+        for (MCRegUnit PU : TRI->regunits(PR))
+          if (WU == PU) {
+            Touches = true;
+            break;
+          }
+        if (Touches)
+          break;
+      }
+      if (Touches && LIS->getInterval(WReg).overlaps(VI)) {
+        Free[i] = false;
+        break;
+      }
+    }
+  }
+
+  unsigned SpanFree = 0;
+  for (unsigned i = 0; i < N; ++i)
+    SpanFree += Free[i];
+
+  // point_free at the def instant (OccupiedRegUnits is current point-occupancy).
+  unsigned PointFree = 0;
+  for (unsigned i = 0; i < N; ++i) {
+    bool Occ = false;
+    for (MCRegUnit U : TRI->regunits(Order[i]))
+      if (OccupiedRegUnits.test(U)) {
+        Occ = true;
+        break;
+      }
+    if (!Occ)
+      ++PointFree;
+  }
+
+  StringRef FnName = MRI->getVRegDef(VI.reg())->getParent()->getParent()->getName();
+  dbgs() << "[SLOTDELTA] fn=" << FnName << " vreg=" << printReg(VI.reg(), TRI)
+         << " rc=" << TRI->getRegClassName(RC) << " span=[" << VI.beginIndex()
+         << "," << VI.endIndex() << ")"
+         << " budget=" << N << " span_free=" << SpanFree
+         << " point_free=" << PointFree
+         << " delta_thread=" << (PointFree >= SpanFree ? PointFree - SpanFree : 0);
+  // Per-width: theoretical = floor(span_free/W); factual = aligned all-free
+  // W-windows (window at absolute index j..j+W-1, j % W == 0, all Free).
+  for (unsigned W = 1; W <= 16; W <<= 1) {
+    unsigned Theo = SpanFree / W;
+    unsigned Fact = 0;
+    for (unsigned j = 0; j + W <= N; j += W) {
+      bool AllFree = true;
+      for (unsigned k = 0; k < W; ++k)
+        if (!Free[j + k]) {
+          AllFree = false;
+          break;
+        }
+      if (AllFree)
+        ++Fact;
+    }
+    dbgs() << " | W" << W << " theo=" << Theo << " fact=" << Fact
+           << " dfrag=" << (Theo >= Fact ? Theo - Fact : 0);
+  }
+  dbgs() << "\n";
+}
+
 MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     const TargetRegisterClass *RC, const LiveInterval &VI,
     ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs,
     ArrayRef<MCRegister> Hints) {
+  if (EnableSlotDelta)
+    dumpSpanWidthDelta(RC, VI);
   LLVM_DEBUG({
     dbgs() << "    Allocation order for " << TRI->getRegClassName(RC) << ":";
     for (MCRegister PR : RegClassInfo.getOrder(RC))
@@ -804,6 +917,133 @@ bool AMDGPUSSARegisterAllocator::edgeCopiesNeedSplit(
         return true;
   }
   return false;
+}
+
+bool AMDGPUSSARegisterAllocator::trySplitColorViaBlocker(Register Failed,
+                                                         unsigned RPLimit) {
+  const TargetRegisterClass *RC = MRI->getRegClass(Failed);
+  const LiveInterval &FI = LIS->getInterval(Failed);
+  SlotIndex FS = FI.beginIndex(), FE = FI.endIndex();
+
+  // Candidate blockers: colored values whose physreg P is (a) legal for Failed's
+  // RC, (b) occupied across Failed's whole range ONLY by B (B overlaps FI), and
+  // (c) B is LIVE-THROUGH FI — no use of B strictly inside [FS,FE). Such a B can
+  // be spilled across FI with its reload landing AFTER FE, so P frees over all of
+  // FI with no interior reload (the only sound way to vacate a lane at full
+  // point-pressure — a used-inside interferer would re-thread).
+  SmallVector<std::pair<Register, MCRegister>, 4> Candidates;
+  unsigned NOverlap = 0, NLiveThru = 0, NNotUsed = 0;
+  for (const auto &[B, P] : ColorMap) {
+    if (B == Failed || !LIS->hasInterval(B))
+      continue;
+    // B's physreg must overlap a register Failed could use: some reg unit of P
+    // (or of a wider B's aligned tuple) must be a unit Failed's RC can hold. For
+    // a width-1 Failed, any B whose color includes a Failed-legal lane qualifies
+    // (a wide B occupies several lanes; freeing it frees all of them).
+    bool PLegal = false;
+    for (MCRegister Cand : RegClassInfo.getOrder(RC)) {
+      for (MCRegUnit CU : TRI->regunits(Cand)) {
+        for (MCRegUnit PU : TRI->regunits(P))
+          if (CU == PU) {
+            PLegal = true;
+            break;
+          }
+        if (PLegal)
+          break;
+      }
+      if (PLegal)
+        break;
+    }
+    if (!PLegal)
+      continue;
+    const LiveInterval &BI = LIS->getInterval(B);
+    if (!BI.overlaps(FI))
+      continue;
+    ++NOverlap;
+    // Live-through: B must be live at FS and FE and have no use inside (FS,FE).
+    if (!BI.liveAt(FS) || !BI.liveAt(FE.getPrevSlot()))
+      continue;
+    ++NLiveThru;
+    bool UsedInside = false;
+    for (const MachineOperand &MO : MRI->use_operands(B)) {
+      SlotIndex U = LIS->getInstructionIndex(*MO.getParent()).getRegSlot();
+      if (FS < U && U < FE) {
+        UsedInside = true;
+        break;
+      }
+    }
+    if (UsedInside)
+      continue;
+    ++NNotUsed;
+    Candidates.emplace_back(B, P);
+  }
+
+  LLVM_DEBUG(dbgs() << "  split-color: " << printReg(Failed, TRI) << " ["
+                    << FS << "," << FE << ") candidates: overlap=" << NOverlap
+                    << " livethru=" << NLiveThru << " notused=" << NNotUsed
+                    << " final=" << Candidates.size() << "\n");
+
+  if (Candidates.empty())
+    return false;
+
+  // Select only when there is a choice. >1: prefer the blocker whose live range
+  // extends farthest past FE (most wasteful to hold P for one lane; its reload is
+  // furthest from FI). ==1: take it.
+  auto Pick = Candidates[0];
+  if (Candidates.size() > 1) {
+    SlotIndex Best;
+    for (const auto &C : Candidates) {
+      SlotIndex E = LIS->getInterval(C.first).endIndex();
+      if (!Best.isValid() || Best < E) {
+        Best = E;
+        Pick = C;
+      }
+    }
+  }
+  Register B = Pick.first;
+  MCRegister P = Pick.second;
+
+  LLVM_DEBUG(dbgs() << "  split-color: spilling live-through blocker "
+                    << printReg(B, TRI) << " (phys " << TRI->getName(P)
+                    << ") across " << printReg(Failed, TRI) << " ["
+                    << FS << "," << FE << ")\n");
+
+  // Spill B across FI: store at B's def, free at FS, reload at B's uses reachable
+  // from FS — all after FE (live-through guarantee), so P is free over all of FI.
+  bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+  Emitter->beginPass(IsVGPR);
+  Emitter->spillOneVMP(VRegMaskPair(B, MRI->getMaxLaneMaskForVReg(B)), FS,
+                       RPLimit);
+
+  // B's whole-range assignment P is now invalid: spillOneVMP replaced B's long
+  // range with a short head stub + fresh narrow reload redefs. Drop P and RE-
+  // COLOR each surviving piece with colorOneInPlace (the proven width-safe path
+  // used by the ordinary coloring-time spill). Forcing P onto the reloads is
+  // UNSOUND when B is wide: spillOneVMP decomposes a wide B into narrower reload
+  // chunks (e.g. AV64 pieces of a 1024-bit tuple), and a narrow reload cannot
+  // hold the wide physreg P -> "incorrect register class" verifier error.
+  // Freeing B's units is what opens the lane for Failed; the colorer then places
+  // B's head, B's reloads, and Failed each at its correct width.
+  ColorMap.erase(B);
+  auto ColorInPlace = [&](Register R) -> bool {
+    if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
+        MRI->reg_nodbg_empty(R))
+      return true;
+    return colorOneInPlace(R);
+  };
+  bool OK = ColorInPlace(B); // surviving head stub
+  for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+    OK &= ColorInPlace(VMP.getVReg()); // fresh reload redefs
+  OK &= ColorInPlace(Failed);          // the value we set out to place
+
+  if (!OK) {
+    LLVM_DEBUG(dbgs() << "  split-color: a piece remained uncolorable after "
+                         "blocker spill\n");
+    return false;
+  }
+  LLVM_DEBUG(dbgs() << "  split-color: colored " << printReg(Failed, TRI)
+                    << " via split of " << printReg(B, TRI) << "\n");
+  return true;
 }
 
 void AMDGPUSSARegisterAllocator::color() {
@@ -2237,12 +2477,22 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
              "coloring-time spill is width-1 only; wider failure = up-front "
              "spiller under-spilled");
 
-      MachineInstr *DefMI = MRI->getVRegDef(Failed);
-      assert(DefMI && "uncolorable value must have a def in SSA");
-      SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
       bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
       unsigned RPLimit =
           IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+
+      // LIVE-RANGE SPLITTING (experiment): Failed has no through-lane across its
+      // range, but the file is point-feasible — some physreg's only occupant
+      // across Failed's (short) range is a LIVE-THROUGH liver B (no use inside).
+      // Spilling B across frees B's physreg P over Failed's range with no
+      // interior reload; color Failed into P and keep B's reload in P too. This
+      // is Hack-compatible (stays SSA) and avoids spilling Failed itself.
+      if (EnableSplitLiveRanges && trySplitColorViaBlocker(Failed, RPLimit))
+        continue;
+
+      MachineInstr *DefMI = MRI->getVRegDef(Failed);
+      assert(DefMI && "uncolorable value must have a def in SSA");
+      SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
       LLVM_DEBUG(dbgs() << "SSA RA: spilling uncolorable " << printReg(Failed,
                                                                        TRI)
                         << " (kill-at-def) and coloring reloads in place\n");

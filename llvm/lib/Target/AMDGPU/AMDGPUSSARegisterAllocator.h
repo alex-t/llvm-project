@@ -96,6 +96,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // Returns 0 if none.
   MCRegister findNonInterferingGap(const TargetRegisterClass *RC,
                                    const LiveInterval &VI);
+  void dumpSpanWidthDelta(const TargetRegisterClass *RC, const LiveInterval &VI);
   unsigned MaxVGPRIdx = 0;
   unsigned MaxSGPRIdx = 0;
   unsigned MaxAGPRIdx = 0;
@@ -141,6 +142,15 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// after a coloring-failure spill. Returns false if no register is free
   /// (should not happen for a width-1 reload — point pressure ≤ limit < file).
   bool colorOneInPlace(Register R);
+
+  /// Coloring-time live-range split (experiment, gated by
+  /// -amdgpu-ssa-split-live-ranges). \p Failed is a width-1 value with no
+  /// through-lane. Find a colored liver B whose physreg P is occupied across
+  /// Failed's whole (short) range ONLY by B and B is LIVE-THROUGH there (no use
+  /// inside), spill B across so P frees over Failed's range with no interior
+  /// reload, color Failed into P, and keep B's reload in P. Returns true if
+  /// Failed was colored this way; false to fall back to spilling Failed itself.
+  bool trySplitColorViaBlocker(Register Failed, unsigned RPLimit);
   void seedOccupiedAtBBEntry(MachineBasicBlock *MBB);
   // True if the parallel PHI edge-copies for Pred->MBB cannot be safely placed
   // at Pred's terminator (they would clobber a value live into a sibling

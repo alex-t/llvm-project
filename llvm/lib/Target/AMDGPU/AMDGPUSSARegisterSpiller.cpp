@@ -48,6 +48,15 @@ static cl::opt<bool> EnableNarrowRemnant(
              "un-spilled remnant lanes into a fresh narrow vreg so the wide vreg "
              "vacates its aligned tuple (unblocks aligned placement)"));
 
+namespace llvm {
+cl::opt<bool> EnableSplitLiveRanges(
+    "amdgpu-ssa-split-live-ranges", cl::init(false), cl::Hidden,
+    cl::desc("After RP spilling, split values that are point-feasible but have no "
+             "physreg free across their whole span (span_free=0) at the region "
+             "boundary, so coloring can place the halves separately (SSARA "
+             "live-range-splitting experiment)"));
+} // namespace llvm
+
 // ============================================================================
 static cl::opt<cl::boolOrDefault> VerifyFinalRP(
     "amdgpu-ssa-spiller-verify-rp",

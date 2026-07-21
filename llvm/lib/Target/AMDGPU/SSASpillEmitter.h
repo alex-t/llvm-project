@@ -206,6 +206,16 @@ public:
   bool narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
                              LaneBitmask RemnantMask);
 
+  /// Live-range split (Hack-compatible, pre-coloring): insert
+  /// `%new = COPY \p V` just before \p SplitPt and redirect every use of \p V
+  /// at-or-after the copy (whose reaching value is the one live at the split) to
+  /// %new. \p V then ends at the copy; the two halves no longer interfere across
+  /// SplitPt, so coloring may place them in different physregs (reopening an
+  /// aligned through-lane mid-life). Stays in SSA, so the interference graph
+  /// stays chordal. Returns %new, or a null Register if nothing was redirected
+  /// (dead copy removed). \p SplitPt must be a non-PHI, mid-block position.
+  Register splitLiveRangeAt(Register V, MachineBasicBlock::iterator SplitPt);
+
   /// Reload vregs created so far (fresh names from SSA repair). Policy layers
   /// subtract these from their spill-candidate sets so a reload is never
   /// immediately re-spilled.
