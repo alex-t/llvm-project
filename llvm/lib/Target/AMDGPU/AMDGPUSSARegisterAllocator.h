@@ -151,6 +151,26 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// reload, color Failed into P, and keep B's reload in P. Returns true if
   /// Failed was colored this way; false to fall back to spilling Failed itself.
   bool trySplitColorViaBlocker(Register Failed, unsigned RPLimit);
+
+  /// Self-split (experiment, gated by -amdgpu-ssa-split-live-ranges): \p Failed is
+  /// a long liver with no through-lane AND no live-through blocker to spill around
+  /// (trySplitColorViaBlocker found nothing). Chop Failed into segments, each
+  /// short enough that one physreg is free across it, coloring each into that reg.
+  /// Only valid when Failed is POINT-FEASIBLE (some PR free at every slot); aborts
+  /// (returns false -> caller memory-spills) if any slot has zero free PRs.
+  bool trySelfSplitColor(Register Failed);
+  // (declared once; defined in the .cpp)
+
+  /// Single linear scan over ColorMap for \p VI: the shared "collect" step of the
+  /// gap-scan / split pipeline. ORs the register units of every colored occupant
+  /// whose interval overlaps VI into \p OccupiedUnits. \p Overlappers is optional:
+  /// when non-null it also collects (occupant vreg, its physreg) for each. The gap
+  /// pick (findNonInterferingGap) passes nullptr (needs only occupancy); the
+  /// splitter (trySplitColorViaBlocker) passes a vector. NOT cacheable across the
+  /// two — they run in different phases with ColorMap mutated between.
+  void scanOverlappersForVI(
+      const LiveInterval &VI, BitVector &OccupiedUnits,
+      SmallVectorImpl<std::pair<Register, MCRegister>> *Overlappers = nullptr);
   void seedOccupiedAtBBEntry(MachineBasicBlock *MBB);
   // True if the parallel PHI edge-copies for Pred->MBB cannot be safely placed
   // at Pred's terminator (they would clobber a value live into a sibling
