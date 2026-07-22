@@ -1857,6 +1857,15 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
   // per cycle from its own registers, never from a block-wide assumption.
   const MachineFunction &MF = *MBB.getParent();
 
+  // A cycle's scratch register is TRANSIENT: it is saved at the cycle start and
+  // restored (its value moved out, leaving it dead) at the cycle end, so the
+  // NEXT cycle can reuse the same index. Track each file's peak scratch usage
+  // separately and fold it back into the reported high-water AFTER the loop, so
+  // the base index we hand each cycle is the reused (pre-scratch) high-water
+  // rather than one that permanently grows per cycle (which over-counted usage
+  // and tripped the no-scratch asserts early).
+  unsigned PeakVGPR = MaxVGPRIdx, PeakAGPR = MaxAGPRIdx, PeakSGPR = MaxSGPRIdx;
+
   while (!DstToSrc.empty()) {
     // Pick any entry as cycle start — all remaining entries form disjoint
     // cycles, and the walk traces the full cycle regardless of entry point.
@@ -1921,7 +1930,11 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
               ? ScratchBase
               : TRI->getMatchingSuperReg(ScratchBase, AMDGPU::sub0,
                                          TRI->getPhysRegBaseClass(CycleStart));
-      MaxIdx += CycleWidth;
+      // The scratch transiently occupies [MaxIdx, MaxIdx + CycleWidth): record
+      // that as this file's peak, but do NOT advance MaxIdx — the scratch is dead
+      // after this cycle's restore, so the next cycle reuses the same base index.
+      unsigned &Peak = IsVGPR ? PeakVGPR : (IsAGPR ? PeakAGPR : PeakSGPR);
+      Peak = std::max(Peak, MaxIdx + CycleWidth);
 
       LLVM_DEBUG(dbgs() << "    cycle via scratch " << TRI->getName(Scratch)
                         << ":\n");
@@ -1977,6 +1990,12 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
                         << " <-> " << TRI->getName(Cycle[I]) << "\n");
     }
   }
+
+  // Fold each file's transient-scratch peak back into the reported high-water.
+  // (No-op unless a scratch cycle raised it above the entering value.)
+  MaxVGPRIdx = std::max(MaxVGPRIdx, PeakVGPR);
+  MaxAGPRIdx = std::max(MaxAGPRIdx, PeakAGPR);
+  MaxSGPRIdx = std::max(MaxSGPRIdx, PeakSGPR);
 }
 
 void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
