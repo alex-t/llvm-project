@@ -15,6 +15,7 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/LiveIntervals.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/InitializePasses.h"
@@ -1784,6 +1785,53 @@ void AMDGPUSSARegisterAllocator::emitSwap(MachineBasicBlock &MBB,
   SwapInChunks(4);
 }
 
+void AMDGPUSSARegisterAllocator::breakCycleViaMemory(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
+    MCRegister CycleStart, DenseMap<MCRegister, MCRegister> &DstToSrc) {
+  // Break a permutation cycle with a MEMORY scratchpad when no free scratch
+  // register exists in the cycle's file (the file is full). Mirrors the
+  // register-scratch path but the "saved value" lives on the stack:
+  //   store CycleStart -> stack ; walk cycle with reg copies ; reload -> last reg.
+  // storeRegToStackSlot/loadRegFromStackSlot emit SI_SPILL_* pseudos; the later
+  // frame lowering (SILowerSGPRSpills / eliminateFrameIndex, both after this pass)
+  // supplies any intermediate VGPR (AGPR spills) and keeps EXEC/SCC safe (SGPR
+  // spills), so we do not manage those here.
+  const TargetRegisterClass *RC = TRI->getPhysRegBaseClass(CycleStart);
+  unsigned Bits = TRI->getRegSizeInBits(*RC);
+  int FI = MBB.getParent()->getFrameInfo().CreateSpillStackObject(
+      Bits / 8, Align(Bits / 8));
+
+  LLVM_DEBUG(dbgs() << "    cycle via MEMORY scratch (fi=" << FI << "), start "
+                    << TRI->getName(CycleStart) << ":\n");
+
+  // Save CycleStart to the slot (its register is about to be overwritten).
+  // NB: like the rest of resolvePermutation (SSA destruction, post-coloring), we
+  // do NOT maintain SlotIndexes/LIS here — they are no longer needed downstream.
+  TII->storeRegToStackSlot(MBB, InsertPt, CycleStart, /*isKill=*/false, FI, RC,
+                           TRI, /*VReg=*/Register());
+
+  // Walk the cycle: each Cur gets its Src via a register copy, except the final
+  // member (whose Src is CycleStart, now on the stack) which is reloaded.
+  MCRegister Cur = CycleStart;
+  while (true) {
+    MCRegister Src = DstToSrc[Cur];
+    DstToSrc.erase(Cur);
+    if (!DstToSrc.count(Src)) {
+      assert(Src == CycleStart && "Cycle walk did not return to start");
+      TII->loadRegFromStackSlot(MBB, InsertPt, Cur, FI, RC, TRI,
+                                /*VReg=*/Register());
+      LLVM_DEBUG(dbgs() << "      reload: fi=" << FI << " -> "
+                        << TRI->getName(Cur) << "\n");
+      break;
+    }
+    BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY), Cur)
+        .addReg(Src);
+    LLVM_DEBUG(dbgs() << "      " << TRI->getName(Src) << " -> "
+                      << TRI->getName(Cur) << "\n");
+    Cur = Src;
+  }
+}
+
 void AMDGPUSSARegisterAllocator::resolvePermutation(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
     SmallVectorImpl<std::pair<MCRegister, MCRegister>> &Copies) {
@@ -1901,23 +1949,34 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
     //   SGPR: there is no scalar swap. emitSwap uses an S_XOR triplet, which
     //         writes SCC and is therefore only safe when SCC is dead here.
     //         Otherwise a scratch COPY is the only SCC-preserving option.
+    // NeedMemFallback: the cycle requires a scratch register but none is free
+    // (the file is full). Rather than assert, break the cycle through a MEMORY
+    // scratchpad (store a member, walk with copies, reload) — this is what Greedy
+    // does when both files are full. storeRegToStackSlot/loadRegFromStackSlot emit
+    // SI_SPILL_* pseudos whose intermediate-register/EXEC/SCC details are handled
+    // by the later frame lowering (SILowerSGPRSpills runs after this pass).
     bool UseScratch;
+    bool NeedMemFallback = false;
     if (IsVGPR) {
       UseScratch = !ST->hasSwap() && ScratchOcc == CurrentOcc && ScratchFits;
     } else if (IsAGPR) {
       // AGPRs have no swap or XOR primitive, so an in-place emitSwap is
       // impossible; a scratch AGPR (plain COPYs, legalized to AGPR moves
-      // downstream) is the only way to break the cycle.
-      UseScratch = true;
-      assert(ScratchFits &&
-             "AGPR permutation cycle with no free scratch register");
+      // downstream) is the only way to break the cycle — or, if none fits, memory.
+      UseScratch = ScratchFits;
+      NeedMemFallback = !ScratchFits;
     } else {
       bool SccDead = MBB.computeRegisterLiveness(TRI, AMDGPU::SCC, InsertPt) ==
                      MachineBasicBlock::LQR_Dead;
-      UseScratch = !SccDead;
-      assert(
-          (!UseScratch || ScratchFits) &&
-          "SGPR permutation cycle with live SCC and no free scratch register");
+      // SCC dead -> in-place S_XOR triplet. SCC live -> need a scratch COPY
+      // (S_XOR would clobber SCC); if none fits, memory fallback.
+      UseScratch = !SccDead && ScratchFits;
+      NeedMemFallback = !SccDead && !ScratchFits;
+    }
+
+    if (NeedMemFallback) {
+      breakCycleViaMemory(MBB, InsertPt, CycleStart, DstToSrc);
+      continue;
     }
 
     if (UseScratch && ScratchFits) {

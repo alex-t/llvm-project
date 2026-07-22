@@ -244,6 +244,13 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void resolvePermutation(
       MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
       SmallVectorImpl<std::pair<MCRegister, MCRegister>> &Copies);
+  // Break a permutation cycle through a memory scratchpad when no free scratch
+  // register exists in the cycle's file (store a member, walk with copies,
+  // reload). Used by resolvePermutation as the fallback for full-file cycles.
+  void breakCycleViaMemory(MachineBasicBlock &MBB,
+                           MachineBasicBlock::iterator InsertPt,
+                           MCRegister CycleStart,
+                           DenseMap<MCRegister, MCRegister> &DstToSrc);
   void emitSwap(MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
                 MCRegister RegA, MCRegister RegB);
   void rewriteOperands(MachineFunction &MF);
