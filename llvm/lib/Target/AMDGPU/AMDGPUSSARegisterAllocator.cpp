@@ -1067,6 +1067,64 @@ bool AMDGPUSSARegisterAllocator::trySplitColorViaBlocker(Register Failed,
   return true;
 }
 
+void AMDGPUSSARegisterAllocator::commitColor(Register Piece, MCRegister PR) {
+  ColorMap[Piece] = PR;
+  unsigned Idx = TRI->getHWRegIndex(PR);
+  unsigned W = TRI->getRegSizeInBits(*MRI->getRegClass(Piece)) / 32;
+  const TargetRegisterClass *PhysRC = TRI->getPhysRegBaseClass(PR);
+  if (TRI->isVGPRClass(PhysRC))
+    MaxVGPRIdx = std::max(MaxVGPRIdx, Idx + W);
+  else if (TRI->isAGPRClass(PhysRC))
+    MaxAGPRIdx = std::max(MaxAGPRIdx, Idx + W);
+  else if (TRI->isSGPRClass(PhysRC))
+    MaxSGPRIdx = std::max(MaxSGPRIdx, Idx + W);
+}
+
+SlotIndex AMDGPUSSARegisterAllocator::firstBlockAfter(
+    MCRegister PR, SlotIndex S, SlotIndex End,
+    ArrayRef<std::pair<Register, MCRegister>> Overlappers) const {
+  // Call-clobber: a call in (S,End) clobbering PR bounds the free run there.
+  SlotIndex Best = End;
+  for (const auto &[CallIdx, CallMI] : CallSites) {
+    if (CallIdx <= S || End <= CallIdx)
+      continue;
+    bool Clob = CallMI->modifiesRegister(PR, TRI);
+    if (!Clob)
+      for (const MachineOperand &MO : CallMI->operands())
+        if (MO.isRegMask() && MO.clobbersPhysReg(PR)) {
+          Clob = true;
+          break;
+        }
+    if (Clob && CallIdx < Best)
+      Best = CallIdx;
+  }
+  for (const auto &[WReg, WPhys] : Overlappers) {
+    bool Touches = false;
+    for (MCRegUnit WU : TRI->regunits(WPhys)) {
+      for (MCRegUnit PU : TRI->regunits(PR))
+        if (WU == PU) {
+          Touches = true;
+          break;
+        }
+      if (Touches)
+        break;
+    }
+    if (!Touches)
+      continue;
+    const LiveInterval &WI = LIS->getInterval(WReg);
+    for (const LiveRange::Segment &Seg : WI.segments) {
+      if (Seg.end <= S)
+        continue; // entirely before the piece start
+      if (Seg.start <= S)
+        return S; // occupied AT S -> PR not free here
+      if (Seg.start < Best)
+        Best = Seg.start; // first block after S
+      break;              // segments are sorted; earliest found
+    }
+  }
+  return Best;
+}
+
 bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
   // SELF-SPLIT — Failed IS ITSELF the long liver: no single PR is free across its
   // whole range, and no separate live-through blocker exists to spill around
@@ -1083,54 +1141,44 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
   // let the caller fall through to the width-1 spill path. First cut also bails on
   // a boundary that is not a clean non-PHI instruction.
   const TargetRegisterClass *RC = MRI->getRegClass(Failed);
+  bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+  const MachineFunction &MF = MRI->getMF();
+  unsigned RPLimit = IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
 
-  // firstBlockAfter(PR, S, End): if PR is occupied AT S by an overlapping colored
-  // value (or call-clobbered at S) -> return S (PR not free here). Otherwise the
-  // earliest slot > S where PR becomes occupied, clamped to End. Overlappers is
-  // the shared scan's occupant list for the CURRENT piece.
-  auto firstBlockAfter =
-      [&](MCRegister PR, SlotIndex S, SlotIndex End,
-          ArrayRef<std::pair<Register, MCRegister>> Overlappers) -> SlotIndex {
-    // Call-clobber: a call in (S,End) clobbering PR bounds the free run there.
-    SlotIndex Best = End;
-    for (const auto &[CallIdx, CallMI] : CallSites) {
-      if (CallIdx <= S || End <= CallIdx)
-        continue;
-      bool Clob = CallMI->modifiesRegister(PR, TRI);
-      if (!Clob)
-        for (const MachineOperand &MO : CallMI->operands())
-          if (MO.isRegMask() && MO.clobbersPhysReg(PR)) {
-            Clob = true;
-            break;
-          }
-      if (Clob && CallIdx < Best)
-        Best = CallIdx;
-    }
-    for (const auto &[WReg, WPhys] : Overlappers) {
-      bool Touches = false;
-      for (MCRegUnit WU : TRI->regunits(WPhys)) {
-        for (MCRegUnit PU : TRI->regunits(PR))
-          if (WU == PU) {
-            Touches = true;
-            break;
-          }
-        if (Touches)
-          break;
+  // Spill a piece we could not settle in a register (the genuinely-tight tail),
+  // then color its reload remnants. CRUCIAL: once we have peeled/colored ANY
+  // earlier piece we are mid-mutation, so we must NOT return false and orphan the
+  // current piece — we spill it. This is the SOLE recovery for a piece that
+  // cannot be settled in a register (whether it is the first piece == whole
+  // Failed, or a tail): store-at-def + reload-at-use, then color the stub and the
+  // reload remnants. It must succeed: a reload remnant that still cannot be
+  // colored means the function is genuinely infeasible at coloring time (needs
+  // MORE up-front spilling) — report that LOUDLY at the real cause rather than
+  // leaving an uncolored operand for a confusing downstream crash.
+  auto spillPiece = [&](Register Piece) {
+    MachineInstr *DefMI = MRI->getVRegDef(Piece);
+    if (!DefMI)
+      report_fatal_error("SSARA self-split: piece to spill has no def");
+    SlotIndex Kill = LIS->getInstructionIndex(*DefMI).getRegSlot();
+    Emitter->beginPass(IsVGPR);
+    Emitter->spillOneVMP(VRegMaskPair(Piece, MRI->getMaxLaneMaskForVReg(Piece)),
+                         Kill, RPLimit);
+    auto MustColor = [&](Register R) {
+      if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
+          MRI->reg_nodbg_empty(R))
+        return;
+      if (!colorOneInPlace(R)) {
+        std::string Msg;
+        raw_string_ostream OS(Msg);
+        OS << "SSARA: coloring-time recovery exhausted for " << printReg(R, TRI)
+           << " — function is infeasible at coloring time (needs more up-front "
+              "spilling)";
+        report_fatal_error(StringRef(Msg));
       }
-      if (!Touches)
-        continue;
-      const LiveInterval &WI = LIS->getInterval(WReg);
-      for (const LiveRange::Segment &Seg : WI.segments) {
-        if (Seg.end <= S)
-          continue;             // entirely before the piece start
-        if (Seg.start <= S)
-          return S;             // occupied AT S -> PR not free here
-        if (Seg.start < Best)
-          Best = Seg.start;     // first block after S
-        break;                  // segments are sorted; earliest found
-      }
-    }
-    return Best;
+    };
+    MustColor(Piece); // surviving stub
+    for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+      MustColor(VMP.getVReg()); // reload remnants
   };
 
   Register Cur = Failed;
@@ -1138,7 +1186,7 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
   const unsigned MaxPieces = 64; // runaway guard
   while (Pieces < MaxPieces) {
     if (!LIS->hasInterval(Cur))
-      return false;
+      return Pieces > 0; // already mutated: caller must not re-spill Failed
     const LiveInterval &CI = LIS->getInterval(Cur);
     SlotIndex S = CI.beginIndex(), E = CI.endIndex();
 
@@ -1147,9 +1195,8 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
     scanOverlappersForVI(CI, Occ, &Overlappers);
 
     // Pick the PR free at S that stays free the LONGEST (fewest future splits).
-    // getOrder(RC) already yields RC-width PRs, so no RC->contains filter is
-    // needed (matches findNonInterferingGap's scan). BestPR default-constructs to
-    // NoRegister; !BestPR tests that via MCRegister's unsigned conversion.
+    // getOrder(RC) already yields RC-width PRs; BestPR default-constructs to
+    // NoRegister (!BestPR tests it via MCRegister's unsigned conversion).
     MCRegister BestPR;
     SlotIndex BestBound = S;
     for (MCRegister PR : RegClassInfo.getOrder(RC)) {
@@ -1161,47 +1208,41 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
         BestBound = B;
       }
     }
-    if (!BestPR) {
-      LLVM_DEBUG(dbgs() << "  self-split: no PR free at " << S
-                        << " (over-pressure) -> fall through\n");
-      return false;
-    }
 
-    // OVER-PRESSURE GUARD: a peel is only worth doing if the free run [S,BestBound)
-    // actually spans at least ONE use of Cur. In a genuinely over-pressure region
-    // a PR is free for only a handful of slots between occupants, so the run ends
-    // BEFORE the first use — peeling there makes a register-resident piece with no
-    // use in it (pointless) and grinds the region into confetti (the buffer-fat-
-    // pointers 64-micro-piece pathology). If no free run reaches a use, this is
-    // real over-pressure, not fragmentation: bail to the memory-spill fall-through.
-    if (BestBound < E) {
+    // No free PR at S, or the free run does not even reach the next use
+    // (genuine over-pressure, not fragmentation — peeling here would grind the
+    // region into use-less confetti). This PIECE can't be settled in a register:
+    // spill it. If we have not mutated yet (Pieces==0, Cur==Failed) we can still
+    // cleanly hand the whole value to the caller's spill by returning false;
+    // otherwise we are mid-split and MUST spill this piece here to avoid orphaning
+    // it (the caller only re-spills the original Failed, not our tail pieces).
+    bool NoFreeRun = !BestPR;
+    if (!NoFreeRun && BestBound < E) {
       SlotIndex FirstUse;
       for (MachineInstr &U : MRI->use_nodbg_instructions(Cur)) {
         SlotIndex US = LIS->getInstructionIndex(U).getRegSlot();
         if (US > S && (!FirstUse.isValid() || US < FirstUse))
           FirstUse = US;
       }
-      if (FirstUse.isValid() && BestBound <= FirstUse) {
-        LLVM_DEBUG(dbgs()
-                   << "  self-split: free run [" << S << "," << BestBound
-                   << ") does not reach first use " << FirstUse
-                   << " (over-pressure, not fragmentation) -> fall through\n");
-        return false;
-      }
+      if (FirstUse.isValid() && BestBound <= FirstUse)
+        NoFreeRun = true;
+    }
+    if (NoFreeRun) {
+      // This piece cannot be settled in a register (no free PR at its start, or
+      // the free run does not reach its first use). Spill it — for the first
+      // piece this IS the whole Failed (same as a plain kill-at-def spill); for a
+      // tail it is the tight remainder. Uniform recovery: no "return false and
+      // hope the caller's whole-spill helps" — that would just move the crash for
+      // genuine over-pressure at the def.
+      LLVM_DEBUG(dbgs() << "  self-split: piece " << printReg(Cur, TRI)
+                        << " cannot be placed -> spill it\n");
+      spillPiece(Cur);
+      return true;
     }
 
     if (BestBound >= E) {
-      // BestPR is free across the whole remaining range: color it, done.
-      ColorMap[Cur] = BestPR;
-      unsigned Idx = TRI->getHWRegIndex(BestPR);
-      unsigned W = TRI->getRegSizeInBits(*RC) / 32;
-      const TargetRegisterClass *PhysRC = TRI->getPhysRegBaseClass(BestPR);
-      if (TRI->isVGPRClass(PhysRC))
-        MaxVGPRIdx = std::max(MaxVGPRIdx, Idx + W);
-      else if (TRI->isAGPRClass(PhysRC))
-        MaxAGPRIdx = std::max(MaxAGPRIdx, Idx + W);
-      else if (TRI->isSGPRClass(PhysRC))
-        MaxSGPRIdx = std::max(MaxSGPRIdx, Idx + W);
+      // BestPR is free across the whole remaining piece: color it, done.
+      commitColor(Cur, BestPR);
       LLVM_DEBUG(dbgs() << "  self-split: colored final piece "
                         << printReg(Cur, TRI) << " -> " << TRI->getName(BestPR)
                         << " (" << (Pieces + 1) << " pieces total)\n");
@@ -1209,11 +1250,10 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
     }
 
     // Split at the boundary (where BestPR becomes occupied). splitLiveRangeAt
-    // needs a clean non-PHI, mid-block instruction. The boundary slot may land on
-    // a PHI or a gap slot; in that case back up to the nearest earlier real
-    // instruction in (S, BestBound). The head piece is still free on BestPR (it
-    // is a PREFIX of the [S,BestBound) free run), just shorter. Only bail if no
-    // clean instruction exists before the boundary (piece is entirely PHIs).
+    // needs a clean non-PHI, mid-block instruction; if the boundary lands on a
+    // PHI/gap, back up to the nearest earlier real instruction in (S, BestBound)
+    // (the head is still a prefix of the free run). If none exists, spill this
+    // piece rather than orphan it.
     MachineInstr *SplitMI = LIS->getInstructionFromIndex(BestBound);
     SlotIndex Probe = BestBound;
     while ((!SplitMI || SplitMI->isPHI() || SplitMI->isDebugInstr()) &&
@@ -1223,27 +1263,18 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
     }
     if (!SplitMI || SplitMI->isPHI() || SplitMI->isDebugInstr() ||
         LIS->getInstructionIndex(*SplitMI).getRegSlot() <= S) {
-      LLVM_DEBUG(dbgs() << "  self-split: no clean split point in [" << S << ","
-                        << BestBound << ") -> fall through\n");
-      return false;
+      LLVM_DEBUG(dbgs() << "  self-split: no clean split point for piece "
+                        << printReg(Cur, TRI) << " -> spill it\n");
+      spillPiece(Cur);
+      return true;
     }
     Register Tail = Emitter->splitLiveRangeAt(Cur, SplitMI->getIterator());
     if (!Tail) {
-      LLVM_DEBUG(dbgs() << "  self-split: splitLiveRangeAt failed -> fall "
-                           "through\n");
-      return false;
+      spillPiece(Cur);
+      return true;
     }
     // Head piece (Cur, now [S,BestBound)) is free on BestPR: color it.
-    ColorMap[Cur] = BestPR;
-    unsigned Idx = TRI->getHWRegIndex(BestPR);
-    unsigned W = TRI->getRegSizeInBits(*RC) / 32;
-    const TargetRegisterClass *PhysRC = TRI->getPhysRegBaseClass(BestPR);
-    if (TRI->isVGPRClass(PhysRC))
-      MaxVGPRIdx = std::max(MaxVGPRIdx, Idx + W);
-    else if (TRI->isAGPRClass(PhysRC))
-      MaxAGPRIdx = std::max(MaxAGPRIdx, Idx + W);
-    else if (TRI->isSGPRClass(PhysRC))
-      MaxSGPRIdx = std::max(MaxSGPRIdx, Idx + W);
+    commitColor(Cur, BestPR);
     LLVM_DEBUG(dbgs() << "  self-split: peeled piece " << printReg(Cur, TRI)
                       << " -> " << TRI->getName(BestPR) << " [" << S << ","
                       << BestBound << "), recurse on tail "
@@ -1251,8 +1282,11 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
     Cur = Tail;
     ++Pieces;
   }
-  LLVM_DEBUG(dbgs() << "  self-split: exceeded piece cap -> fall through\n");
-  return false;
+  // Hit the piece cap mid-split: spill whatever remains rather than orphan it.
+  LLVM_DEBUG(dbgs() << "  self-split: piece cap -> spill remainder "
+                    << printReg(Cur, TRI) << "\n");
+  spillPiece(Cur);
+  return true;
 }
 
 void AMDGPUSSARegisterAllocator::color() {
@@ -1785,6 +1819,38 @@ void AMDGPUSSARegisterAllocator::emitSwap(MachineBasicBlock &MBB,
   SwapInChunks(4);
 }
 
+MCRegister AMDGPUSSARegisterAllocator::findLocalScratch(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
+    const TargetRegisterClass *RC,
+    const DenseMap<MCRegister, MCRegister> &CycleRegs) {
+  // Find a physreg of RC's file that is FREE AT THIS POINT: not live across
+  // InsertPt, not reserved, and not one of the cycle's own registers (which are
+  // all live here by definition). Register pressure is local, so a function full
+  // at its peak can still have a free reg at this cycle's point. Uses the physreg
+  // liveness query (LIS is not maintained past SSA destruction).
+  const TargetRegisterClass *BaseRC =
+      TRI->isSGPRClass(RC)   ? &AMDGPU::SGPR_32RegClass
+      : TRI->isAGPRClass(RC) ? &AMDGPU::AGPR_32RegClass
+                             : &AMDGPU::VGPR_32RegClass;
+  for (MCRegister PR : RegClassInfo.getOrder(BaseRC)) {
+    if (MRI->isReserved(PR))
+      continue;
+    // Skip the cycle's own registers (live here) and any that alias them.
+    bool InCycle = false;
+    for (const auto &[Dst, Src] : CycleRegs)
+      if (TRI->regsOverlap(PR, Dst) || TRI->regsOverlap(PR, Src)) {
+        InCycle = true;
+        break;
+      }
+    if (InCycle)
+      continue;
+    if (MBB.computeRegisterLiveness(TRI, PR, InsertPt) ==
+        MachineBasicBlock::LQR_Dead)
+      return PR;
+  }
+  return MCRegister();
+}
+
 void AMDGPUSSARegisterAllocator::breakCycleViaMemory(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
     MCRegister CycleStart, DenseMap<MCRegister, MCRegister> &DstToSrc) {
@@ -1977,22 +2043,44 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
       NeedMemFallback = !SccDead && !ScratchFits;
     }
 
+    // Approach A: before spilling to memory, try to find an SGPR/AGPR that is
+    // actually FREE AT THIS CYCLE POINT (not just below the function-wide
+    // high-water). Register pressure is local: a function can be full at its peak
+    // yet have a free reg at the cycle's point. This costs nothing and avoids the
+    // heavy memory fallback whenever the point has any slack. Only if the point is
+    // GENUINELY saturated do we fall to memory.
+    MCRegister LocalScratch;
+    if (NeedMemFallback) {
+      LocalScratch = findLocalScratch(MBB, InsertPt, CycleRC, DstToSrc);
+      if (LocalScratch) {
+        NeedMemFallback = false;
+        LLVM_DEBUG(dbgs() << "    local scratch found: "
+                          << TRI->getName(LocalScratch) << "\n");
+      }
+    }
+
     if (NeedMemFallback) {
       breakCycleViaMemory(MBB, InsertPt, CycleStart, DstToSrc);
       continue;
     }
 
-    if (UseScratch && ScratchFits) {
-      // One 32-bit scratch at the current high-water (see the width note above).
+    if ((UseScratch && ScratchFits) || LocalScratch) {
+      // Prefer a locally-free scratch (Approach A) when the high-water reg does
+      // not fit; otherwise one 32-bit scratch at the current high-water.
       MCRegister Scratch =
-          IsVGPR ? MCRegister(AMDGPU::VGPR0 + MaxIdx)
-                 : IsAGPR ? MCRegister(AMDGPU::AGPR0 + MaxIdx)
-                          : MCRegister(AMDGPU::SGPR0 + MaxIdx);
-      // The scratch transiently occupies [MaxIdx, MaxIdx + 1): record that as this
-      // file's peak, but do NOT advance MaxIdx — the scratch is dead after this
-      // cycle's restore, so the next cycle reuses the same base index.
-      unsigned &Peak = IsVGPR ? PeakVGPR : (IsAGPR ? PeakAGPR : PeakSGPR);
-      Peak = std::max(Peak, MaxIdx + 1);
+          LocalScratch ? LocalScratch
+          : IsVGPR     ? MCRegister(AMDGPU::VGPR0 + MaxIdx)
+          : IsAGPR     ? MCRegister(AMDGPU::AGPR0 + MaxIdx)
+                       : MCRegister(AMDGPU::SGPR0 + MaxIdx);
+      // A high-water scratch transiently occupies [MaxIdx, MaxIdx + 1): record
+      // that as this file's peak, but do NOT advance MaxIdx — the scratch is dead
+      // after this cycle's restore, so the next cycle reuses the same base index.
+      // A LocalScratch is an already-counted in-use-elsewhere reg, so it adds no
+      // peak.
+      if (!LocalScratch) {
+        unsigned &Peak = IsVGPR ? PeakVGPR : (IsAGPR ? PeakAGPR : PeakSGPR);
+        Peak = std::max(Peak, MaxIdx + 1);
+      }
 
       LLVM_DEBUG(dbgs() << "    cycle via scratch " << TRI->getName(Scratch)
                         << ":\n");
@@ -2754,14 +2842,13 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   if (!UncolorableVRegs.empty()) {
     NumTierSpills += UncolorableVRegs.size();
     for (Register Failed : UncolorableVRegs) {
-      // GATE: only width-1 (single-lane) values are spilled here. A wider tuple
-      // that cannot be colored means the widest tier is over the limit — the
-      // up-front spiller's responsibility, not a reactive coloring-time spill.
+      // A value coloring could not place: try to recover it — split (blocker or
+      // self), else spill+reload — regardless of width. A WIDE tuple that fails
+      // is usually not over-pressure but an aligned-placement gap (no N aligned
+      // free regs even though N are free scattered); it may still succeed via
+      // splitting or a spill whose reloads decompose to per-dword. Do NOT assert
+      // on width here — let it try its luck; only genuine infeasibility remains.
       const TargetRegisterClass *RC = MRI->getRegClass(Failed);
-      assert(TRI->getRegSizeInBits(*RC) == 32 &&
-             "coloring-time spill is width-1 only; wider failure = up-front "
-             "spiller under-spilled");
-
       bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
       unsigned RPLimit =
           IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);

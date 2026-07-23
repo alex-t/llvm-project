@@ -159,7 +159,18 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// Only valid when Failed is POINT-FEASIBLE (some PR free at every slot); aborts
   /// (returns false -> caller memory-spills) if any slot has zero free PRs.
   bool trySelfSplitColor(Register Failed);
-  // (declared once; defined in the .cpp)
+
+  /// Assign \p Piece -> \p PR in ColorMap and bump the file's high-water mark.
+  /// Shared by the coloring-time split paths.
+  void commitColor(Register Piece, MCRegister PR);
+
+  /// Earliest slot > \p S in [\p S, \p End) where \p PR becomes occupied by an
+  /// overlapping colored value in \p Overlappers or a call-clobber; returns \p S
+  /// if PR is already occupied at S (not free here), else the bound (clamped to
+  /// \p End). Helper for trySelfSplitColor's per-piece free-run search.
+  SlotIndex
+  firstBlockAfter(MCRegister PR, SlotIndex S, SlotIndex End,
+                  ArrayRef<std::pair<Register, MCRegister>> Overlappers) const;
 
   /// Single linear scan over ColorMap for \p VI: the shared "collect" step of the
   /// gap-scan / split pipeline. ORs the register units of every colored occupant
@@ -251,6 +262,14 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
                            MachineBasicBlock::iterator InsertPt,
                            MCRegister CycleStart,
                            DenseMap<MCRegister, MCRegister> &DstToSrc);
+  // Find a physreg of RC's file free AT InsertPt (not live across it, not
+  // reserved, not one of the cycle's own regs) to use as a transient permutation
+  // scratch when the function-wide high-water reg does not fit. Returns null if
+  // the point is genuinely saturated. (Approach A: local, zero-cost scratch.)
+  MCRegister findLocalScratch(MachineBasicBlock &MBB,
+                              MachineBasicBlock::iterator InsertPt,
+                              const TargetRegisterClass *RC,
+                              const DenseMap<MCRegister, MCRegister> &CycleRegs);
   void emitSwap(MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
                 MCRegister RegA, MCRegister RegB);
   void rewriteOperands(MachineFunction &MF);
