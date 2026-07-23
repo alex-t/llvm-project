@@ -1852,16 +1852,16 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
   SmallVector<std::pair<MCRegister, MCRegister>, 8> DwordCopies;
   for (auto &[Src, Dst] : Copies) {
     unsigned Bits = TRI->getRegSizeInBits(*TRI->getPhysRegBaseClass(Dst));
-    unsigned W = Bits / 32;
-    // A copy that is at most one dword wide (W <= 1, including sub-dword 16-bit
-    // true16 lo16/hi16 slices where Bits==16 and W==0) has no wider sibling to
-    // alias, so it is already atomic — pass it through unchanged. Only genuinely
-    // multi-dword copies (W > 1) need splitting so a wide write cannot hide a
+    // A copy that is at most one dword wide (Bits <= 32, i.e. a 32-bit dword or a
+    // sub-dword 16-bit true16 lo16/hi16 slice) has no wider sibling to alias, so
+    // it is already atomic — pass it through unchanged. Only genuinely multi-dword
+    // copies (Bits > 32) need splitting so a wide write cannot hide a
     // write-after-read hazard against a narrower copy of the same dword.
-    if (W <= 1) {
+    if (Bits <= 32) {
       DwordCopies.push_back({Src, Dst});
       continue;
     }
+    unsigned W = Bits / 32;
     for (unsigned K = 0; K < W; ++K) {
       unsigned SubIdx = SIRegisterInfo::getSubRegFromChannel(K);
       MCRegister S = TRI->getSubReg(Src, SubIdx);
@@ -1931,14 +1931,17 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
         IsVGPR ? ST->getOccupancyWithNumVGPRs(MaxIdx, DynVGPRBlockSize)
                : ST->getOccupancyWithNumSGPRs(MaxIdx);
 
-    // Scratch must match the cycle's register width.
-    unsigned CycleWidth =
-        TRI->getRegSizeInBits(*TRI->getPhysRegBaseClass(CycleStart)) / 32;
+    // The scratch is ALWAYS exactly one 32-bit register. Every cycle reaching
+    // Phase 2 is at most one dword wide: the DwordCopies pre-pass decomposes any
+    // Bits>32 copy into per-dword copies, so a cycle is either a 32-bit value or a
+    // sub-dword (16-bit true16) value — both fit a single 32-bit scratch. (16-bit
+    // cycles are VGPR-only and are broken in place by emitSwap/V_SWAP_B16, never
+    // via this scratch path, so the scratch here is always a clean 32-bit
+    // SGPR/AGPR.) Hence the reserve is one register, not CycleWidth.
     unsigned ScratchOcc =
-        IsVGPR ? ST->getOccupancyWithNumVGPRs(MaxIdx + CycleWidth,
-                                              DynVGPRBlockSize)
-               : ST->getOccupancyWithNumSGPRs(MaxIdx + CycleWidth);
-    bool ScratchFits = MaxIdx + CycleWidth <= MaxHWLimit;
+        IsVGPR ? ST->getOccupancyWithNumVGPRs(MaxIdx + 1, DynVGPRBlockSize)
+               : ST->getOccupancyWithNumSGPRs(MaxIdx + 1);
+    bool ScratchFits = MaxIdx + 1 <= MaxHWLimit;
 
     // Decide between resolving the cycle with a scratch register (plain COPYs)
     // and in place via emitSwap.
@@ -1980,20 +1983,16 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
     }
 
     if (UseScratch && ScratchFits) {
-      MCRegister ScratchBase =
+      // One 32-bit scratch at the current high-water (see the width note above).
+      MCRegister Scratch =
           IsVGPR ? MCRegister(AMDGPU::VGPR0 + MaxIdx)
                  : IsAGPR ? MCRegister(AMDGPU::AGPR0 + MaxIdx)
                           : MCRegister(AMDGPU::SGPR0 + MaxIdx);
-      MCRegister Scratch =
-          (CycleWidth == 1)
-              ? ScratchBase
-              : TRI->getMatchingSuperReg(ScratchBase, AMDGPU::sub0,
-                                         TRI->getPhysRegBaseClass(CycleStart));
-      // The scratch transiently occupies [MaxIdx, MaxIdx + CycleWidth): record
-      // that as this file's peak, but do NOT advance MaxIdx — the scratch is dead
-      // after this cycle's restore, so the next cycle reuses the same base index.
+      // The scratch transiently occupies [MaxIdx, MaxIdx + 1): record that as this
+      // file's peak, but do NOT advance MaxIdx — the scratch is dead after this
+      // cycle's restore, so the next cycle reuses the same base index.
       unsigned &Peak = IsVGPR ? PeakVGPR : (IsAGPR ? PeakAGPR : PeakSGPR);
-      Peak = std::max(Peak, MaxIdx + CycleWidth);
+      Peak = std::max(Peak, MaxIdx + 1);
 
       LLVM_DEBUG(dbgs() << "    cycle via scratch " << TRI->getName(Scratch)
                         << ":\n");
@@ -2520,12 +2519,12 @@ bool AMDGPUSSARegisterAllocator::verifyValueFlow(MachineFunction &MF) {
   // the vfKey lane index agree at dword granularity.
   auto dwordKeys = [&](MCRegister P) {
     SmallVector<MCRegUnit, 8> Keys;
-    unsigned NW = TRI->getRegSizeInBits(*TRI->getPhysRegBaseClass(P)) / 32;
-    if (NW <= 1) {
+    unsigned Bits = TRI->getRegSizeInBits(*TRI->getPhysRegBaseClass(P));
+    if (Bits <= 32) { // one dword or a sub-dword true16 slice: single key
       Keys.push_back(*TRI->regunits(P).begin());
       return Keys;
     }
-    for (unsigned K = 0; K < NW; ++K) {
+    for (unsigned K = 0, NW = Bits / 32; K < NW; ++K) {
       MCRegister D = TRI->getSubReg(P, SIRegisterInfo::getSubRegFromChannel(K));
       Keys.push_back(*TRI->regunits(D).begin());
     }
