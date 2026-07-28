@@ -142,6 +142,11 @@ class SSASpillEmitter {
   // Set transiently if a reload redef leaves SSA broken; inline repair clears it.
   bool SSAInvalidated = false;
 
+  // PHI web members erased by the last spillPhiWeb() call (caller prunes ColorMap).
+  SmallVector<Register, 32> LastWebErased;
+  // RP relief at the region peak delivered by the last spillPhiWeb().
+  unsigned LastWebPeakRelief = 0;
+
   // --- internal mechanism helpers (moved verbatim from the spiller) ---
   // Store \p VMP right after its def (EXEC full ⇒ captures all lanes). The store
   // half of spillOneVMP; its only caller. Returns the store instruction.
@@ -195,6 +200,42 @@ public:
   /// \p KillIdx onward, place dominance-ordered reloads at the reachable uses,
   /// and repair SSA inline. \p RPLimit bounds reload-hoist decisions.
   void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx, unsigned RPLimit);
+
+  /// In-memory PHI-web coalescing. \p PhiResult must be defined by a PHI. Closes
+  /// the transitive operand/result equivalence class (union-find over PHI edges),
+  /// assigns ONE shared stack slot, stores every non-PHI operand at its def (in
+  /// its predecessor — SSA-legal), reloads every EXTERNAL use of any web member
+  /// from that slot (rolling window: one reg, dies after its use), and erases the
+  /// now-dead PHIs. This is a MONOTONE wall-dissolution: it only REMOVES register
+  /// pressure at the join, so reloads are NOT RP-gated (gating on pre-spill RP is
+  /// a false-positive — it measures the very wall we are removing). Returns true
+  /// if the web was coalesced; false (no-op) if PhiResult is not a PHI or the web
+  /// has no ground operand. \p PeakSlot is the region's peak-RP slot: the number
+  /// of erased web members live there (the true RP relief the caller should credit
+  /// so it does not over-spill) is recorded in lastWebPeakRelief().
+  bool spillPhiWeb(Register PhiResult, unsigned RPLimit, SlotIndex PeakSlot);
+
+  /// Members erased by the last spillPhiWeb() (for the caller to prune ColorMap).
+  ArrayRef<Register> lastWebErased() const { return LastWebErased; }
+
+  /// RP relief at the peak slot delivered by the last spillPhiWeb(): count of
+  /// erased PHI members whose live range covered the peak (ground-operand stores
+  /// are isKill=false and stay in registers, so they do NOT relieve the peak).
+  unsigned lastWebPeakRelief() const { return LastWebPeakRelief; }
+
+  /// [region-rp-reduction Stage 2] Post-spill RP just BEFORE \p UseMI (per-use
+  /// reload site). File via beginPass() (2-way, POC). See .cpp for accounting.
+  unsigned reloadRPBeforeUse(const MachineInstr *UseMI) const;
+
+  /// [Stage 2] Post-spill RP at the END of \p NCD (shared hoisted-reload site).
+  /// Valid for an empty NCD. Covers the NCD-block RP that canHoistReloadTo skips.
+  unsigned reloadRPAtBlockEnd(const MachineBasicBlock *NCD) const;
+
+  /// [Stage 2] Public forwarder to canHoistReloadTo: can \p B's shared reload
+  /// hoist to \p NCD (reload at NCD end) within \p RPLimit on every NCD->use path?
+  bool canHoistReload(MachineBasicBlock *NCD, unsigned RPLimit, Register B) {
+    return canHoistReloadTo(NCD, /*InsertPoint=*/nullptr, RPLimit, B);
+  }
 
   /// After a partial spill leaves \p WideVReg with only its \p RemnantMask lanes
   /// live (a contiguous sub-register named by \p SubIdx), extract that remnant

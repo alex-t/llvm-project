@@ -38,6 +38,7 @@ namespace llvm {
 class GCNSubtarget;
 class SIInstrInfo;
 class SIRegisterInfo;
+struct GCNRegPressure;
 
 class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   const SIRegisterInfo *TRI = nullptr;
@@ -151,6 +152,69 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// reload, color Failed into P, and keep B's reload in P. Returns true if
   /// Failed was colored this way; false to fall back to spilling Failed itself.
   bool trySplitColorViaBlocker(Register Failed, unsigned RPLimit);
+
+  /// [Design: region-rp-reduction, Stage 1] Register file for region
+  /// enumeration. AGPR is a DISTINCT file on non-unified targets (gfx908):
+  /// separate budget, measured separately. On unified targets (gfx90a+) arch-VGPR
+  /// and AGPR share one budget — enumerate only SGPR + (unified) VGPR there.
+  enum class RegFile { SGPR, VGPR, AGPR };
+
+  /// [Stage 1] A tight region: a contiguous slot span within ONE block whose
+  /// all-live RP in \p File exceeds the allocatable-pool limit. Half-open slot
+  /// pair label; a value "crosses" it if its interval overlaps [Start,End).
+  /// Block-local for v1 (cross-MBB coalescing deferred). Target is RP > pool:
+  /// all-live RP already counts colored + uncolored crossers, so RP <= pool is
+  /// exactly "placed + uncolored-crossers all fit".
+  struct TightRegion {
+    MachineBasicBlock *MBB;
+    SlotIndex Start, End; // half-open, within MBB
+    SlotIndex PeakSlot;   // slot where Peak RP is reached (a value must be live
+                          // here to relieve the region by being spilled)
+    RegFile File;
+    unsigned Peak;  // max RP observed in the span
+    unsigned Limit; // allocatable-pool count for the file
+  };
+
+  /// [Stage 1] Allocatable-pool size for \p File (SGPR_32 / VGPR_32 / AGPR_32
+  /// count) — the number the colorer draws from; the region target is RP <= this.
+  /// NOT raw getMaxNum* (102/64), NOT the spiller's margined value.
+  unsigned allocatablePool(MachineFunction &MF, RegFile File) const;
+
+  /// [Stage 1] Per-file pressure at a tracker point. VGPR uses the UNIFIED count
+  /// on gfx90a+ (arch+agpr+avgpr share one budget) and arch-VGPR alone otherwise;
+  /// AGPR is the separate AGPR count (only meaningful on non-unified targets).
+  unsigned pressureOf(const GCNRegPressure &P, RegFile File) const;
+
+  /// [Stage 1] Enumerate tight regions for \p File: per block, maximal contiguous
+  /// slot spans where all-live RP (GCNUpwardRPTracker) > allocatablePool(File).
+  void findTightRegions(MachineFunction &MF, RegFile File,
+                        SmallVectorImpl<TightRegion> &Out) const;
+
+  /// [Stage 2] Cost of spilling candidate \p B to relieve region \p R.
+  ///   Feasible : no use is strictly inside R (case 2) nor in R's loop (case 3),
+  ///              and every reload's post-spill RP <= R.Limit (Test 2). Else B
+  ///              cannot relieve R — drop it.
+  ///   Cost     : NReloads * Width. NReloads = 1 when B's uses are commonly
+  ///              dominated and the shared reload hoists to their NCD; else one
+  ///              reload per use.
+  ///   Width    : dwords B frees in R per spill (RP relief).
+  /// Ranking (Stage 3): Feasible, then Cost asc, then Width desc (equal traffic
+  /// -> widest wins: frees more RP in R).
+  struct SpillCost {
+    bool Feasible;
+    unsigned Cost;
+    unsigned Width;
+    explicit operator bool() const { return Feasible; }
+    static SpillCost Infeasible() { return {false, 0, 0}; }
+  };
+  SpillCost costOfSpilling(Register B, const TightRegion &R);
+
+  /// [Stage 3] Region RP-reduction driver. While tight regions remain, service
+  /// the worst (highest Peak) by spilling the cheapest feasible crosser ACROSS
+  /// that region (kill at R.Start so its register frees over R and the reload
+  /// lands after R), then recompute regions globally. Returns true if any spill
+  /// was performed (caller then re-colors from clean). Bounded by a round cap.
+  bool reduceRegionPressure(MachineFunction &MF);
 
   /// Self-split (experiment, gated by -amdgpu-ssa-split-live-ranges): \p Failed is
   /// a long liver with no through-lane AND no live-through blocker to spill around

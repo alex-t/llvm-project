@@ -119,7 +119,9 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
   // divergent control flow can modify EXEC. Store placement is fixed at the def
   // and is independent of KillIdx (which only decides where the reg is freed).
   MachineInstr *DefStoreMI = spillAtDefinition(VMP);
-  assert(DefStoreMI && "Virtual register must have a definition in SSA form");
+  // DefStoreMI may be null when the value's def is IMPLICIT_DEF (undef): no store
+  // is emitted (storing undef is illegal MIR). Reloads then load an uninitialized
+  // slot, which is a semantic don't-care for an undef value.
   (void)DefStoreMI;
 
   // Step 2c: Get stack slot for reload phase
@@ -134,6 +136,159 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
   Info.FrameIndex = FI;
   buildDomGroupsForSpill(Info);
   emitReloadsAndRepairSSA(Info);
+}
+
+bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
+                                  SlotIndex PeakSlot) {
+  CurRPLimit = RPLimit;
+  LastWebErased.clear();
+  LastWebPeakRelief = 0;
+  // getUniqueVRegDef throughout (NOT getVRegDef, which asserts on multi-def): a
+  // reload-created value has several redefs; treat it as a non-PHI ground/leaf.
+  MachineInstr *RootDef = MRI->getUniqueVRegDef(PhiResult);
+  if (!RootDef || !RootDef->isPHI())
+    return false;
+
+  // --- 1. Close the equivalence class (analysis only; slot stays virtual). ---
+  SmallSetVector<Register, 32> PhiMembers; // PHIs in the web (candidates to erase)
+  SmallSetVector<Register, 32> GroundOps;  // non-PHI operands (store at their def)
+  SmallVector<Register, 32> Work;
+  PhiMembers.insert(PhiResult);
+  Work.push_back(PhiResult);
+  // The web equivalence result<->operand is BIDIRECTIONAL. Close it BOTH ways:
+  //  - DOWN: a member PHI's operands (a PHI operand joins the web; a ground def is
+  //    a store site).
+  //  - UP: any PHI that USES the member as an operand (that consuming PHI is in the
+  //    same class). Without the up-edge, a bb.N-Flow PHI reached as an operand of a
+  //    bb.M-end PHI would be its OWN single-PHI web, and the edge to the end PHI
+  //    would look EXTERNAL -> reloaded per-predecessor back into the join wall (the
+  //    exact defect: web=1 everywhere, 128 reloads into RP=129 bb.1). Closing up
+  //    makes that edge internal so it vanishes with the erased PHIs.
+  while (!Work.empty()) {
+    Register R = Work.pop_back_val();
+    MachineInstr *D = MRI->getUniqueVRegDef(R);
+    if (D && D->isPHI()) {
+      // DOWN: operands of this member PHI.
+      for (unsigned I = 1, E = D->getNumOperands(); I + 1 < E; I += 2) {
+        MachineOperand &Op = D->getOperand(I);
+        if (!Op.isReg() || !Op.getReg().isVirtual())
+          continue;
+        Register OpReg = Op.getReg();
+        MachineInstr *OpDef = MRI->getUniqueVRegDef(OpReg);
+        if (OpDef && OpDef->isPHI()) {
+          if (PhiMembers.insert(OpReg))
+            Work.push_back(OpReg);
+        } else {
+          GroundOps.insert(OpReg); // ground def -> store site
+        }
+      }
+    }
+    // UP: any PHI consuming R as an operand joins the class.
+    for (MachineInstr &U : MRI->use_nodbg_instructions(R)) {
+      if (!U.isPHI())
+        continue;
+      Register UResult = U.getOperand(0).getReg();
+      if (PhiMembers.insert(UResult))
+        Work.push_back(UResult);
+    }
+  }
+  if (GroundOps.empty())
+    return false; // all-undef web -> caller falls back
+
+  LLVM_DEBUG(dbgs() << "\nspillPhiWeb(): root " << printReg(PhiResult, TRI)
+                    << " web=" << PhiMembers.size() << " PHIs, "
+                    << GroundOps.size() << " ground ops\n");
+
+  // True RP relief at the region peak = number of web PHI RESULTS live at PeakSlot.
+  // Only the PHI members leave the peak (they are erased + their result reloaded at
+  // the far use); ground operands keep their register (isKill=false store). Credit
+  // this to the caller so it stops spilling once the peak is actually relieved,
+  // instead of under-crediting (1 per web) and over-spilling.
+  if (PeakSlot.isValid())
+    for (Register M : PhiMembers)
+      if (LIS->hasInterval(M) && LIS->getInterval(M).liveAt(PeakSlot))
+        ++LastWebPeakRelief;
+
+  // --- 2. Collect EXTERNAL uses (non-web-edge). Internal edges (a member feeding
+  // another web PHI) vanish when the PHIs are erased. ---
+  auto isInternalEdge = [&](MachineInstr &U) {
+    return U.isPHI() && PhiMembers.count(U.getOperand(0).getReg());
+  };
+  SmallVector<std::pair<MachineInstr *, Register>, 64> ExternalUses;
+  for (Register M : PhiMembers)
+    for (MachineInstr &U : MRI->reg_nodbg_instructions(M)) {
+      if (!U.readsVirtualRegister(M) || isInternalEdge(U))
+        continue;
+      ExternalUses.push_back({&U, M});
+    }
+
+  // --- 3. Commit: one shared slot for the whole web. ---
+  VRegMaskPair RootVMP(PhiResult, MRI->getMaxLaneMaskForVReg(PhiResult));
+  int FI = assignVirt2StackSlot(RootVMP);
+
+  // --- 4a. Store every ground operand at its def (in its predecessor block). ---
+  for (Register G : GroundOps) {
+    MachineInstr *GDef = MRI->getUniqueVRegDef(G);
+    if (!GDef || GDef->isImplicitDef())
+      continue; // live-in / undef: nothing to save (v1)
+    MachineBasicBlock *GBB = GDef->getParent();
+    MachineBasicBlock::iterator InsertAfter = std::next(GDef->getIterator());
+    const TargetRegisterClass *RC = TRI->getRegClassForReg(*MRI, G);
+    TII->storeRegToStackSlot(*GBB, InsertAfter, G, /*isKill=*/false, FI, RC, TRI,
+                             G);
+    LIS->InsertMachineInstrInMaps(*std::prev(InsertAfter));
+    ++NumSpills;
+    LLVM_DEBUG(dbgs() << "  phi-web: store ground " << printReg(G, TRI) << " -> FI"
+                      << FI << " in " << printMBBReference(*GBB) << "\n");
+  }
+
+  // --- 4b. Reload each PHI member's EXTERNAL uses from the shared slot via the
+  // STANDARD repair pipeline (buildDomGroupsForSpill + emitReloadsAndRepairSSA):
+  // that emits a fresh reload vreg per reaching-region and rewrites the use +
+  // reconstructs SSA — a spill NEVER leaves a multi-def (each reload is a new
+  // vreg, use rewritten). Killing at the PHI's own def frees the whole result;
+  // reloads read FI (whichever predecessor ran wrote it in 4a). Option b: NO RP
+  // gate — the web spill is a monotone wall-dissolution. (Ground ops are NOT
+  // reloaded: their store is isKill=false, so they keep their register for their
+  // own non-PHI uses.) ---
+  SmallSetVector<Register, 32> MembersWithExtUse;
+  for (auto &[U, M] : ExternalUses)
+    MembersWithExtUse.insert(M);
+  for (Register M : MembersWithExtUse) {
+    MachineInstr *MDef = MRI->getUniqueVRegDef(M);
+    if (!MDef)
+      continue;
+    VRegMaskPair VMP(M, MRI->getMaxLaneMaskForVReg(M));
+    Virt2StackSlotMap[VMP] = FI; // reloads of M read the shared web slot
+    // Seed the store-at-def memo so the pipeline does NOT store M at the join
+    // (its value already lives in FI via the operand stores). We call the reload
+    // half directly, so no store is emitted regardless; this is belt-and-braces.
+    SpillInfo Info;
+    Info.SpilledVMP = VMP;
+    Info.KillIdx = LIS->getInstructionIndex(*MDef).getRegSlot();
+    Info.FrameIndex = FI;
+    buildDomGroupsForSpill(Info);
+    emitReloadsAndRepairSSA(Info);
+  }
+
+  // --- 5. Erase the PHI members as a batch. After 4b every external use is a
+  // reload (fresh vreg); the only remaining uses of a member are INTERNAL web
+  // edges (operands of sibling web PHIs), which disappear as those siblings are
+  // erased. So erase the whole set together. (-verify-machineinstrs will flag any
+  // dangling use if an external reload was missed — the proven-root-cause path.)
+  for (Register M : PhiMembers) {
+    if (MachineInstr *D = MRI->getUniqueVRegDef(M)) {
+      LIS->RemoveMachineInstrFromMaps(*D);
+      D->eraseFromParent();
+    }
+    if (LIS->hasInterval(M))
+      LIS->removeInterval(M);
+    LastWebErased.push_back(M);
+  }
+  LLVM_DEBUG(dbgs() << "  phi-web: coalesced, erased " << LastWebErased.size()
+                    << "/" << PhiMembers.size() << " PHIs, " << GroundOps.size()
+                    << " ground stores -> FI" << FI << "\n");
+  return true;
 }
 
 bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
@@ -315,6 +470,17 @@ MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
   if (!DefMI) {
     LLVM_DEBUG(
         dbgs() << "spillAtDefinition(): No definition found (live-in?)\n");
+    return nullptr;
+  }
+
+  // The value is an undef (IMPLICIT_DEF). There is nothing to save — storing it
+  // would emit `SI_SPILL_*_SAVE <undef reg>` (the source is dead right after the
+  // IMPLICIT_DEF), which the machine verifier rejects as "using an undefined
+  // physical register". Skip the store; the reload side re-materializes the undef
+  // (an uninitialized slot load of an undef value is semantically a don't-care).
+  if (DefMI->isImplicitDef()) {
+    LLVM_DEBUG(dbgs() << "spillAtDefinition(): def is IMPLICIT_DEF (undef) -> "
+                         "no store emitted\n");
     return nullptr;
   }
 
@@ -909,6 +1075,35 @@ unsigned SSASpillEmitter::getMaxRPForBlock(MachineBasicBlock *MBB) {
 
   MaxRPCache[MBB] = MaxRP;
   return MaxRP;
+}
+
+unsigned SSASpillEmitter::reloadRPBeforeUse(const MachineInstr *UseMI) const {
+  // [region-rp-reduction Stage 2] Post-spill RP just BEFORE UseMI, where a
+  // per-use reload lands. reset(*MI) seeds just AFTER the use; recede steps to
+  // just-before (same pattern as maxRPBetween). Post-spill accounting: the value
+  // leaves its long range but is re-present at the reload (-W+W cancel), so RP
+  // before the use is the post-spill pressure there. 2-way file (POC; AGPR folded
+  // into VGPR like the rest of the emitter).
+  GCNUpwardRPTracker Tracker(*LIS);
+  Tracker.reset(*UseMI);
+  Tracker.recede(*UseMI);
+  GCNRegPressure P = Tracker.getPressure();
+  return IsVGPRPass
+             ? P.getVGPRNum(MF.getSubtarget<GCNSubtarget>().hasGFX90AInsts())
+             : P.getSGPRNum();
+}
+
+unsigned SSASpillEmitter::reloadRPAtBlockEnd(const MachineBasicBlock *NCD) const {
+  // [Stage 2] RP at NCD's end, where a shared hoisted reload sits. reset(MBB)
+  // seeds at the block's last slot (valid for an empty NCD); no recede needed.
+  // canHoistReloadTo(InsertPoint==null) SKIPS this NCD-block RP check, so the
+  // reload's own block is covered here.
+  GCNUpwardRPTracker Tracker(*LIS);
+  Tracker.reset(*NCD);
+  GCNRegPressure P = Tracker.getPressure();
+  return IsVGPRPass
+             ? P.getVGPRNum(MF.getSubtarget<GCNSubtarget>().hasGFX90AInsts())
+             : P.getSGPRNum();
 }
 
 unsigned SSASpillEmitter::maxRPBetween(MachineInstr *DefMI,

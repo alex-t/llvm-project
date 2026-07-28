@@ -1715,29 +1715,27 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
   if (!usingDefaultRegAlloc())
     reportFatalUsageError(RegAllocOptNotSupportedMessage);
 
+  addPass(&GCNPreRALongBranchRegID);
+
   if (EnableSSARegAlloc) {
+    // SSARA replaces the SGPR allocator's slot: it allocates BOTH SGPR and VGPR
+    // in one SSA-based pass. Placed HERE (where createSGPRAllocPass would run) so
+    // it inherits the whole downstream tail below — VirtRegRewriter,
+    // StackSlotColoring, SILowerSGPRSpills (lowers our SI_SPILL_S32 pseudos to
+    // VGPR LANES, not memory), WWM alloc, and the VGPR allocator (which allocates
+    // the lane-holder VGPRs SILowerSGPRSpills's virtual-lane path creates).
     addPass(createAMDGPURebuildSSALegacyPass());
     // Undef-aware PHI coalescing: fold diamond-merge "one real operand, rest
-    // undef" PHIs so the spiller sees ordinary spillable ranges instead of
-    // un-spillable φ-operands, and all-undef placeholders stop reserving
-    // registers. Standalone so it survives the eventual removal of the
-    // temporary RebuildSSA bridge -- it must remain the last pass before the
-    // spiller.
+    // undef" PHIs so ordinary spillable ranges are seen instead of un-spillable
+    // φ-operands. Must be the last pass before the allocator.
     addPass(createAMDGPUPHICoalescerPass());
-    addPass(createAMDGPUSSARegisterSpillerPass());
-    // The spiller's reloads redefine OrigVReg but it repairs SSA inline
-    // (reaching-VNI reconstruction) and returns SSA MIR, so no second
-    // RebuildSSA is needed here.
     addPass(createAMDGPUSSARegisterAllocatorPass());
     // Independent post-allocation physreg-liveness check (SSARA correctness
     // gate). No-op unless -amdgpu-verify-physreg-liveness is given.
     addPass(createAMDGPUVerifyPhysRegLivenessPass());
-    return true;
+  } else {
+    addPass(createSGPRAllocPass(true));
   }
-
-  addPass(&GCNPreRALongBranchRegID);
-
-  addPass(createSGPRAllocPass(true));
 
   // Commit allocated register changes. This is mostly necessary because too
   // many things rely on the use lists of the physical registers, such as the
