@@ -1337,25 +1337,42 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
 
       SmallDenseSet<Register, 32> Rejected; // reload-infeasible, this region
       while (R.Peak > long(Limit)) {
-        // Max-coverage victim selection (known-good baseline): pick the colored
-        // occupant covering the most of R (tie -> widest interval), then gate on
-        // costOfSpilling (reject if its reload would re-enter pressure). The
-        // unified cost/benefit selection is deferred — it regressed cf512's
-        // default path (28->6 instead of 28->0).
+        // UNIFIED COST/BENEFIT selection. benefit = width IFF the candidate covers
+        // R (overlaps it) — a value must span the region to relieve it; cost =
+        // loop-depth-weighted reload traffic (costOfSpilling.Cost). Pick MIN
+        // cost/benefit. Both "spill the cheap live-through crosser" (easy tests)
+        // and "spill the cheap short resident" (wide bitcast) fall out of one
+        // formula.
+        //
+        // NOTE (cf512 regression fix): benefit uses REGION-OVERLAP coverage, NOT
+        // liveAt(R.PeakSlot). A region peak can be a PLATEAU (many slots at max);
+        // a victim covering most of R but not live at the single recorded
+        // PeakSlot still relieves R. The strict liveAt(PeakSlot) filter dropped
+        // such victims -> under-spill -> cf512 28->6. Overlap coverage restores
+        // the max-coverage victim set while ranking it by cost/benefit.
         Register BestB;
-        int BestCover = 0, BestWidth = 0;
+        double BestRatio = 0;
+        int BestCover = 0;
         unsigned BestW = 0;
         for (const Iv &I : Ivs) {
           if (!I.Colored || Spilled.count(I.VReg) || Rejected.count(I.VReg))
             continue;
           SlotIndex OS = std::max(I.S, R.S), OE = std::min(I.E, R.E);
           if (!(OS < OE))
-            continue;
+            continue; // must cover R to relieve it
           int Cover = OS.distance(OE);
-          int Width = I.S.distance(I.E);
-          if (Cover > BestCover || (Cover == BestCover && Width > BestWidth)) {
+          SpillCost SC = costOfSpilling(I.VReg, TR);
+          if (!SC.Feasible) {
+            Rejected.insert(I.VReg);
+            continue;
+          }
+          // cost/benefit; benefit = width freed in R (I.W). Lower ratio is better;
+          // tie-break by larger coverage (relieves more of the span).
+          double Ratio = double(SC.Cost) / double(I.W ? I.W : 1);
+          if (!BestB || Ratio < BestRatio ||
+              (Ratio == BestRatio && Cover > BestCover)) {
+            BestRatio = Ratio;
             BestCover = Cover;
-            BestWidth = Width;
             BestW = I.W;
             BestB = I.VReg;
           }
@@ -1365,16 +1382,10 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
                             << ") -> leave residual to split\n");
           break;
         }
-        if (!costOfSpilling(BestB, TR).Feasible) {
-          LLVM_DEBUG(dbgs() << "    reject " << printReg(BestB, TRI)
-                            << " (reload re-enters pressure) -> next victim\n");
-          Rejected.insert(BestB);
-          continue;
-        }
         LLVM_DEBUG(dbgs() << "    spill " << printReg(BestB, TRI)
-                          << " cover=" << BestCover << " w=" << BestW
-                          << " -> peak " << R.Peak << "->" << (R.Peak - long(BestW))
-                          << "\n");
+                          << " cost/benefit=" << BestRatio << " cover=" << BestCover
+                          << " w=" << BestW << " -> peak " << R.Peak << "->"
+                          << (R.Peak - long(BestW)) << "\n");
         Emitter->beginPass(WantVGPR);
         // getUniqueVRegDef (NOT getVRegDef, which ASSERTS on multi-def): a value
         // that a prior reload redefined at several sites has multiple defs and is
