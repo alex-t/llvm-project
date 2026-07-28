@@ -35,6 +35,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Target/TargetMachine.h"
 
+#include <unordered_set>
+
 using namespace llvm;
 
 #define DEBUG_TYPE "si-instr-info"
@@ -10257,10 +10259,7 @@ MachineInstr *SIInstrInfo::createPHIDestinationCopy(
 MachineInstr *SIInstrInfo::createPHISourceCopy(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator InsPt,
     const DebugLoc &DL, Register Src, unsigned SrcSubReg, Register Dst) const {
-  if (InsPt != MBB.end() &&
-      (InsPt->getOpcode() == AMDGPU::SI_IF ||
-       InsPt->getOpcode() == AMDGPU::SI_ELSE ||
-       InsPt->getOpcode() == AMDGPU::SI_IF_BREAK) &&
+  if (InsPt != MBB.end() && isBasicBlockPrologue(*InsPt) &&
       InsPt->definesRegister(Src, /*TRI=*/nullptr)) {
     InsPt++;
     return BuildMI(MBB, InsPt, DL,

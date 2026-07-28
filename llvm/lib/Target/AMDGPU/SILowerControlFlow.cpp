@@ -160,6 +160,7 @@ public:
     AU.addPreserved<SlotIndexesWrapperPass>();
     AU.addPreserved<LiveIntervalsWrapperPass>();
     AU.addPreserved<LiveVariablesWrapperPass>();
+    //AU.addPreserved<MachineBlockFrequencyInfoWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 };
@@ -311,7 +312,7 @@ void SILowerControlFlow::emitElse(MachineInstr &MI) {
   Register DstReg = MI.getOperand(0).getReg();
   Register SrcReg = MI.getOperand(1).getReg();
 
-  MachineBasicBlock::iterator Start = MBB.begin();
+  MachineBasicBlock::iterator Start = MBB.getFirstNonPHI();
 
   // This must be inserted before phis and any spill code inserted before the
   // else.
@@ -477,7 +478,7 @@ MachineBasicBlock *SILowerControlFlow::emitEndCf(MachineInstr &MI) {
   MachineBasicBlock &MBB = *MI.getParent();
   const DebugLoc &DL = MI.getDebugLoc();
 
-  MachineBasicBlock::iterator InsPt = MBB.begin();
+  MachineBasicBlock::iterator InsPt = MBB.getFirstNonPHI();
 
   // If we have instructions that aren't prolog instructions, split the block
   // and emit a terminator instruction. This ensures correct spill placement.
@@ -485,7 +486,7 @@ MachineBasicBlock *SILowerControlFlow::emitEndCf(MachineInstr &MI) {
   bool NeedBlockSplit = false;
   Register DataReg = MI.getOperand(0).getReg();
   for (MachineBasicBlock::iterator I = InsPt, E = MI.getIterator();
-       I != E; ++I) {
+       !I.getInstrIterator().isEnd() && I != E; ++I) {
     if (I->modifiesRegister(DataReg, TRI)) {
       NeedBlockSplit = true;
       break;
@@ -516,6 +517,7 @@ MachineBasicBlock *SILowerControlFlow::emitEndCf(MachineInstr &MI) {
   MachineInstr *NewMI = BuildMI(MBB, InsPt, DL, TII->get(Opcode), LMC.ExecReg)
                             .addReg(LMC.ExecReg)
                             .add(MI.getOperand(0));
+
   if (LV) {
     LV->replaceKillInstruction(DataReg, MI, *NewMI);
 
@@ -880,5 +882,6 @@ SILowerControlFlowPass::run(MachineFunction &MF,
   PA.preserve<SlotIndexesAnalysis>();
   PA.preserve<LiveIntervalsAnalysis>();
   PA.preserve<LiveVariablesAnalysis>();
+  //PA.preserve<MachineBlockFrequencyAnalysis>();
   return PA;
 }
