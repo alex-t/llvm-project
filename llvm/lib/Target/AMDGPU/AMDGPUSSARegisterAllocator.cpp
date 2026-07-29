@@ -1316,6 +1316,41 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
                       << "]: limit=" << Limit << " tight-regions="
                       << Regions.size() << "\n");
 
+    // Recompute the max whole-width RP over [RS,RE) from the CURRENT ColorMap +
+    // UncolorableVRegs (same accounting as the initial sweep above). Used to
+    // re-measure a region's peak after a spill (option 1: recompute, don't
+    // hand-credit relief). O(colored) per call — compile-time addressed later.
+    auto recomputeRegionPeak = [&](SlotIndex RS, SlotIndex RE) -> long {
+      SmallVector<std::pair<SlotIndex, int>, 128> E2;
+      auto addV = [&](Register V) {
+        if (!LIS->hasInterval(V) || MRI->reg_nodbg_empty(V))
+          return;
+        const TargetRegisterClass *RC = MRI->getRegClass(V);
+        bool IsVG = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+        if (IsVG != WantVGPR)
+          return;
+        const LiveInterval &LI = LIS->getInterval(V);
+        SlotIndex OS = std::max(LI.beginIndex(), RS);
+        SlotIndex OE = std::min(LI.endIndex(), RE);
+        if (!(OS < OE))
+          return;
+        int W = TRI->getRegSizeInBits(*RC) / 32;
+        E2.push_back({OS, W});
+        E2.push_back({OE, -W});
+      };
+      for (const auto &[V, PhysReg] : ColorMap)
+        addV(V);
+      for (Register F : UncolorableVRegs)
+        addV(F);
+      llvm::sort(E2, [](auto &A, auto &B) { return A.first < B.first; });
+      long Cur = 0, Mx = 0;
+      for (auto &Ev2 : E2) {
+        Cur += Ev2.second;
+        Mx = std::max(Mx, Cur);
+      }
+      return Mx;
+    };
+
     // Per region: keep spilling max-coverage victims until peak <= Limit.
     for (Region &R : Regions) {
       LLVM_DEBUG(dbgs() << "  region [" << R.S << "," << R.E
@@ -1361,14 +1396,38 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
           if (!(OS < OE))
             continue; // must cover R to relieve it
           int Cover = OS.distance(OE);
-          SpillCost SC = costOfSpilling(I.VReg, TR);
-          if (!SC.Feasible) {
-            Rejected.insert(I.VReg);
-            continue;
+          // A PHI-web candidate (a PHI result, or a PHI OPERAND) is resolved by the
+          // web spill (store operands in predecessors, reload result-uses), NOT a
+          // plain per-value spill. costOfSpilling's single-value reload gate
+          // (case1-phi: "reload lands at end of R.MBB -> in R") is WRONG for it —
+          // the web never reloads the operand into R — so it would wrongly reject
+          // the exact candidates the web is meant to handle. BYPASS the gate for
+          // web candidates and give a fixed cost (feasible by construction, the
+          // monotone wall-dissolution). Only when the flag is on.
+          bool IsWebCand = false;
+          if (EnablePhiWebSpill) {
+            MachineInstr *D = MRI->getUniqueVRegDef(I.VReg);
+            if (D && D->isPHI())
+              IsWebCand = true;
+            else
+              for (MachineInstr &U : MRI->use_nodbg_instructions(I.VReg))
+                if (U.isPHI()) {
+                  IsWebCand = true;
+                  break;
+                }
           }
-          // cost/benefit; benefit = width freed in R (I.W). Lower ratio is better;
-          // tie-break by larger coverage (relieves more of the span).
-          double Ratio = double(SC.Cost) / double(I.W ? I.W : 1);
+          double Ratio;
+          if (IsWebCand) {
+            Ratio = 1.0; // web spill: cheap, feasible by construction
+          } else {
+            SpillCost SC = costOfSpilling(I.VReg, TR);
+            if (!SC.Feasible) {
+              Rejected.insert(I.VReg);
+              continue;
+            }
+            // cost/benefit; benefit = width freed in R. Lower ratio is better.
+            Ratio = double(SC.Cost) / double(I.W ? I.W : 1);
+          }
           if (!BestB || Ratio < BestRatio ||
               (Ratio == BestRatio && Cover > BestCover)) {
             BestRatio = Ratio;
@@ -1410,24 +1469,54 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
                 WebRoot = U.getOperand(0).getReg();
                 break;
               }
-          if (WebRoot)
-            DidWeb = Emitter->spillPhiWeb(WebRoot, Limit, R.PeakSlot);
+          if (WebRoot) {
+            LLVM_DEBUG(dbgs() << "    region-rp region [" << R.S << "," << R.E
+                              << ") victim=" << printReg(BestB, TRI) << " -> WEB root="
+                              << printReg(WebRoot, TRI) << "\n");
+            DidWeb = Emitter->spillPhiWeb(WebRoot, Limit, R.S, R.E);
+          }
         }
-        if (!DidWeb)
+        if (!DidWeb) {
+          // Fall back to a plain spill — but only if BestB still has a non-empty
+          // interval. A PHI-operand victim whose consuming web was already spilled
+          // (and BestB emptied) this round would otherwise crash beginIndex() on an
+          // empty range. Such a stale victim contributes nothing now: reject it and
+          // continue (its web already relieved the region).
+          if (!LIS->hasInterval(BestB) || LIS->getInterval(BestB).empty()) {
+            LLVM_DEBUG(dbgs() << "    stale victim " << printReg(BestB, TRI)
+                              << " (web already spilled) -> skip\n");
+            Rejected.insert(BestB);
+            continue;
+          }
           Emitter->spillOneVMP(
               VRegMaskPair(BestB, MRI->getMaxLaneMaskForVReg(BestB)),
               LIS->getInterval(BestB).beginIndex(), Limit);
+        }
         ColorMap.erase(BestB);
         // A PHI-web spill erases several PHIs; prune their stale ColorMap entries.
         for (Register M : Emitter->lastWebErased())
           ColorMap.erase(M);
         Spilled.insert(BestB);
-        // Credit the ACTUAL peak relief: a web spill removes every web PHI result
-        // that was live at the peak (lastWebPeakRelief), not just the root width.
-        // Under-crediting (BestW=1 per web) made the loop over-spill (1276 B vs
-        // Greedy 340; SGPR overflow -> spillSGPR assert on cf512).
-        R.Peak -= DidWeb ? long(std::max(Emitter->lastWebPeakRelief(), 1u))
-                         : long(BestW);
+        // Mark every ground op the web STORED as Spilled, so the driver does not
+        // re-select and double-spill it (cf512: %999/%944/... were spilled WEB then
+        // PLAIN because only BestB was recorded as Spilled).
+        for (Register G : Emitter->lastWebGround())
+          Spilled.insert(G);
+        // Update the region peak. PLAIN spill: the known-good incremental decrement
+        // (R.Peak -= BestW) is exact and keeps the default path byte-identical. WEB
+        // spill: relief is not a simple width (a web removes pressure across the
+        // region), so RECOMPUTE the peak from the post-spill ColorMap (option 1).
+        if (DidWeb) {
+          long NewPeak = recomputeRegionPeak(R.S, R.E);
+          LLVM_DEBUG(dbgs() << "    web-spilled " << printReg(BestB, TRI)
+                            << " webErased=" << Emitter->lastWebErased().size()
+                            << "; region [" << R.S << "," << R.E << ") peak "
+                            << R.Peak << "->" << NewPeak << " (Limit=" << Limit
+                            << ")\n");
+          R.Peak = NewPeak;
+        } else {
+          R.Peak -= long(BestW);
+        }
         AnySpill = true;
       }
     }

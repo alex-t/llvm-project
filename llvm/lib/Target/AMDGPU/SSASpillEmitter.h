@@ -144,6 +144,9 @@ class SSASpillEmitter {
 
   // PHI web members erased by the last spillPhiWeb() call (caller prunes ColorMap).
   SmallVector<Register, 32> LastWebErased;
+  // Ground operands the last spillPhiWeb() stored (the driver marks them Spilled
+  // so they are not re-selected and double-spilled as plain victims).
+  SmallVector<Register, 32> LastWebGround;
   // RP relief at the region peak delivered by the last spillPhiWeb().
   unsigned LastWebPeakRelief = 0;
 
@@ -213,10 +216,14 @@ public:
   /// has no ground operand. \p PeakSlot is the region's peak-RP slot: the number
   /// of erased web members live there (the true RP relief the caller should credit
   /// so it does not over-spill) is recorded in lastWebPeakRelief().
-  bool spillPhiWeb(Register PhiResult, unsigned RPLimit, SlotIndex PeakSlot);
+  bool spillPhiWeb(Register PhiResult, unsigned RPLimit, SlotIndex RegS,
+                   SlotIndex RegE);
 
   /// Members erased by the last spillPhiWeb() (for the caller to prune ColorMap).
   ArrayRef<Register> lastWebErased() const { return LastWebErased; }
+
+  /// Ground operands stored by the last spillPhiWeb() (driver marks them Spilled).
+  ArrayRef<Register> lastWebGround() const { return LastWebGround; }
 
   /// RP relief at the peak slot delivered by the last spillPhiWeb(): count of
   /// erased PHI members whose live range covered the peak (ground-operand stores

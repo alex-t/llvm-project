@@ -139,9 +139,10 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
 }
 
 bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
-                                  SlotIndex PeakSlot) {
+                                  SlotIndex RegS, SlotIndex RegE) {
   CurRPLimit = RPLimit;
   LastWebErased.clear();
+  LastWebGround.clear();
   LastWebPeakRelief = 0;
   // getUniqueVRegDef throughout (NOT getVRegDef, which asserts on multi-def): a
   // reload-created value has several redefs; treat it as a non-PHI ground/leaf.
@@ -195,19 +196,60 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
   if (GroundOps.empty())
     return false; // all-undef web -> caller falls back
 
+  // SOUNDNESS GATE (option 2): all ground ops of the web share ONE stack slot. That
+  // is only correct if no two of them are ever SIMULTANEOUSLY LIVE — i.e. the PHIs
+  // are copy-less control-flow merges where exactly one incoming value reaches the
+  // join on any path. If two operands interfere, the shared slot would clobber one
+  // (the second store overwrites the first while the first is still needed) — a
+  // MISCOMPILE. In-memory coalescing is register-coalescing with a slot as the
+  // color, so it needs the SAME non-interference precondition. Prove it here; if any
+  // pair interferes, DECLINE the web (return false) and let the caller fall back to
+  // a plain per-value spill. (This is why 1024's divergent-select bitcast is safe:
+  // its two operands come from mutually-exclusive cmp.true/cmp.false predecessors.)
+  {
+    SmallVector<Register, 16> GV(GroundOps.begin(), GroundOps.end());
+    for (unsigned A = 0; A < GV.size(); ++A)
+      for (unsigned B = A + 1; B < GV.size(); ++B)
+        if (LIS->hasInterval(GV[A]) && LIS->hasInterval(GV[B]) &&
+            LIS->getInterval(GV[A]).overlaps(LIS->getInterval(GV[B]))) {
+          LLVM_DEBUG(dbgs()
+                     << "spillPhiWeb(): DECLINE root " << printReg(PhiResult, TRI)
+                     << " — operands " << printReg(GV[A], TRI) << " and "
+                     << printReg(GV[B], TRI)
+                     << " interfere (shared slot would clobber)\n");
+          return false;
+        }
+  }
+
+  // Report the ground ops so the driver marks them Spilled (a web stores each once;
+  // without this the driver re-selects a stored ground op as a plain victim and
+  // double-spills it — proven on cf512: %999/%944/%1003/%948 spilled WEB then PLAIN).
+  for (Register G : GroundOps)
+    LastWebGround.push_back(G);
+
   LLVM_DEBUG(dbgs() << "\nspillPhiWeb(): root " << printReg(PhiResult, TRI)
                     << " web=" << PhiMembers.size() << " PHIs, "
                     << GroundOps.size() << " ground ops\n");
 
-  // True RP relief at the region peak = number of web PHI RESULTS live at PeakSlot.
-  // Only the PHI members leave the peak (they are erased + their result reloaded at
-  // the far use); ground operands keep their register (isKill=false store). Credit
-  // this to the caller so it stops spilling once the peak is actually relieved,
-  // instead of under-crediting (1 per web) and over-spilling.
-  if (PeakSlot.isValid())
+  // True RP relief the web delivers in the region [RegS,RegE) = number of web
+  // values (PHI results AND ground operands) whose live range OVERLAPS the region.
+  // Every such value leaves the region's registers: PHI results are erased and
+  // reloaded at their far uses; ground operands are stored (their register frees
+  // across the region — they are only re-present at their def and at reloads).
+  // Count via LiveInterval::overlaps(Start,End) directly (not liveAt(PeakSlot): a
+  // peak is often a plateau the members do not cover at the single recorded slot,
+  // which counted 0 -> credit fell back to 1 -> under-credit -> over-spill).
+  auto overlapsRegion = [&](Register V) {
+    return LIS->hasInterval(V) && LIS->getInterval(V).overlaps(RegS, RegE);
+  };
+  if (RegS.isValid() && RegE.isValid()) {
     for (Register M : PhiMembers)
-      if (LIS->hasInterval(M) && LIS->getInterval(M).liveAt(PeakSlot))
+      if (overlapsRegion(M))
         ++LastWebPeakRelief;
+    for (Register G : GroundOps)
+      if (overlapsRegion(G))
+        ++LastWebPeakRelief;
+  }
 
   // --- 2. Collect EXTERNAL uses (non-web-edge). Internal edges (a member feeding
   // another web PHI) vanish when the PHIs are erased. ---
@@ -285,6 +327,23 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
       LIS->removeInterval(M);
     LastWebErased.push_back(M);
   }
+
+  // --- 6. RECOMPUTE each ground operand's live interval. Erasing the PHIs removed
+  // the ground ops' PHI-edge USES; a ground op whose only remaining use was that
+  // edge is now live only [def, store] instead of across the join region. Without
+  // recomputing, its STALE interval still spans the region, so region-rp reads it
+  // as a live crosser and RE-SPILLS it in a later round (proven on cf512: %999
+  // stored WEB round 0, then PLAIN round 1 — the double-spill / over-spill root).
+  // The store reads G (isKill=false), so the recomputed range correctly ends at
+  // the store, not across the region.
+  for (Register G : GroundOps) {
+    if (!G.isVirtual() || MRI->reg_nodbg_empty(G))
+      continue;
+    if (LIS->hasInterval(G))
+      LIS->removeInterval(G);
+    LIS->createAndComputeVirtRegInterval(G);
+  }
+
   LLVM_DEBUG(dbgs() << "  phi-web: coalesced, erased " << LastWebErased.size()
                     << "/" << PhiMembers.size() << " PHIs, " << GroundOps.size()
                     << " ground stores -> FI" << FI << "\n");
