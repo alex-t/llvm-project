@@ -1,4 +1,4 @@
-//===-- AMDGPUPHICoalescer.cpp ----------------------------------*- C++ -*-===//
+//===-- AMDGPUPHISimplifier.cpp ---------------------------------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,7 +6,13 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Undef-aware PHI coalescing for the SSA register-allocation stack.
+// Undef-aware PHI SIMPLIFICATION for the SSA register-allocation stack.
+//
+// NOTE: this is NOT a PHI coalescer. It performs no interference-graph
+// coalescing and no Hack-style permutation fixed point; it is two local,
+// SSA-preserving peephole rewrites run PRE-RA that remove the artificial
+// register-pressure inflation the structurizer's undef-PHIs create. The real
+// PHI coalescer (Hack sec. 4.3) is a separate, later component.
 //
 // Runs after SSA reconstruction and before the SSA spiller. It targets the
 // register-pressure inflation caused by "one real operand, rest undef" PHIs,
@@ -66,29 +72,29 @@
 
 using namespace llvm;
 
-#define DEBUG_TYPE "amdgpu-phi-coalescer"
+#define DEBUG_TYPE "amdgpu-phi-simplifier"
 
 STATISTIC(NumUndefFlagged, "Number of fully-undef PHI operands flagged undef");
-STATISTIC(NumPHIsCoalesced, "Number of single-real PHIs coalesced to operand");
+STATISTIC(NumPHIsSimplified, "Number of single-real PHIs folded to their operand");
 
 // Escape hatch for A/B measurement and bisection. On by default.
-static cl::opt<bool> EnablePHICoalescer(
-    "amdgpu-phi-coalesce", cl::Hidden, cl::init(true),
-    cl::desc("Enable undef-aware PHI coalescing before the SSA spiller"));
+static cl::opt<bool> EnablePHISimplifier(
+    "amdgpu-phi-simplify", cl::Hidden, cl::init(true),
+    cl::desc("Enable undef-aware PHI simplification before the SSA spiller"));
 
 // Sub-flags for differential diagnostics: attribute crash/pressure effects to
 // rewrite (a) [undef-flagging] vs (b) [single-real fold] independently. Both on
 // by default; the master flag above still gates the whole pass.
 static cl::opt<bool> EnableUndefFlagging(
-    "amdgpu-phi-coalesce-undef", cl::Hidden, cl::init(true),
+    "amdgpu-phi-simplify-undef", cl::Hidden, cl::init(true),
     cl::desc("(a) flag fully-undef PHI operands undef"));
 static cl::opt<bool> EnableSingleRealFold(
-    "amdgpu-phi-coalesce-fold", cl::Hidden, cl::init(true),
-    cl::desc("(b) coalesce single-real PHIs onto their real operand"));
+    "amdgpu-phi-simplify-fold", cl::Hidden, cl::init(true),
+    cl::desc("(b) fold single-real PHIs onto their real operand"));
 
 namespace {
 
-class AMDGPUPHICoalescer : public MachineFunctionPass {
+class AMDGPUPHISimplifier : public MachineFunctionPass {
   MachineDominatorTree *MDT = nullptr;
   MachineRegisterInfo *MRI = nullptr;
 
@@ -104,8 +110,8 @@ class AMDGPUPHICoalescer : public MachineFunctionPass {
 public:
   static char ID;
 
-  AMDGPUPHICoalescer() : MachineFunctionPass(ID) {
-    initializeAMDGPUPHICoalescerPass(*PassRegistry::getPassRegistry());
+  AMDGPUPHISimplifier() : MachineFunctionPass(ID) {
+    initializeAMDGPUPHISimplifierPass(*PassRegistry::getPassRegistry());
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override;
@@ -119,18 +125,18 @@ public:
 
 } // end anonymous namespace
 
-char AMDGPUPHICoalescer::ID = 0;
+char AMDGPUPHISimplifier::ID = 0;
 
-char &llvm::AMDGPUPHICoalescerID = AMDGPUPHICoalescer::ID;
+char &llvm::AMDGPUPHISimplifierID = AMDGPUPHISimplifier::ID;
 
-INITIALIZE_PASS_BEGIN(AMDGPUPHICoalescer, DEBUG_TYPE, "AMDGPU PHI Coalescer",
+INITIALIZE_PASS_BEGIN(AMDGPUPHISimplifier, DEBUG_TYPE, "AMDGPU PHI Simplifier",
                       false, false)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
-INITIALIZE_PASS_END(AMDGPUPHICoalescer, DEBUG_TYPE, "AMDGPU PHI Coalescer",
+INITIALIZE_PASS_END(AMDGPUPHISimplifier, DEBUG_TYPE, "AMDGPU PHI Simplifier",
                     false, false)
 
-bool AMDGPUPHICoalescer::runOnMachineFunction(MachineFunction &MF) {
-  if (!EnablePHICoalescer)
+bool AMDGPUPHISimplifier::runOnMachineFunction(MachineFunction &MF) {
+  if (!EnablePHISimplifier)
     return false;
 
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
@@ -139,12 +145,12 @@ bool AMDGPUPHICoalescer::runOnMachineFunction(MachineFunction &MF) {
   if (!MRI->isSSA())
     return false;
 
-  LLVM_DEBUG(dbgs() << "\n=== AMDGPUPHICoalescer on " << MF.getName()
+  LLVM_DEBUG(dbgs() << "\n=== AMDGPUPHISimplifier on " << MF.getName()
                     << " ===\n");
 
   bool Changed = false;
 
-  // Collect PHIs up front so a coalesced PHI can be erased immediately. The
+  // Collect PHIs up front so a folded PHI can be erased immediately. The
   // erase must be immediate, not deferred: replaceRegWith(Res, Real) rewrites
   // *every* operand mentioning Res, including the PHI's own def operand, so
   // until the PHI is gone Real transiently has two defs. A deferred erase would
@@ -181,7 +187,7 @@ bool AMDGPUPHICoalescer::runOnMachineFunction(MachineFunction &MF) {
         SoleReal = &Src;
     }
 
-    // (b) Coalesce a single-real PHI onto its real operand `%real` and delete
+    // (b) Fold a single-real PHI onto its real operand `%real` and delete
     // the PHI, replacing every use of the result `%res` with `%real`. Only
     // whole-register sources qualify (a sub-register source would need index
     // composition; left as an ordinary PHI).
@@ -219,17 +225,17 @@ bool AMDGPUPHICoalescer::runOnMachineFunction(MachineFunction &MF) {
     if (!RealDef || !MDT->dominates(RealDef, &PHI))
       continue;
 
-    LLVM_DEBUG(dbgs() << "  coalesce " << printReg(Res) << " := "
+    LLVM_DEBUG(dbgs() << "  simplify " << printReg(Res) << " := "
                       << printReg(Real) << " (" << PHI);
     MRI->replaceRegWith(Res, Real);
     PHI.eraseFromParent();
-    ++NumPHIsCoalesced;
+    ++NumPHIsSimplified;
     Changed = true;
   }
 
   return Changed;
 }
 
-MachineFunctionPass *llvm::createAMDGPUPHICoalescerPass() {
-  return new AMDGPUPHICoalescer();
+MachineFunctionPass *llvm::createAMDGPUPHISimplifierPass() {
+  return new AMDGPUPHISimplifier();
 }

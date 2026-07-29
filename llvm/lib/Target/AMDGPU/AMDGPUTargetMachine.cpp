@@ -596,7 +596,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUSSARegisterAllocatorPass(*PR);
   initializeAMDGPUVerifyPhysRegLivenessPass(*PR);
   initializeAMDGPURebuildSSALegacyPass(*PR);
-  initializeAMDGPUPHICoalescerPass(*PR);
+  initializeAMDGPUPHISimplifierPass(*PR);
   initializeAMDGPURewriteUndefForPHILegacyPass(*PR);
   initializeSIAnnotateControlFlowLegacyPass(*PR);
   initializeAMDGPUInsertDelayAluLegacyPass(*PR);
@@ -1725,10 +1725,10 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
     // VGPR LANES, not memory), WWM alloc, and the VGPR allocator (which allocates
     // the lane-holder VGPRs SILowerSGPRSpills's virtual-lane path creates).
     addPass(createAMDGPURebuildSSALegacyPass());
-    // Undef-aware PHI coalescing: fold diamond-merge "one real operand, rest
+    // Undef-aware PHI simplification: fold diamond-merge "one real operand, rest
     // undef" PHIs so ordinary spillable ranges are seen instead of un-spillable
     // φ-operands. Must be the last pass before the allocator.
-    addPass(createAMDGPUPHICoalescerPass());
+    addPass(createAMDGPUPHISimplifierPass());
     addPass(createAMDGPUSSARegisterAllocatorPass());
     // Independent post-allocation physreg-liveness check (SSARA correctness
     // gate). No-op unless -amdgpu-verify-physreg-liveness is given.

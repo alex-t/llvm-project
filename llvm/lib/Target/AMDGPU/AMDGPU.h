@@ -108,9 +108,9 @@ FunctionPass *createAMDGPURebuildSSALegacyPass();
 void initializeAMDGPURebuildSSALegacyPass(PassRegistry &);
 extern char &AMDGPURebuildSSALegacyID;
 
-MachineFunctionPass *createAMDGPUPHICoalescerPass();
-void initializeAMDGPUPHICoalescerPass(PassRegistry &);
-extern char &AMDGPUPHICoalescerID;
+MachineFunctionPass *createAMDGPUPHISimplifierPass();
+void initializeAMDGPUPHISimplifierPass(PassRegistry &);
+extern char &AMDGPUPHISimplifierID;
 
 MachineFunctionPass *createAMDGPUVerifyPhysRegLivenessPass();
 void initializeAMDGPUVerifyPhysRegLivenessPass(PassRegistry &);
