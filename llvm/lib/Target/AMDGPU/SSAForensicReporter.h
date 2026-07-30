@@ -82,6 +82,7 @@ enum class ForensicEventKind : uint8_t {
   ReloadEmitted,              // E15
   RunCompleted,               // E17
   Rollback,                   // reserved (Q-A) — unused in v1
+  ShadowTreePick,             // E18 — SSARegisterTree shadow-oracle comparison
 };
 
 /// One value live at a decision-boundary slot — the full liveness cross-section
@@ -243,6 +244,26 @@ public:
   void spillEmitted(unsigned VRegIdx, StringRef Site);
   /// E15. A reload was emitted for \p VRegIdx.
   void reloadEmitted(unsigned VRegIdx, StringRef Site);
+
+  // === Shadow register-tree oracle (E18) ===
+
+  /// E18. Record a shadow SSARegisterTree comparison at a real physreg pick.
+  /// PURE OBSERVER — the tree's answer is discarded; this only logs the
+  /// divergence between what the real allocator chose and what the shadow tree
+  /// would have picked. \p RealLeaf is the leaf index of the physreg the
+  /// allocator actually chose; \p TreeLeaf is tree.pickFreeAligned(width) (-1 if
+  /// the tree found nothing); \p Match is RealLeaf==TreeLeaf. \p FreeCount and
+  /// \p FullAtWidthLevel give the tree's aggregate context. \p AttemptCause links
+  /// back to the E4 attempt.
+  void shadowTreePick(uint64_t AttemptCause, unsigned VRegIdx, unsigned WidthDwords,
+                      int64_t RealLeaf, int64_t TreeLeaf, bool Match,
+                      unsigned FreeCount, unsigned FullAtWidthLevel);
+
+  /// E18 (skip variant). The shadow tree could not evaluate this pick and was
+  /// skipped. \p Reason is one of "class" (non-VGPR_32 file), "leaf-oob"
+  /// (physreg outside the mapped VGPR_32 order), or "unmapped".
+  void shadowTreeSkip(uint64_t AttemptCause, unsigned VRegIdx, unsigned WidthDwords,
+                      StringRef Reason);
 
   // === Causality ===
 

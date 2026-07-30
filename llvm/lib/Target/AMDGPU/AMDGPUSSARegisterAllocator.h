@@ -31,6 +31,7 @@
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "SSASpillEmitter.h"
 #include "SSAForensicReporter.h"
+#include "SSARegisterTree.h"
 #include <memory>
 #include <set>
 
@@ -119,6 +120,57 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // allocator is byte-identical ON vs OFF. Created per function in
   // runOnMachineFunction and shared with the emitter via setReporter().
   std::unique_ptr<SSAForensicReporter> Reporter;
+
+  // === Shadow register-tree oracle (-amdgpu-ssa-shadow-tree, default off) ===
+  //
+  // A SHADOW SSARegisterTree that mirrors, for the VGPR_32 file ONLY, the exact
+  // occupancy the allocator maintains in OccupiedRegUnits, and — at each real
+  // VGPR_32 pick — logs what the tree WOULD have picked vs. what the allocator
+  // actually chose. It NEVER influences allocation: its answer is discarded and
+  // every mutation/compare is guarded behind the flag AND Reporter->active(), so
+  // an off run (and a build without the flag set) is byte-identical.
+  //
+  // Mapping: leaf index == VGPR_32 allocation-order ordinal (getOrder index).
+  // The tree requires a power-of-two leaf count, so it is sized to the padded
+  // power of two >= the real allocatable VGPR_32 count; the padding leaves
+  // [RealVGPR32Count, padded) are pre-allocated at construction so the tree's
+  // pickFreeAligned can never return a nonexistent register. See the .cpp for
+  // the leafOf() physreg->leaf map and the width-1 scope of this increment.
+  std::unique_ptr<SSARegisterTree> ShadowTree;
+  // getOrder(VGPR_32) ordinal for each MCRegister, or -1 if not a VGPR_32 in the
+  // order. Built once per function in setupShadowTree(); the identity of the
+  // physreg<->leaf bijection.
+  DenseMap<unsigned, int> VGPR32Leaf;
+  // MCRegUnit -> owning VGPR_32's leaf ordinal. Keyed by reg UNIT (not physreg)
+  // because on targets with lo16/hi16 sub-registers the reg-unit roots of a
+  // VGPR_32 are VGPRn_LO16/HI16, never VGPRn itself — so a physreg-id lookup off
+  // a reg unit never matches. This unit->leaf map is the reliable bridge from an
+  // OccupiedRegUnits bit (or a physreg's reg units) to its VGPR_32 leaf.
+  DenseMap<unsigned, int> VGPR32UnitLeaf;
+  unsigned RealVGPR32Count = 0;   // allocatable VGPR_32 regs (real, pre-padding)
+  unsigned ShadowLeaves = 0;      // padded power-of-two leaf count of ShadowTree
+  bool shadowActive() const;      // flag && Reporter && Reporter->active()
+  void setupShadowTree();         // build the map + tree (per function)
+  // Return the leaf index of \p PhysReg if it is a VGPR_32 in the mapped order,
+  // else -1. Wider VGPR tuples map to their FIRST (lowest-index) sub-VGPR_32
+  // leaf, which is the aligned block start; a non-VGPR physreg returns -1.
+  int shadowLeafOf(MCRegister PhysReg) const;
+  // Collect the leaf index of every VGPR_32 that \p PhysReg covers (its own leaf
+  // if it is a VGPR_32; each sub-VGPR_32's leaf if it is a wider tuple), resolved
+  // through the getOrder-ordinal map so no contiguity of a tuple's sub-registers
+  // in leaf space is assumed. Empty for a non-VGPR physreg.
+  void shadowLeavesOf(MCRegister PhysReg,
+                      SmallVectorImpl<unsigned> &Leaves) const;
+  // Mirror OccupiedRegUnits mutations into ShadowTree for the VGPR_32 file only.
+  // These are no-ops unless shadowActive(). \p PhysReg is a full physreg (any
+  // width); the width in leaves is derived from its VGPR-unit span.
+  void shadowAllocate(MCRegister PhysReg);
+  void shadowFree(MCRegister PhysReg);
+  // Mirror a raw OccupiedRegUnits.reset(Unit): free the VGPR_32 leaf that owns
+  // \p Unit (no-op if Unit is not a VGPR_32 unit). For the two sites that clear
+  // single reg units directly rather than through markFree.
+  void shadowFreeUnit(MCRegUnit Unit);
+  void shadowResetToOccupied(); // rebuild tree occupancy from OccupiedRegUnits
 
   // Values that color() could not place (no physreg free across their whole
   // range — the %560/%1072 long-liver class). color() collects ALL of them and

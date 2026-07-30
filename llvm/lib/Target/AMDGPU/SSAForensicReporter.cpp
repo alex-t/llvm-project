@@ -90,6 +90,8 @@ static const char *kindName(ForensicEventKind K) {
     return "run-completed";
   case ForensicEventKind::Rollback:
     return "rollback"; // reserved (Q-A) — never emitted in v1
+  case ForensicEventKind::ShadowTreePick:
+    return "shadow-tree-pick";
   }
   return "unknown";
 }
@@ -469,6 +471,41 @@ void SSAForensicReporter::reloadEmitted(unsigned VRegIdx, StringRef Site) {
   ForensicEvent &E = newEvent(ForensicEventKind::ReloadEmitted);
   E.IntFacts.push_back({"vreg", (int64_t)VRegIdx});
   E.StrFacts.push_back({"site", Site.str()});
+}
+
+//===----------------------------------------------------------------------===//
+// Shadow register-tree oracle (E18).
+//===----------------------------------------------------------------------===//
+
+void SSAForensicReporter::shadowTreePick(uint64_t AttemptCause, unsigned VRegIdx,
+                                         unsigned WidthDwords, int64_t RealLeaf,
+                                         int64_t TreeLeaf, bool Match,
+                                         unsigned FreeCount,
+                                         unsigned FullAtWidthLevel) {
+  if (!enabled())
+    return;
+  ForensicEvent &E = newEvent(ForensicEventKind::ShadowTreePick);
+  E.IntFacts.push_back({"vreg", (int64_t)VRegIdx});
+  E.IntFacts.push_back({"widthDwords", (int64_t)WidthDwords});
+  E.IntFacts.push_back({"realLeaf", RealLeaf});
+  E.IntFacts.push_back({"treeLeaf", TreeLeaf});
+  E.StrFacts.push_back({"match", Match ? "true" : "false"});
+  E.IntFacts.push_back({"freeCount", (int64_t)FreeCount});
+  E.IntFacts.push_back({"fullAtWidthLevel", (int64_t)FullAtWidthLevel});
+  uint64_t ID = E.ID;
+  link(AttemptCause, ID);
+}
+
+void SSAForensicReporter::shadowTreeSkip(uint64_t AttemptCause, unsigned VRegIdx,
+                                         unsigned WidthDwords, StringRef Reason) {
+  if (!enabled())
+    return;
+  ForensicEvent &E = newEvent(ForensicEventKind::ShadowTreePick);
+  E.IntFacts.push_back({"vreg", (int64_t)VRegIdx});
+  E.IntFacts.push_back({"widthDwords", (int64_t)WidthDwords});
+  E.StrFacts.push_back({"skipped", Reason.str()});
+  uint64_t ID = E.ID;
+  link(AttemptCause, ID);
 }
 
 //===----------------------------------------------------------------------===//

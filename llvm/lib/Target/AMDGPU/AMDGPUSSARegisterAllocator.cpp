@@ -102,6 +102,19 @@ static cl::opt<bool> EnablePhiWebSpill(
     "amdgpu-ssa-phi-web-spill", cl::Hidden, cl::init(false),
     cl::desc("region-rp: spill a PHI victim as an in-memory-coalesced web"));
 
+// Shadow register-tree oracle (SSARegisterTree). When on AND the forensic sink
+// is active, a shadow SSARegisterTree mirrors the VGPR_32 occupancy the
+// allocator maintains and, at each real VGPR_32 pick, LOGS what the tree would
+// have picked vs. the allocator's choice (behavior-neutral: the tree's answer is
+// discarded; it never influences allocation). Default off; requires a forensic
+// sink (-amdgpu-ssa-forensic-json/-trace) for the divergences to land anywhere.
+static cl::opt<bool> EnableSSAShadowTree(
+    "amdgpu-ssa-shadow-tree", cl::Hidden, cl::init(false),
+    cl::desc("Run a SHADOW SSARegisterTree for the VGPR_32 file that mirrors the "
+             "allocator's occupancy and logs its pick vs. the real pick to the "
+             "forensic NDJSON (observer only; requires a forensic sink; default "
+             "off; byte-identical output on vs off)"));
+
 // Step-0 PHI-copy metric (see PHI_Coalescer design section 9). Counted at the
 // copy-vs-fixed-point decision in lowerPHIs(); pure instrumentation, no MIR
 // change. Baseline for the coalescer and regression guard for every later step.
@@ -219,11 +232,177 @@ void AMDGPUSSARegisterAllocator::widenToAVOnUnified() {
 void AMDGPUSSARegisterAllocator::markOccupied(MCRegister PhysReg) {
   for (MCRegUnit Unit : TRI->regunits(PhysReg))
     OccupiedRegUnits.set(Unit);
+  shadowAllocate(PhysReg); // behavior-neutral mirror (no-op unless shadowActive)
 }
 
 void AMDGPUSSARegisterAllocator::markFree(MCRegister PhysReg) {
   for (MCRegUnit Unit : TRI->regunits(PhysReg))
     OccupiedRegUnits.reset(Unit);
+  shadowFree(PhysReg); // behavior-neutral mirror (no-op unless shadowActive)
+}
+
+//===----------------------------------------------------------------------===//
+// Shadow register-tree oracle (SSARegisterTree). VGPR_32 file ONLY.
+//
+// PURE OBSERVER. Every method here is a no-op unless shadowActive() (the flag is
+// on AND the forensic reporter is live). The tree mirrors the VGPR_32 occupancy
+// the allocator keeps in OccupiedRegUnits and, at the pick, logs what it would
+// have chosen — its answer is DISCARDED. Nothing here reads or writes ColorMap /
+// OccupiedRegUnits in a way the allocation can observe.
+//===----------------------------------------------------------------------===//
+
+bool AMDGPUSSARegisterAllocator::shadowActive() const {
+  return EnableSSAShadowTree && Reporter && Reporter->active() && ShadowTree;
+}
+
+// Build the physreg<->leaf bijection and size the shadow tree. Leaf index i is
+// the i-th register of getOrder(VGPR_32) (the same order pickFreePhysReg scans
+// first-fit), so tree.pickFreeAligned(1) — the lowest free leaf — is directly
+// comparable to the allocator's first-fit pick. The tree needs a power-of-two
+// leaf count; we round the real allocatable VGPR_32 count UP to a power of two
+// and pre-allocate the padding leaves [RealVGPR32Count, ShadowLeaves) so
+// pickFreeAligned can never hand back a register that does not exist.
+void AMDGPUSSARegisterAllocator::setupShadowTree() {
+  ShadowTree.reset();
+  VGPR32Leaf.clear();
+  VGPR32UnitLeaf.clear();
+  RealVGPR32Count = 0;
+  ShadowLeaves = 0;
+  // Only stand the tree up when it will actually be used; keeps the off path and
+  // non-forensic runs at zero cost.
+  if (!EnableSSAShadowTree || !Reporter || !Reporter->active())
+    return;
+
+  ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(&AMDGPU::VGPR_32RegClass);
+  RealVGPR32Count = Order.size();
+  if (RealVGPR32Count == 0)
+    return;
+  for (unsigned I = 0; I < RealVGPR32Count; ++I) {
+    MCRegister PR(Order[I]);
+    VGPR32Leaf[PR.id()] = (int)I;
+    // Map every reg unit of this VGPR_32 to its leaf. A VGPR_32 owns 1 unit on
+    // targets without 16-bit sub-regs and 2 (lo16/hi16) with them; all map to
+    // the same leaf, so an occupied bit on any of them frees/occupies the leaf.
+    for (MCRegUnit U : TRI->regunits(PR))
+      VGPR32UnitLeaf[U] = (int)I;
+  }
+
+  // Round up to a power of two (tree requirement). PowerOf2Ceil(1)==1.
+  ShadowLeaves = llvm::PowerOf2Ceil(RealVGPR32Count);
+  ShadowTree = std::make_unique<SSARegisterTree>(ShadowLeaves);
+  // Pre-mark the padding leaves occupied so they are never picked or double-freed.
+  for (unsigned L = RealVGPR32Count; L < ShadowLeaves; ++L)
+    ShadowTree->allocateAligned(L, 1);
+}
+
+// Map a physreg to a VGPR_32 leaf. A VGPR_32 maps directly. A wider VGPR tuple
+// (vreg_64/96/128/...) maps to its LOWEST-index sub-VGPR_32's leaf, which — with
+// leaf==getOrder-ordinal — is the aligned block start we mirror. A non-VGPR
+// physreg (SGPR/AGPR/VCC/...) returns -1: out of scope for this increment.
+int AMDGPUSSARegisterAllocator::shadowLeafOf(MCRegister PhysReg) const {
+  auto Direct = VGPR32Leaf.find(PhysReg.id());
+  if (Direct != VGPR32Leaf.end())
+    return Direct->second;
+  // Wider VGPR tuple: find the lowest leaf over its reg units (mapped via
+  // VGPR32UnitLeaf, which handles lo16/hi16 unit roots correctly). A non-VGPR
+  // physreg contributes no mapped unit and returns -1.
+  int Best = -1;
+  for (MCRegUnit Unit : TRI->regunits(PhysReg)) {
+    auto It = VGPR32UnitLeaf.find(Unit);
+    if (It != VGPR32UnitLeaf.end() && (Best < 0 || It->second < Best))
+      Best = It->second;
+  }
+  return Best;
+}
+
+// Enumerate the ACTUAL leaf index of every VGPR_32 that \p PhysReg covers, into
+// \p Leaves. A scalar VGPR_32 yields its own leaf; a wider tuple yields the leaf
+// of each of its VGPR_32 sub-registers. We resolve each leaf through the
+// getOrder-ordinal map (VGPR32Leaf) rather than assuming a tuple's sub-VGPRs are
+// contiguous in leaf space — on targets that reserve VGPRs the allocation order
+// is NOT the HW-index order, so a contiguous [Leaf, Leaf+W) block would mark the
+// wrong leaves (a drift that would corrupt even the width-1 comparison). Each
+// leaf is tracked as an independent width-1 cell, which is all pickFreeAligned(1)
+// needs; aligned-block modeling of wide tuples is a later increment.
+void AMDGPUSSARegisterAllocator::shadowLeavesOf(
+    MCRegister PhysReg, SmallVectorImpl<unsigned> &Leaves) const {
+  auto Direct = VGPR32Leaf.find(PhysReg.id());
+  if (Direct != VGPR32Leaf.end()) {
+    Leaves.push_back((unsigned)Direct->second);
+    return;
+  }
+  // Wider tuple (or any physreg): collect the leaf of each covered reg unit via
+  // VGPR32UnitLeaf (dedup — a VGPR_32 owns 2 units on lo16/hi16 targets, both
+  // pointing at the same leaf). A non-VGPR physreg maps no units and yields [].
+  for (MCRegUnit Unit : TRI->regunits(PhysReg)) {
+    auto It = VGPR32UnitLeaf.find(Unit);
+    if (It != VGPR32UnitLeaf.end() &&
+        !llvm::is_contained(Leaves, (unsigned)It->second))
+      Leaves.push_back((unsigned)It->second);
+  }
+}
+
+void AMDGPUSSARegisterAllocator::shadowAllocate(MCRegister PhysReg) {
+  if (!shadowActive())
+    return;
+  // Mirror as width-1 per VGPR_32 leaf so wider/unaligned tuples (out of the
+  // width-1 pick scope) never wedge the aligned tree; each leaf tracks one dword.
+  SmallVector<unsigned, 8> Leaves;
+  shadowLeavesOf(PhysReg, Leaves);
+  for (unsigned L : Leaves)
+    if (L < RealVGPR32Count && ShadowTree->isFree(L, 1))
+      ShadowTree->allocateAligned(L, 1);
+}
+
+void AMDGPUSSARegisterAllocator::shadowFree(MCRegister PhysReg) {
+  if (!shadowActive())
+    return;
+  SmallVector<unsigned, 8> Leaves;
+  shadowLeavesOf(PhysReg, Leaves);
+  for (unsigned L : Leaves)
+    if (L < RealVGPR32Count && !ShadowTree->isFree(L, 1))
+      ShadowTree->freeAligned(L, 1);
+}
+
+void AMDGPUSSARegisterAllocator::shadowFreeUnit(MCRegUnit Unit) {
+  if (!shadowActive())
+    return;
+  // Recover the VGPR_32 leaf that owns Unit directly from the unit map (the root
+  // iterator would yield VGPRn_LO16/HI16, which are NOT in the physreg-keyed
+  // map). A VGPR_32 owning 2 units means each is cleared separately; freeing an
+  // already-free leaf is a guarded no-op.
+  auto It = VGPR32UnitLeaf.find(Unit);
+  if (It != VGPR32UnitLeaf.end()) {
+    unsigned L = (unsigned)It->second;
+    if (L < RealVGPR32Count && !ShadowTree->isFree(L, 1))
+      ShadowTree->freeAligned(L, 1);
+  }
+}
+
+// Resync the shadow tree to the AUTHORITATIVE OccupiedRegUnits. Called wherever
+// the allocator resets/rebuilds OccupiedRegUnits wholesale (per-block seed,
+// colorOneInPlace, deferred per-unit frees) so the mirror can never drift from
+// the real occupancy even across the paths that touch the bitvector directly.
+void AMDGPUSSARegisterAllocator::shadowResetToOccupied() {
+  if (!shadowActive())
+    return;
+  // Free every real leaf, then re-occupy from the live OccupiedRegUnits. One
+  // width-1 leaf per VGPR_32 whose reg unit is currently set.
+  for (unsigned L = 0; L < RealVGPR32Count; ++L)
+    if (!ShadowTree->isFree(L, 1))
+      ShadowTree->freeAligned(L, 1);
+  ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(&AMDGPU::VGPR_32RegClass);
+  for (unsigned L = 0; L < RealVGPR32Count; ++L) {
+    MCRegister PR(Order[L]);
+    bool Occ = false;
+    for (MCRegUnit U : TRI->regunits(PR))
+      if (OccupiedRegUnits.test(U)) {
+        Occ = true;
+        break;
+      }
+    if (Occ)
+      ShadowTree->allocateAligned(L, 1);
+  }
 }
 
 void AMDGPUSSARegisterAllocator::collectOccupancy(const TargetRegisterClass *RC,
@@ -929,6 +1108,11 @@ bool AMDGPUSSARegisterAllocator::colorOneInPlace(Register R) {
       markOccupied(PhysReg);
   }
 
+  // The reset() above cleared OccupiedRegUnits directly (not through markFree),
+  // so the mirror must be re-anchored to the just-rebuilt occupancy. No-op unless
+  // shadowActive.
+  shadowResetToOccupied();
+
   MCRegister Chosen = pickFreePhysReg(RC, RI, /*WiderDefs=*/{});
   if (!Chosen)
     return false;
@@ -1093,6 +1277,10 @@ void AMDGPUSSARegisterAllocator::seedOccupiedAtBBEntry(MachineBasicBlock *MBB) {
     LLVM_DEBUG(dbgs() << "    phys live-in: " << TRI->getName(LI.PhysReg)
                       << "\n");
   }
+
+  // Anchor the shadow tree to the freshly-seeded OccupiedRegUnits (the reset()
+  // above dropped the previous block's mirror). No-op unless shadowActive.
+  shadowResetToOccupied();
 }
 
 bool AMDGPUSSARegisterAllocator::edgeCopiesNeedSplit(
@@ -2431,8 +2619,10 @@ void AMDGPUSSARegisterAllocator::color() {
                 if (!LIS->getRegUnit(Unit).liveAt(NextSI)) {
                   if (HasEC)
                     DeferredUnits.push_back(Unit);
-                  else
+                  else {
                     OccupiedRegUnits.reset(Unit);
+                    shadowFreeUnit(Unit); // mirror (no-op unless shadowActive)
+                  }
                 }
               continue;
             }
@@ -2673,6 +2863,47 @@ void AMDGPUSSARegisterAllocator::color() {
                               << TRI->getName(Chosen) << "\n");
           }
 
+          // SHADOW register-tree oracle: ask the tree what it WOULD pick and log
+          // it against the allocator's actual Chosen. Behavior-neutral — the
+          // tree's answer is discarded here, never fed back. Done BEFORE the
+          // markOccupied below so the tree still shows Chosen free (its leaf must
+          // be a candidate). Only the width-1 VGPR_32 pick is in scope; wider
+          // tuples / non-VGPR files log a skip. No-op unless shadowActive.
+          // Cause link: AttemptID exists only on the normal-def pick path (tied
+          // and undef-self-tie defs create no E4 attempt), so use 0 (no-cause)
+          // uniformly — the shadow event stands on its own vreg/leaf facts.
+          if (shadowActive()) {
+            const TargetRegisterClass *CRC = MRI->getRegClass(Reg);
+            unsigned WDwords = TRI->getRegSizeInBits(*CRC) / 32;
+            bool IsVGPR = TRI->isVGPRClass(CRC) && !TRI->isAGPRClass(CRC);
+            int RealLeaf = shadowLeafOf(Chosen);
+            if (!IsVGPR || WDwords != 1)
+              Reporter->shadowTreeSkip(/*Cause=*/0, Reg.virtRegIndex(), WDwords,
+                                       !IsVGPR ? "class" : "wide-tuple");
+            else if (RealLeaf < 0)
+              Reporter->shadowTreeSkip(/*Cause=*/0, Reg.virtRegIndex(), WDwords,
+                                       "leaf-oob");
+            else {
+              LLVM_DEBUG({
+                // Drift probe (DEBUG-only, neutral): the tree mirrors exactly
+                // OccupiedRegUnits, so RealLeaf (which the allocator picked, thus
+                // free in its OccupiedAtDef ⊇ OccupiedRegUnits view) MUST be free
+                // in the tree. If not, the mirror drifted.
+                if (!ShadowTree->isFree((unsigned)RealLeaf, 1))
+                  dbgs() << "!!! SHADOW-DRIFT vreg" << Reg.virtRegIndex()
+                         << " realLeaf=" << RealLeaf
+                         << " but shadow tree says it is occupied (mirror bug; "
+                            "freeCount=" << ShadowTree->freeCount() << ")\n";
+              });
+              int TreeLeaf = ShadowTree->pickFreeAligned(1);
+              bool Match = (TreeLeaf == RealLeaf);
+              Reporter->shadowTreePick(/*Cause=*/0, Reg.virtRegIndex(), WDwords,
+                                       RealLeaf, TreeLeaf, Match,
+                                       ShadowTree->freeCount(),
+                                       ShadowTree->fullCountAtLevel(0));
+            }
+          }
+
           ColorMap[Reg] = Chosen;
           // Forensic collection: record the vreg this tier just colored, by
           // pool, for the post-pass rank analysis.
@@ -2751,8 +2982,10 @@ void AMDGPUSSARegisterAllocator::color() {
 
         // Free dying uses deferred past an early-clobber def now that its defs
         // are colored (they could not reuse these physregs).
-        for (MCRegUnit Unit : DeferredUnits)
+        for (MCRegUnit Unit : DeferredUnits) {
           OccupiedRegUnits.reset(Unit);
+          shadowFreeUnit(Unit); // mirror (no-op unless shadowActive)
+        }
         for (MCRegister PR : DeferredFree)
           markFree(PR);
       }
@@ -3873,6 +4106,11 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   MaxSGPRIdx = 0;
   MaxAGPRIdx = 0;
   UncolorableVRegs.clear();
+  // Shadow register-tree oracle (observer, default off). Build the VGPR_32
+  // physreg<->leaf map + empty tree for this function; seedOccupiedAtBBEntry
+  // re-anchors it per block. No-op / not built unless the flag AND a forensic
+  // sink are on.
+  setupShadowTree();
   color();
 
   // [Stage 3] Region RP-reduction: do our BEST-EFFORT spill-across to drop the
@@ -3915,6 +4153,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       MaxSGPRIdx = 0;
       MaxAGPRIdx = 0;
       UncolorableVRegs.clear();
+      setupShadowTree(); // rebuild the shadow tree for the fresh recolor
       color();
       LLVM_DEBUG(dbgs() << "=== region-rp round " << Round << ": after recolor, "
                         << UncolorableVRegs.size() << " uncolorable remain ===\n");
