@@ -49,14 +49,34 @@ SSARegisterTree::SSARegisterTree(unsigned NumLeaves) {
     ++NumLevels;
 
   // 2N entries (1-based; slot 0 unused). Each node starts fully free: its free
-  // count equals its span.
+  // count equals its span, and its largest free aligned block is its whole span.
   FreeLeaves.assign(2 * N, 0);
+  MaxFreeAligned.assign(2 * N, 0);
   NodeAllocated.resize(2 * N, false);
-  for (unsigned Node = 1; Node < 2 * N; ++Node)
+  for (unsigned Node = 1; Node < 2 * N; ++Node) {
     FreeLeaves[Node] = spanOf(Node);
+    MaxFreeAligned[Node] = spanOf(Node);
+  }
 
   // Nothing is occupied yet, so no aligned block of any width is full.
   FullAtLevel.assign(NumLevels + 1, 0);
+}
+
+// MaxFreeAligned for a node: its whole span if the node is itself completely
+// free, else the larger of its two children's aggregates. For a leaf (span 1)
+// the "completely free" branch already yields 1-if-free / 0-if-taken.
+void SSARegisterTree::refreshMaxFreeAligned(unsigned Node) {
+  unsigned Span = spanOf(Node);
+  if (FreeLeaves[Node] == Span) {
+    MaxFreeAligned[Node] = Span;
+    return;
+  }
+  if (Span == 1) {
+    MaxFreeAligned[Node] = 0; // occupied leaf
+    return;
+  }
+  unsigned Left = 2 * Node, Right = Left + 1;
+  MaxFreeAligned[Node] = std::max(MaxFreeAligned[Left], MaxFreeAligned[Right]);
 }
 
 // depth(Node) = floor(log2(Node)); span = N >> depth.
@@ -114,16 +134,21 @@ bool SSARegisterTree::allocateAligned(unsigned FirstLeaf, unsigned Width) {
   // width-2^k block contains 2^(k-j) full sub-blocks at each level j <= k.
   NodeAllocated[Node] = true;
   FreeLeaves[Node] = 0;
+  // The node is now fully occupied, so it contains no free aligned block.
+  // (Its stale descendants are never observed: the descent prunes here on 0.)
+  MaxFreeAligned[Node] = 0;
   unsigned K = Log2_32(Width); // block's level
   for (unsigned J = 0; J <= K; ++J)
     FullAtLevel[J] += (1u << (K - J));
 
-  // Walk the root-path: propagate the lost free leaves, and where an ancestor
-  // transitions to fully occupied (FreeLeaves hits 0), bump its level's count.
+  // Walk the root-path: propagate the lost free leaves, refresh each ancestor's
+  // largest-free-aligned aggregate from its (already-updated) children, and where
+  // an ancestor transitions to fully occupied bump its level's full count.
   for (unsigned A = Node / 2; A >= 1; A /= 2) {
     FreeLeaves[A] -= Width;
     if (FreeLeaves[A] == 0)
       ++FullAtLevel[levelOf(A)];
+    refreshMaxFreeAligned(A);
   }
   return true;
 }
@@ -137,22 +162,27 @@ void SSARegisterTree::freeAligned(unsigned FirstLeaf, unsigned Width) {
   if (!NodeAllocated[Node])
     return;
 
-  // Reverse the allocate accounting. First undo the ancestor cascade: an
-  // ancestor that WAS full (FreeLeaves == 0) stops being full as we add leaves
-  // back, so decrement its level's count before restoring the count.
-  for (unsigned A = Node / 2; A >= 1; A /= 2) {
-    if (FreeLeaves[A] == 0)
-      --FullAtLevel[levelOf(A)];
-    FreeLeaves[A] += Width;
-  }
+  // Restore the freed node first: it is completely free again, so its whole span
+  // is once more a free aligned block. This must happen before we refresh its
+  // parent (refreshMaxFreeAligned reads the children's aggregates).
+  NodeAllocated[Node] = false;
+  FreeLeaves[Node] = Width;
+  MaxFreeAligned[Node] = Width;
 
-  // Undo the block-and-descendants accounting.
+  // Undo the block-and-descendants full-count accounting.
   unsigned K = Log2_32(Width);
   for (unsigned J = 0; J <= K; ++J)
     FullAtLevel[J] -= (1u << (K - J));
 
-  NodeAllocated[Node] = false;
-  FreeLeaves[Node] = Width;
+  // Reverse the ancestor cascade: an ancestor that WAS full stops being full as
+  // we add leaves back, so decrement its level's count before restoring the
+  // count, then refresh its largest-free-aligned aggregate from its children.
+  for (unsigned A = Node / 2; A >= 1; A /= 2) {
+    if (FreeLeaves[A] == 0)
+      --FullAtLevel[levelOf(A)];
+    FreeLeaves[A] += Width;
+    refreshMaxFreeAligned(A);
+  }
 }
 
 bool SSARegisterTree::isFree(unsigned FirstLeaf, unsigned Width) const {
@@ -176,10 +206,37 @@ unsigned SSARegisterTree::fullCountAtLevel(unsigned K) const {
   return K < FullAtLevel.size() ? FullAtLevel[K] : 0;
 }
 
-// STUB (increment 2c).
 int SSARegisterTree::pickFreeAligned(unsigned Width) const {
-  (void)Width;
-  return -1;
+  // Mirror validBlock's argument rejects, but return -1 (not false).
+  if (Width == 0 || !isPowerOf2_32(Width) || Width > N)
+    return -1;
+
+  // Root prune: MaxFreeAligned[1] is the widest free aligned block anywhere.
+  if (MaxFreeAligned[1] < Width)
+    return -1;
+
+  // Descend to the target level (depth NumLevels-K, where each node spans W),
+  // always taking the LEFT child first when its subtree still contains a free
+  // aligned block of at least Width -- this yields the LOWEST firstLeaf.
+  //
+  // MaxFreeAligned (not FreeLeaves) is the correct admission test: FreeLeaves
+  // only counts free leaves, which can be >= Width while no *aligned* block of
+  // that width exists (e.g. occupancy ".#.#" has 2 free leaves but no free
+  // aligned pair). MaxFreeAligned answers the aligned-block question directly.
+  unsigned TargetDepth = NumLevels - Log2_32(Width);
+  unsigned Node = 1;
+  for (unsigned Depth = 0; Depth < TargetDepth; ++Depth) {
+    unsigned Left = 2 * Node;
+    unsigned Right = Left + 1;
+    if (MaxFreeAligned[Left] >= Width)
+      Node = Left; // prefer the lower-indexed subtree
+    else
+      Node = Right; // guaranteed by the invariant: parent had a free width-W
+                    // block, so if the left child cannot host it the right can.
+  }
+
+  // Node is the lowest-indexed target-level node that is completely free.
+  return static_cast<int>(firstLeafOf(Node));
 }
 
 void SSARegisterTree::dump(raw_ostream &OS) const {

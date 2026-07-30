@@ -123,6 +123,20 @@ private:
   // alloc/free root-path walk; size NumLevels + 1.
   SmallVector<unsigned, 8> FullAtLevel;
 
+  // MaxFreeAligned[i] = width (in leaves) of the LARGEST completely-free aligned
+  // block within node i's subtree (0 if none). Definition:
+  //   * if node i is itself completely free (FreeLeaves[i] == spanOf(i)):
+  //       MaxFreeAligned[i] = spanOf(i);
+  //   * else, an internal node: max(MaxFreeAligned[2i], MaxFreeAligned[2i+1]);
+  //   * a leaf: 1 if free, else 0 (subsumed by the "completely free" rule).
+  // This is the sufficient admission test pickFreeAligned descends on -- unlike
+  // FreeLeaves, which counts free leaves (necessary but NOT sufficient for an
+  // aligned block to exist). Maintained incrementally on the same root-path walk.
+  SmallVector<unsigned, 32> MaxFreeAligned;
+
+  // Recompute MaxFreeAligned[Node] from its own fullness and its children.
+  void refreshMaxFreeAligned(unsigned Node);
+
   // --- geometry helpers (pure functions of a node index) -------------------
   unsigned spanOf(unsigned Node) const;      // leaves covered by Node
   unsigned firstLeafOf(unsigned Node) const; // lowest leaf index under Node

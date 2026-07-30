@@ -257,4 +257,59 @@ TEST(SSARegisterTreeTest, RejectOverlappingBlocksNoOp) {
   EXPECT_EQ(serializeState(T), Before);
 }
 
+//===----------------------------------------------------------------------===//
+// Fragmentation regression (bug: pickFreeAligned used FreeLeaves, which counts
+// free leaves -- necessary but NOT sufficient for a free ALIGNED block).
+//
+// N=8, occupy leaves 1 and 3 -> ".#.#....". The left half [0,4) has 2 free
+// leaves (0 and 2) but NO free aligned width-2 block; the fix must skip it and
+// find [4,8). The old code returned -1 here.
+//===----------------------------------------------------------------------===//
+TEST(SSARegisterTreeTest, PickFreeAlignedSkipsFragmentedHalf) {
+  SSARegisterTree T(8);
+  ASSERT_TRUE(T.allocateAligned(1, 1));
+  ASSERT_TRUE(T.allocateAligned(3, 1));
+
+  // Sanity: occupancy is exactly ".#.#....".
+  std::string Occ;
+  raw_string_ostream OS(Occ);
+  T.dump(OS);
+  EXPECT_EQ(OS.str(), ".#.#....");
+
+  // The free aligned width-2 blocks are [4,6) and [6,8); [0,2) and [2,4) are
+  // fragmented. Lowest free aligned width-2 block starts at leaf 4.
+  EXPECT_TRUE(T.isFree(4, 2));
+  EXPECT_TRUE(T.isFree(6, 2));
+  EXPECT_FALSE(T.isFree(0, 2));
+  EXPECT_FALSE(T.isFree(2, 2));
+  EXPECT_EQ(T.pickFreeAligned(2), 4); // the bug returned -1 here
+
+  // width-1: lowest free single leaf is 0.
+  EXPECT_EQ(T.pickFreeAligned(1), 0);
+
+  // width-4: left half [0,4) is fragmented, so the only free aligned width-4
+  // block is [4,8) -> 4.
+  EXPECT_EQ(T.pickFreeAligned(4), 4);
+
+  // width-8: whole tree is not free -> -1.
+  EXPECT_EQ(T.pickFreeAligned(8), -1);
+}
+
+// A second fragmentation shape: fragment several low pairs and confirm the pick
+// returns the lowest still-whole higher block, and recovers after a free.
+TEST(SSARegisterTreeTest, PickFreeAlignedLowestAmongFreePairs) {
+  SSARegisterTree T(16);
+  ASSERT_TRUE(T.allocateAligned(1, 1)); // breaks pair [0,2)
+  ASSERT_TRUE(T.allocateAligned(2, 1)); // breaks pair [2,4)
+  ASSERT_TRUE(T.allocateAligned(5, 1)); // breaks pair [4,6)
+  // Pair [6,8) is still whole and free -> lowest free aligned width-2 is 6.
+  EXPECT_EQ(T.pickFreeAligned(2), 6);
+  // width-4: [0,4) and [4,8) both fragmented, so [8,12) -> 8.
+  EXPECT_EQ(T.pickFreeAligned(4), 8);
+  // Free the fragmenting leaf and the lowest width-2 drops back down to [0,2).
+  T.freeAligned(1, 1);
+  EXPECT_TRUE(T.isFree(0, 2));
+  EXPECT_EQ(T.pickFreeAligned(2), 0);
+}
+
 } // namespace
