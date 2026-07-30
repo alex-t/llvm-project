@@ -138,8 +138,9 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
   emitReloadsAndRepairSSA(Info);
 }
 
-bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
-                                  SlotIndex RegS, SlotIndex RegE) {
+bool SSASpillEmitter::spillPhiWeb(
+    Register PhiResult, unsigned RPLimit, SlotIndex RegS, SlotIndex RegE,
+    llvm::function_ref<void(Register)> ColorFreshVReg) {
   CurRPLimit = RPLimit;
   LastWebErased.clear();
   LastWebGround.clear();
@@ -152,7 +153,22 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
 
   // --- 1. Close the equivalence class (analysis only; slot stays virtual). ---
   SmallSetVector<Register, 32> PhiMembers; // PHIs in the web (candidates to erase)
-  SmallSetVector<Register, 32> GroundOps;  // non-PHI operands (store at their def)
+  SmallSetVector<Register, 32> GroundOps;  // non-PHI operands (store on their edge)
+  // Each ground operand appears on a specific PHI incoming EDGE (pred block). The
+  // store + color-pinning COPY belongs at THAT predecessor's end (the classic
+  // PHI-elimination edge), NOT at the ground def: the def may sit in a hot,
+  // scattered block, whereas the pred end is adjacent to the join we are relieving,
+  // so the shared color is free there. A PHI operand may name a SUB-REGISTER of a
+  // wider vreg (a 32-bit PHI reading %wide.subN); record the subreg so we store
+  // only that lane (the slot is sized by the narrow PHI result, not the wide reg).
+  struct GroundEdge {
+    Register Reg;
+    unsigned SubReg;
+    MachineBasicBlock *Pred;
+    MachineInstr *Phi;   // the PHI whose operand reads Reg on this edge
+    unsigned OpIdx;      // operand index of Reg in Phi (block operand is OpIdx+1)
+  };
+  SmallVector<GroundEdge, 32> GroundEdges;
   SmallVector<Register, 32> Work;
   PhiMembers.insert(PhiResult);
   Work.push_back(PhiResult);
@@ -174,13 +190,26 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
         MachineOperand &Op = D->getOperand(I);
         if (!Op.isReg() || !Op.getReg().isVirtual())
           continue;
+        // An UNDEF PHI operand (`undef %r.subN, %bb`) carries no live value on that
+        // edge — %r is not live-out there. Storing it would emit a COPY reading an
+        // undefined register (verifier: "reading vreg without a def"). Skip it: the
+        // reload on that path reads whatever the slot holds, which is sound because
+        // the incoming value was undef anyway.
+        if (Op.isUndef())
+          continue;
         Register OpReg = Op.getReg();
         MachineInstr *OpDef = MRI->getUniqueVRegDef(OpReg);
         if (OpDef && OpDef->isPHI()) {
           if (PhiMembers.insert(OpReg))
             Work.push_back(OpReg);
         } else {
-          GroundOps.insert(OpReg); // ground def -> store site
+          // Ground operand on this PHI edge. The block operand is I+1. Record
+          // EVERY edge (no dedup): only one edge executes at runtime, so each edge
+          // carrying a web value must write the slot, even if the same vreg flows
+          // on two edges. GroundOps stays unique for the interference gate/relief.
+          MachineBasicBlock *PredBB = D->getOperand(I + 1).getMBB();
+          GroundOps.insert(OpReg);
+          GroundEdges.push_back({OpReg, Op.getSubReg(), PredBB, D, I});
         }
       }
     }
@@ -208,9 +237,12 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
   // its two operands come from mutually-exclusive cmp.true/cmp.false predecessors.)
   {
     SmallVector<Register, 16> GV(GroundOps.begin(), GroundOps.end());
+    auto HasLive = [&](Register R) {
+      return LIS->hasInterval(R) && !LIS->getInterval(R).empty();
+    };
     for (unsigned A = 0; A < GV.size(); ++A)
       for (unsigned B = A + 1; B < GV.size(); ++B)
-        if (LIS->hasInterval(GV[A]) && LIS->hasInterval(GV[B]) &&
+        if (HasLive(GV[A]) && HasLive(GV[B]) &&
             LIS->getInterval(GV[A]).overlaps(LIS->getInterval(GV[B]))) {
           LLVM_DEBUG(dbgs()
                      << "spillPhiWeb(): DECLINE root " << printReg(PhiResult, TRI)
@@ -264,35 +296,62 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
       ExternalUses.push_back({&U, M});
     }
 
-  // --- 3. Commit: one shared slot for the whole web. ---
   VRegMaskPair RootVMP(PhiResult, MRI->getMaxLaneMaskForVReg(PhiResult));
   int FI = assignVirt2StackSlot(RootVMP);
 
-  // --- 4a. Store every ground operand at its def (in its predecessor block). ---
-  for (Register G : GroundOps) {
-    MachineInstr *GDef = MRI->getUniqueVRegDef(G);
-    if (!GDef || GDef->isImplicitDef())
-      continue; // live-in / undef: nothing to save (v1)
-    MachineBasicBlock *GBB = GDef->getParent();
-    MachineBasicBlock::iterator InsertAfter = std::next(GDef->getIterator());
-    const TargetRegisterClass *RC = TRI->getRegClassForReg(*MRI, G);
-    TII->storeRegToStackSlot(*GBB, InsertAfter, G, /*isKill=*/false, FI, RC, TRI,
-                             G);
-    LIS->InsertMachineInstrInMaps(*std::prev(InsertAfter));
-    ++NumSpills;
-    LLVM_DEBUG(dbgs() << "  phi-web: store ground " << printReg(G, TRI) << " -> FI"
-                      << FI << " in " << printMBBReference(*GBB) << "\n");
+  // --- 3. Store every web ground operand into the shared slot on its PHI edge,
+  // all reaching the slot in ONE physreg R (required: the SGPR-lane lowering sees
+  // one lane for a width-1 slot and asserts on N distinct source SGPRs). We do NOT
+  // recolor the long-lived ground ops (a color free across their full ranges
+  // rarely exists). Instead ONE operand is the "main": it keeps its own color R
+  // and is stored directly (NO copy — so it never interferes with itself, so R
+  // stays reusable). Every OTHER operand gets a short-lived `c = COPY op` at its
+  // predecessor end, colored R and killed into the store; R need only be free at
+  // THAT pred end (where the main op is not live). The color is chosen FIRST, from
+  // the operands as they are — inserting copies before choosing would make each
+  // copy compete for R at the saturated pred ends (the 49-decline bug).
+  if (GroundEdges.empty()) {
+    LastWebGround.clear();
+    return false;
   }
 
-  // --- 4b. Reload each PHI member's EXTERNAL uses from the shared slot via the
-  // STANDARD repair pipeline (buildDomGroupsForSpill + emitReloadsAndRepairSSA):
-  // that emits a fresh reload vreg per reaching-region and rewrites the use +
-  // reconstructs SSA — a spill NEVER leaves a multi-def (each reload is a new
-  // vreg, use rewritten). Killing at the PHI's own def frees the whole result;
-  // reloads read FI (whichever predecessor ran wrote it in 4a). Option b: NO RP
-  // gate — the web spill is a monotone wall-dissolution. (Ground ops are NOT
-  // reloaded: their store is isKill=false, so they keep their register for their
-  // own non-PHI uses.) ---
+  // Store each web ground operand AT ITS DEF into the shared slot. Storing at the
+  // def (not the predecessor end) is what DRAINS the predecessor tail: these
+  // operands are live [def, block-end] only because they are live-out to the join
+  // PHI; once that PHI use is gone (the PHI is erased below) and the value is in
+  // memory from its def onward, each collapses to [def, store], vacating the tail
+  // where N of them piled up (the COLORFAIL cluster). A sub-register operand stores
+  // only its lane (the slot is the result-narrow class). Dedup identical
+  // (value,pred) edges — a value on two edges from one pred needs one store.
+  SmallDenseSet<std::pair<unsigned, MachineBasicBlock *>, 16> StoredEdge;
+  for (const GroundEdge &GE : GroundEdges) {
+    Register G = GE.Reg;
+    if (!G.isVirtual())
+      continue;
+    MachineInstr *GDef = MRI->getUniqueVRegDef(G);
+    if (!GDef || GDef->isImplicitDef())
+      continue; // live-in / undef: nothing to store
+    if (!StoredEdge.insert({G.id(), GE.Pred}).second)
+      continue;
+    MachineBasicBlock &GBB = *GDef->getParent();
+    MachineBasicBlock::iterator DIt = std::next(GDef->getIterator());
+    const TargetRegisterClass *StoreRC =
+        GE.SubReg ? TRI->getSubRegisterClass(MRI->getRegClass(G), GE.SubReg)
+                  : MRI->getRegClass(G);
+    TII->storeRegToStackSlot(GBB, DIt, G, /*isKill=*/false, FI, StoreRC, TRI, G,
+                             MachineInstr::NoFlags, GE.SubReg);
+    LIS->InsertMachineInstrInMaps(*std::prev(DIt));
+    ++NumSpills;
+    LLVM_DEBUG(dbgs() << "  phi-web: store " << printReg(G, TRI)
+                      << (GE.SubReg ? ".subN" : "") << " AT DEF -> FI" << FI
+                      << " in " << printMBBReference(GBB) << "\n");
+  }
+
+  // Reload each PHI member's EXTERNAL uses from the shared slot and erase the PHIs.
+  // The reload redefs are fresh vregs colored in place by the driver
+  // (ColorFreshVReg via reloadedRegs()); the value delivery is memory on whichever
+  // edge ran. This is the join-dissolution: the spilled web is FINAL (no register
+  // coalescing remains — the coalescer's job on it is done by the spill).
   SmallSetVector<Register, 32> MembersWithExtUse;
   for (auto &[U, M] : ExternalUses)
     MembersWithExtUse.insert(M);
@@ -301,10 +360,7 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
     if (!MDef)
       continue;
     VRegMaskPair VMP(M, MRI->getMaxLaneMaskForVReg(M));
-    Virt2StackSlotMap[VMP] = FI; // reloads of M read the shared web slot
-    // Seed the store-at-def memo so the pipeline does NOT store M at the join
-    // (its value already lives in FI via the operand stores). We call the reload
-    // half directly, so no store is emitted regardless; this is belt-and-braces.
+    Virt2StackSlotMap[VMP] = FI;
     SpillInfo Info;
     Info.SpilledVMP = VMP;
     Info.KillIdx = LIS->getInstructionIndex(*MDef).getRegSlot();
@@ -313,11 +369,6 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
     emitReloadsAndRepairSSA(Info);
   }
 
-  // --- 5. Erase the PHI members as a batch. After 4b every external use is a
-  // reload (fresh vreg); the only remaining uses of a member are INTERNAL web
-  // edges (operands of sibling web PHIs), which disappear as those siblings are
-  // erased. So erase the whole set together. (-verify-machineinstrs will flag any
-  // dangling use if an external reload was missed — the proven-root-cause path.)
   for (Register M : PhiMembers) {
     if (MachineInstr *D = MRI->getUniqueVRegDef(M)) {
       LIS->RemoveMachineInstrFromMaps(*D);
@@ -328,14 +379,6 @@ bool SSASpillEmitter::spillPhiWeb(Register PhiResult, unsigned RPLimit,
     LastWebErased.push_back(M);
   }
 
-  // --- 6. RECOMPUTE each ground operand's live interval. Erasing the PHIs removed
-  // the ground ops' PHI-edge USES; a ground op whose only remaining use was that
-  // edge is now live only [def, store] instead of across the join region. Without
-  // recomputing, its STALE interval still spans the region, so region-rp reads it
-  // as a live crosser and RE-SPILLS it in a later round (proven on cf512: %999
-  // stored WEB round 0, then PLAIN round 1 — the double-spill / over-spill root).
-  // The store reads G (isKill=false), so the recomputed range correctly ends at
-  // the store, not across the region.
   for (Register G : GroundOps) {
     if (!G.isVirtual() || MRI->reg_nodbg_empty(G))
       continue;

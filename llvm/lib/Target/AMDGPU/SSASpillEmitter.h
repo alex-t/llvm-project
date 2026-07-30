@@ -216,8 +216,17 @@ public:
   /// has no ground operand. \p PeakSlot is the region's peak-RP slot: the number
   /// of erased web members live there (the true RP relief the caller should credit
   /// so it does not over-spill) is recorded in lastWebPeakRelief().
+  /// Ground operands are stored into the shared slot on their PHI edges.
+  /// Differently-colored SGPRs MAY share the slot: the SILowerSGPRSpills lane
+  /// assert is a per-store WIDTH check (reg-width <= slot lanes), NOT a color/count
+  /// check, and the web's non-interference gate already proves the operands are
+  /// never simultaneously live — so sequential writelanes into the shared lane are
+  /// correct. No shared color is forced. A sub-register PHI operand is
+  /// COPY-extracted to slot width first; that fresh short-lived vreg is colored via
+  /// \p ColorFreshVReg (it lives only [copy, store], so a free reg always exists).
   bool spillPhiWeb(Register PhiResult, unsigned RPLimit, SlotIndex RegS,
-                   SlotIndex RegE);
+                   SlotIndex RegE,
+                   llvm::function_ref<void(Register)> ColorFreshVReg);
 
   /// Members erased by the last spillPhiWeb() (for the caller to prune ColorMap).
   ArrayRef<Register> lastWebErased() const { return LastWebErased; }
