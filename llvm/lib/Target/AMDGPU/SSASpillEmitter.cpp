@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "SSASpillEmitter.h"
+#include "SSAForensicReporter.h"
 #include "AMDGPU.h"
 #include "GCNRegPressure.h"
 #include "GCNSubtarget.h"
@@ -342,6 +343,8 @@ bool SSASpillEmitter::spillPhiWeb(
                              MachineInstr::NoFlags, GE.SubReg);
     LIS->InsertMachineInstrInMaps(*std::prev(DIt));
     ++NumSpills;
+    if (Reporter && SSAForensicReporter::enabled())
+      Reporter->spillEmitted(G.virtRegIndex(), "phi-web-store-at-def");
     LLVM_DEBUG(dbgs() << "  phi-web: store " << printReg(G, TRI)
                       << (GE.SubReg ? ".subN" : "") << " AT DEF -> FI" << FI
                       << " in " << printMBBReference(GBB) << "\n");
@@ -636,6 +639,8 @@ MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
 
   LLVM_DEBUG(dbgs() << "spillAtDefinition(): Stored: " << StoreMI);
   ++NumSpills;
+  if (Reporter && SSAForensicReporter::enabled())
+    Reporter->spillEmitted(VReg.virtRegIndex(), "store-at-def");
 
   return &StoreMI;
 }
@@ -882,6 +887,10 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
                     << (InsertBefore ? " before use" : " at block end") << ": "
                     << printReg(OrigVReg, TRI) << "\n");
   ++NumReloads;
+  if (Reporter && SSAForensicReporter::enabled())
+    Reporter->reloadEmitted(OrigVReg.virtRegIndex(),
+                            InsertBefore ? "reload-before-use"
+                                         : "reload-at-block-end");
   return {OrigVReg, ReloadMI};
 }
 

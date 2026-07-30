@@ -30,6 +30,7 @@
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "SSASpillEmitter.h"
+#include "SSAForensicReporter.h"
 #include <memory>
 #include <set>
 
@@ -111,6 +112,13 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // value, the driver spills it here (store-at-def + dominance reloads) and
   // recolors. Created per function in runOnMachineFunction.
   std::unique_ptr<SSASpillEmitter> Emitter;
+
+  // Forensic reporter (observer; -amdgpu-ssa-forensic*). Records observable
+  // allocation FACTS for post-hoc analysis and NEVER mutates allocator state.
+  // Every hook early-returns when the reporter is disabled (the default), so the
+  // allocator is byte-identical ON vs OFF. Created per function in
+  // runOnMachineFunction and shared with the emitter via setReporter().
+  std::unique_ptr<SSAForensicReporter> Reporter;
 
   // Values that color() could not place (no physreg free across their whole
   // range — the %560/%1072 long-liver class). color() collects ALL of them and
@@ -268,6 +276,42 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void dumpOccupancyMap(const TargetRegisterClass *RC, SlotIndex SI,
                         const char *Tag, const LiveInterval *VI = nullptr) const;
 
+  /// Pure fact extraction shared by dumpOccupancyMap (debug print) and the
+  /// forensic reporter (E16 snapshots): compute the occupancy view of \p RC at
+  /// \p SI into \p Out. Const — reads OccupiedRegUnits / ColorMap / CallSites /
+  /// LIS only, mutates nothing. Identical logic to the counting loop that used
+  /// to live inline in dumpOccupancyMap; that function now calls this and prints.
+  void collectOccupancy(const TargetRegisterClass *RC, SlotIndex SI,
+                        const LiveInterval *VI, OccupancyFacts &Out) const;
+
+  /// One colored value whose register could be freed across a coloring-failure
+  /// region by spilling it: live-through the failed value's range with NO use
+  /// strictly inside. \p OVI aliases the value's live interval (LIS-owned).
+  struct SpillAcrossCandidate {
+    Register V;
+    MCRegister P;
+    unsigned WidthDwords;
+    const LiveInterval *OVI;
+  };
+  /// Pure fact extraction shared by the COLORFAIL debug block and the forensic
+  /// reporter: over ColorMap, find colored values in \p Failed's register file
+  /// that are live-through [FS,FE) (\p FS/\p FE = Failed's interval bounds). Sets
+  /// \p NLiveThru to all live-through occupants and appends the no-interior-use
+  /// subset (the spillable ones) to \p Out; \p LiveThruIdx gets the sorted vreg
+  /// indices of the full live-through set. Const; mutates nothing.
+  void collectSpillAcrossCandidates(
+      Register Failed, SlotIndex FS, SlotIndex FE, bool FIsVGPR,
+      unsigned &NLiveThru, SmallVectorImpl<SpillAcrossCandidate> &Out,
+      SmallVectorImpl<unsigned> &LiveThruIdx) const;
+
+  /// Forensic (facts-only, const): enumerate EVERY value live at \p SI into
+  /// \p Out — the full liveness cross-section the analyst joins to the timeline.
+  /// Reuses the same const LIS/ColorMap walk the allocator already relies on
+  /// (liveAt over every vreg interval, ColorMap lookup for the physreg), so it
+  /// adds no new pressure/LIS pass and mutates nothing. Only called when the
+  /// forensic reporter is enabled (decision boundaries: E4/E10/E16).
+  void collectLiveSet(SlotIndex SI, SmallVectorImpl<LiveSetEntry> &Out) const;
+
   // === Value-flow correctness verifier (-amdgpu-ssa-verify-value-flow) ===
   // Certifies SSA-destruction + physreg assignment preserved VALUE IDENTITY:
   // every physreg use holds the SSA value its vreg operand named. Catches the
@@ -298,7 +342,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   MCRegister pickFreePhysReg(
       const TargetRegisterClass *RC, const LiveInterval &VI,
       ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs,
-      ArrayRef<MCRegister> Hints = {});
+      ArrayRef<MCRegister> Hints = {}, uint64_t AttemptID = 0);
 
   // Option B affinity: collect already-colored phi-partner physregs for VReg
   // (phi results it feeds, and -- if VReg is a phi result -- its operands),

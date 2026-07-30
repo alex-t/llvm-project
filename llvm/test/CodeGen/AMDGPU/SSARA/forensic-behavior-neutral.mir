@@ -1,0 +1,46 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -o %t.off.mir %s
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -amdgpu-ssa-forensic-json=%t.json -o %t.on.mir %s
+# RUN: diff %t.off.mir %t.on.mir
+#
+# Behavior-neutrality (Test 1): the forensic reporter is a pure observer, so the
+# allocator must produce byte-identical MIR with the reporter OFF vs ON. The
+# `diff` succeeds (empty output) only when the two runs match exactly. No asserts
+# required — the reporter is cl::opt-gated, not debug-only. The module has TWO
+# functions so neutrality is exercised across a function boundary (where the
+# reporter opens/flushes its sink), not just a single function.
+
+--- |
+  define amdgpu_kernel void @forensic_neutral_a() { ret void }
+  define amdgpu_kernel void @forensic_neutral_b() { ret void }
+...
+---
+name:            forensic_neutral_a
+tracksRegLiveness: true
+isSSA:           true
+registers:
+  - { id: 0, class: vgpr_32 }
+  - { id: 1, class: vgpr_32 }
+  - { id: 2, class: vgpr_32 }
+body: |
+  bb.0:
+    %0:vgpr_32 = V_MOV_B32_e32 0, implicit $exec
+    %1:vgpr_32 = V_MOV_B32_e32 1, implicit $exec
+    S_NOP 0, implicit %0
+    %2:vgpr_32 = V_MOV_B32_e32 2, implicit $exec
+    S_ENDPGM 0, implicit %1, implicit %2
+...
+---
+name:            forensic_neutral_b
+tracksRegLiveness: true
+isSSA:           true
+registers:
+  - { id: 0, class: sgpr_32 }
+  - { id: 1, class: vgpr_32 }
+body: |
+  bb.0:
+    %0:sgpr_32 = S_MOV_B32 7
+    %1:vgpr_32 = V_MOV_B32_e32 1, implicit $exec
+    S_ENDPGM 0, implicit %0, implicit %1
+...

@@ -1,0 +1,38 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -amdgpu-ssa-forensic-json=%t.json -o /dev/null %s
+# RUN: FileCheck %s --input-file=%t.json
+#
+# JSON smoke (Test 2): the reporter emits well-formed NDJSON with the versioned
+# header and the ordered event stream. One JSON object per function per line.
+# We check the header fields, the run-started / attempt / run-completed events,
+# and the first-class liveSet cross-section on the attempt boundary.
+
+# CHECK: {"reportVersion":1,"schemaVersion":1,"allocatorVersion":"amdgpu-ssa-ra-v1"
+# CHECK-SAME: "function":"forensic_json_smoke"
+# CHECK-SAME: "mfHash":"
+# CHECK-SAME: "kind":"run-started"
+# CHECK-SAME: "kind":"attempt-started"
+# CHECK-SAME: "liveSet":[
+# CHECK-SAME: "kind":"candidate-accepted"
+# CHECK-SAME: "kind":"attempt-completed"
+# CHECK-SAME: "kind":"run-completed"
+
+--- |
+  define amdgpu_kernel void @forensic_json_smoke() { ret void }
+...
+---
+name:            forensic_json_smoke
+tracksRegLiveness: true
+isSSA:           true
+registers:
+  - { id: 0, class: vgpr_32 }
+  - { id: 1, class: vgpr_32 }
+  - { id: 2, class: vgpr_32 }
+body: |
+  bb.0:
+    %0:vgpr_32 = V_MOV_B32_e32 0, implicit $exec
+    %1:vgpr_32 = V_MOV_B32_e32 1, implicit $exec
+    S_NOP 0, implicit %0
+    %2:vgpr_32 = V_MOV_B32_e32 2, implicit $exec
+    S_ENDPGM 0, implicit %1, implicit %2
+...

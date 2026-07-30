@@ -1,0 +1,54 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -o %t.off.mir %s
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -amdgpu-ssa-forensic-json=%t.json -o %t.on.mir %s
+# RUN: diff %t.off.mir %t.on.mir
+# RUN: FileCheck %s --input-file=%t.json
+#
+# Multi-function NDJSON (regression for the per-function truncation bug): the
+# reporter is a pass member created ONCE across the module, so a module with >=2
+# functions must yield one NDJSON line PER function, all functions present, with
+# reportID incrementing 1,2,... Recreating the reporter per function (or opening
+# the sink with truncate each time) would drop all but the last function.
+#
+# Also asserts MIR is byte-identical OFF vs ON on this multi-function module
+# (the `diff` above), covering behavior-neutrality across >1 function.
+#
+# Line 1 = first function, reportID 1.
+# CHECK: {"reportVersion":1,"schemaVersion":1,"allocatorVersion":"amdgpu-ssa-ra-v1","reportID":1,"function":"func_alpha"
+# Line 2 = second function, reportID 2. FileCheck matches on the next line.
+# CHECK: {"reportVersion":1,"schemaVersion":1,"allocatorVersion":"amdgpu-ssa-ra-v1","reportID":2,"function":"func_beta"
+
+--- |
+  define amdgpu_kernel void @func_alpha() { ret void }
+  define amdgpu_kernel void @func_beta() { ret void }
+...
+---
+name:            func_alpha
+tracksRegLiveness: true
+isSSA:           true
+registers:
+  - { id: 0, class: vgpr_32 }
+  - { id: 1, class: vgpr_32 }
+body: |
+  bb.0:
+    %0:vgpr_32 = V_MOV_B32_e32 0, implicit $exec
+    %1:vgpr_32 = V_MOV_B32_e32 1, implicit $exec
+    S_ENDPGM 0, implicit %0, implicit %1
+...
+---
+name:            func_beta
+tracksRegLiveness: true
+isSSA:           true
+registers:
+  - { id: 0, class: vgpr_32 }
+  - { id: 1, class: vgpr_32 }
+  - { id: 2, class: vgpr_32 }
+body: |
+  bb.0:
+    %0:vgpr_32 = V_MOV_B32_e32 0, implicit $exec
+    %1:vgpr_32 = V_MOV_B32_e32 1, implicit $exec
+    S_NOP 0, implicit %0
+    %2:vgpr_32 = V_MOV_B32_e32 2, implicit $exec
+    S_ENDPGM 0, implicit %1, implicit %2
+...

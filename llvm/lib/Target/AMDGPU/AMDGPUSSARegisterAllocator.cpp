@@ -226,9 +226,15 @@ void AMDGPUSSARegisterAllocator::markFree(MCRegister PhysReg) {
     OccupiedRegUnits.reset(Unit);
 }
 
-void AMDGPUSSARegisterAllocator::dumpOccupancyMap(const TargetRegisterClass *RC,
-                                                  SlotIndex SI, const char *Tag,
-                                                  const LiveInterval *VI) const {
+void AMDGPUSSARegisterAllocator::collectOccupancy(const TargetRegisterClass *RC,
+                                                  SlotIndex SI,
+                                                  const LiveInterval *VI,
+                                                  OccupancyFacts &Out) const {
+  // Pure fact extraction: the counting loop lifted verbatim out of
+  // dumpOccupancyMap. Reads OccupiedRegUnits / ColorMap / CallSites / LIS only;
+  // mutates nothing. Fills \p Out with the same map string, tallies, and
+  // phantom/usable register-name lists dumpOccupancyMap used to compute inline.
+  //
   // Two occupancy views, to expose disagreements:
   //  Occ    = the LIVE OccupiedRegUnits bitvector pickFreePhysReg actually
   //           consults (running seed + mark/kill state at this program point).
@@ -259,12 +265,11 @@ void AMDGPUSSARegisterAllocator::dumpOccupancyMap(const TargetRegisterClass *RC,
     return false;
   };
 
-  std::string Map;
-  SmallVector<MCRegister, 128> Order;
-  unsigned FreeUsable = 0, FreeClobbered = 0, Occupied = 0;
-  // Registers set in Occ (running state) but NOT in OccCM (ColorMap-live): the
-  // "phantom" occupancy the map used to miss. Also collect the truly-usable regs.
-  SmallVector<MCRegister, 8> Phantom, Usable;
+  Out = OccupancyFacts();
+  Out.ClassName = TRI->getRegClassName(RC);
+  std::string &Map = Out.Map;
+  MCRegister First, Last;
+  unsigned Count = 0;
   for (MCRegister PR : RegClassInfo.getOrder(RC)) {
     bool O = false, OCM = false;
     for (MCRegUnit U : TRI->regunits(PR)) {
@@ -273,45 +278,68 @@ void AMDGPUSSARegisterAllocator::dumpOccupancyMap(const TargetRegisterClass *RC,
     }
     if (O) {
       Map.push_back('#');
-      ++Occupied;
+      ++Out.Occupied;
       if (!OCM)
-        Phantom.push_back(PR); // occupied by running-state but no live ColorMap vreg
+        Out.Phantom.push_back(TRI->getName(PR)); // running-state, no live vreg
     } else if (Clobbered(PR)) {
       Map.push_back('x');
-      ++FreeClobbered;
+      ++Out.FreeClobbered;
     } else {
       Map.push_back('.');
-      ++FreeUsable;
-      Usable.push_back(PR);
+      ++Out.FreeUsable;
+      Out.Usable.push_back(TRI->getName(PR));
     }
-    Order.push_back(PR);
+    if (Count == 0)
+      First = PR;
+    Last = PR;
+    ++Count;
   }
-  dbgs() << "  [OCCMAP " << Tag << "] " << TRI->getRegClassName(RC) << " @" << SI
-         << "  usable=" << FreeUsable << " clobbered=" << FreeClobbered
-         << " occupied=" << Occupied << " total=" << Order.size() << "\n"
-         << "    " << Map << "\n";
-  if (!Order.empty())
-    dbgs() << "    (" << TRI->getName(Order.front()) << " .. "
-           << TRI->getName(Order.back()) << ")  legend: # occ, x clobbered, . usable\n";
+  Out.Total = Count;
+  if (Count) {
+    Out.FirstReg = TRI->getName(First);
+    Out.LastReg = TRI->getName(Last);
+  }
+}
+
+void AMDGPUSSARegisterAllocator::dumpOccupancyMap(const TargetRegisterClass *RC,
+                                                  SlotIndex SI, const char *Tag,
+                                                  const LiveInterval *VI) const {
+  OccupancyFacts F;
+  collectOccupancy(RC, SI, VI, F);
+
+  dbgs() << "  [OCCMAP " << Tag << "] " << F.ClassName << " @" << SI
+         << "  usable=" << F.FreeUsable << " clobbered=" << F.FreeClobbered
+         << " occupied=" << F.Occupied << " total=" << F.Total << "\n"
+         << "    " << F.Map << "\n";
+  if (F.Total)
+    dbgs() << "    (" << F.FirstReg << " .. " << F.LastReg
+           << ")  legend: # occ, x clobbered, . usable\n";
   // The key question: registers occupied by running-state but with NO live
   // ColorMap vreg (physreg live-ins, dead defs, or stale bits).
-  if (!Phantom.empty()) {
+  if (!F.Phantom.empty()) {
     dbgs() << "    phantom-occupied (Occ set, no live ColorMap vreg):";
-    for (MCRegister PR : Phantom)
-      dbgs() << " " << TRI->getName(PR);
+    for (const std::string &N : F.Phantom)
+      dbgs() << " " << N;
     dbgs() << "\n";
   }
-  if (!Usable.empty()) {
+  if (!F.Usable.empty()) {
     dbgs() << "    usable regs:";
-    for (MCRegister PR : Usable)
-      dbgs() << " " << TRI->getName(PR);
+    for (const std::string &N : F.Usable)
+      dbgs() << " " << N;
     dbgs() << "\n";
     // For each usable reg, find WIDER ColorMap values whose whole interval
     // OVERLAPS VI (pickFreePhysReg's OccupiedAtDef augmentation, lines ~195).
-    // This is the occupancy the liveAt(SI) map view misses.
+    // This is the occupancy the liveAt(SI) map view misses. The usable regs are
+    // exactly the '.' entries of the map in getOrder(RC) order, so we zip the
+    // allocation order with F.Map rather than re-collecting MCRegisters.
     if (VI) {
       unsigned VIWidth = TRI->getRegSizeInBits(*RC);
-      for (MCRegister PR : Usable) {
+      unsigned Idx = 0;
+      for (MCRegister PR : RegClassInfo.getOrder(RC)) {
+        bool Usable = Idx < F.Map.size() && F.Map[Idx] == '.';
+        ++Idx;
+        if (!Usable)
+          continue;
         for (const auto &[WReg, WPhys] : ColorMap) {
           if (TRI->getRegSizeInBits(*MRI->getRegClass(WReg)) <= VIWidth)
             continue;
@@ -330,6 +358,92 @@ void AMDGPUSSARegisterAllocator::dumpOccupancyMap(const TargetRegisterClass *RC,
         }
       }
     }
+  }
+}
+
+void AMDGPUSSARegisterAllocator::collectSpillAcrossCandidates(
+    Register Failed, SlotIndex FS, SlotIndex FE, bool FIsVGPR,
+    unsigned &NLiveThru, SmallVectorImpl<SpillAcrossCandidate> &Out,
+    SmallVectorImpl<unsigned> &LiveThruIdx) const {
+  // Pure fact extraction: the "which colored values could be spilled across the
+  // failed value's region" scan lifted verbatim out of the COLORFAIL debug
+  // block. ANSWER "is there a valid reg to spill across R?": count colored
+  // values in R's FILE that are LIVE-THROUGH [FS,FE) with NO use strictly inside
+  //  — each such value's register can be freed across the whole region by
+  // spilling it (reload past FE). Reads ColorMap / LIS / MRI only.
+  NLiveThru = 0;
+  for (const auto &[V, P] : ColorMap) {
+    if (V == Failed || !LIS->hasInterval(V))
+      continue;
+    const TargetRegisterClass *VRC = MRI->getRegClass(V);
+    bool VIsVGPR = TRI->isVGPRClass(VRC) || TRI->isAGPRClass(VRC);
+    if (VIsVGPR != FIsVGPR)
+      continue; // wrong file
+    const LiveInterval &OVI = LIS->getInterval(V);
+    if (!OVI.liveAt(FS) || !OVI.liveAt(FE.getPrevSlot()))
+      continue; // not live-through R
+    ++NLiveThru;
+    bool UsedInside = false;
+    for (const MachineOperand &MO : MRI->use_operands(V)) {
+      SlotIndex U = LIS->getInstructionIndex(*MO.getParent()).getRegSlot();
+      if (FS < U && U < FE) {
+        UsedInside = true;
+        break;
+      }
+    }
+    if (!UsedInside)
+      Out.push_back(
+          {V, P, (unsigned)(TRI->getRegSizeInBits(*VRC) / 32), &OVI});
+  }
+  // The FULL live-across set (reg indices sorted) so a round-to-round diff shows
+  // exactly which vregs newly appear.
+  for (const auto &[V, P] : ColorMap) {
+    if (V == Failed || !LIS->hasInterval(V))
+      continue;
+    const TargetRegisterClass *VRC = MRI->getRegClass(V);
+    bool VIsVGPR = TRI->isVGPRClass(VRC) || TRI->isAGPRClass(VRC);
+    if (VIsVGPR != FIsVGPR)
+      continue;
+    const LiveInterval &OVI = LIS->getInterval(V);
+    if (OVI.liveAt(FS) && OVI.liveAt(FE.getPrevSlot()))
+      LiveThruIdx.push_back(V.virtRegIndex());
+  }
+  llvm::sort(LiveThruIdx);
+}
+
+void AMDGPUSSARegisterAllocator::collectLiveSet(
+    SlotIndex SI, SmallVectorImpl<LiveSetEntry> &Out) const {
+  // Facts-only const walk: every virtual register whose interval is live at SI,
+  // joined to its physreg via ColorMap (uncolored => phys=-1). This is the same
+  // liveAt(SI) test collectOccupancy already uses over ColorMap, generalized to
+  // ALL vregs so the cross-section is complete (not just the colored ones). No
+  // new LIS/pressure pass; nothing mutated.
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I < E; ++I) {
+    Register VReg = Register::index2VirtReg(I);
+    if (MRI->reg_nodbg_empty(VReg) || !LIS->hasInterval(VReg))
+      continue;
+    const LiveInterval &LI = LIS->getInterval(VReg);
+    if (LI.empty() || !LI.liveAt(SI))
+      continue;
+    const TargetRegisterClass *RC = MRI->getRegClass(VReg);
+    LiveSetEntry Ent;
+    Ent.VReg = VReg.virtRegIndex();
+    {
+      std::string S;
+      raw_string_ostream OS(S);
+      OS << LI.beginIndex();
+      Ent.LR = OS.str();
+    }
+    auto It = ColorMap.find(VReg);
+    if (It != ColorMap.end()) {
+      Ent.Phys = (int64_t)It->second.id();
+      Ent.PhysName = TRI->getName(It->second);
+    } else {
+      Ent.Phys = -1;
+    }
+    Ent.WidthBits = TRI->getRegSizeInBits(*RC);
+    Ent.LaneMask = MRI->getMaxLaneMaskForVReg(VReg).getAsInteger();
+    Out.push_back(std::move(Ent));
   }
 }
 
@@ -641,7 +755,10 @@ void AMDGPUSSARegisterAllocator::dumpSpanWidthDelta(const TargetRegisterClass *R
 MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     const TargetRegisterClass *RC, const LiveInterval &VI,
     ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs,
-    ArrayRef<MCRegister> Hints) {
+    ArrayRef<MCRegister> Hints, uint64_t AttemptID) {
+  // Cache the forensic gate once (loop-invariant) — the per-candidate loops
+  // below check it on every iteration.
+  const bool Report = Reporter && Reporter->active();
   if (EnableSlotDelta)
     dumpSpanWidthDelta(RC, VI);
   LLVM_DEBUG({
@@ -697,14 +814,25 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
   // Option B: prefer a phi-partner's color if it is a legal member of RC and
   // free. Hints are pre-ordered hottest-first by collectPhiHints; take the first
   // that fits. RC->contains guards against a partner whose class differs from RC.
+  uint64_t HintOrdinal = 0;
   for (MCRegister Hint : Hints) {
     if (!Hint || !RC->contains(Hint))
       continue;
+    if (Report)
+      Reporter->candidateConsidered(AttemptID, Hint.id(), TRI->getName(Hint),
+                                    HintOrdinal, "phi-affinity-hint");
     if (IsFree(Hint)) {
       LLVM_DEBUG(dbgs() << "    phi-affinity hint taken: " << TRI->getName(Hint)
                         << "\n");
+      if (Report)
+        Reporter->candidateAccepted(AttemptID, Hint.id(), TRI->getName(Hint),
+                                    HintOrdinal, "phi-affinity-hint");
       return Hint;
     }
+    if (Report)
+      Reporter->candidateRejected(AttemptID, Hint.id(), TRI->getName(Hint),
+                                  HintOrdinal, "not-free");
+    ++HintOrdinal;
   }
 
   if (EnableVirginOrder) {
@@ -736,9 +864,40 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     return MCRegister();
   }
 
-  for (MCRegister PR : RegClassInfo.getOrder(RC))
-    if (IsFree(PR))
+  // Fact-only reject-reason classifier (Q-B): observes WHY IsFree returned
+  // false without changing any control flow. Used solely for candidate facts.
+  auto RejectReason = [&](MCRegister PR) -> const char * {
+    for (MCRegUnit Unit : TRI->regunits(PR))
+      if (OccupiedAtDef.test(Unit))
+        return "occupied-unit";
+    for (const auto &[CallIdx, CallMI] : CallSites) {
+      if (!VI.liveAt(CallIdx))
+        continue;
+      if (CallMI->modifiesRegister(PR, TRI))
+        return "call-modifies";
+      for (const MachineOperand &MO : CallMI->operands())
+        if (MO.isRegMask() && MO.clobbersPhysReg(PR))
+          return "regmask";
+    }
+    return "unknown";
+  };
+
+  uint64_t Ordinal = 0;
+  for (MCRegister PR : RegClassInfo.getOrder(RC)) {
+    if (Report)
+      Reporter->candidateConsidered(AttemptID, PR.id(), TRI->getName(PR),
+                                    Ordinal, "first-fit-order");
+    if (IsFree(PR)) {
+      if (Report)
+        Reporter->candidateAccepted(AttemptID, PR.id(), TRI->getName(PR),
+                                    Ordinal, "first-fit-order");
       return PR;
+    }
+    if (Report)
+      Reporter->candidateRejected(AttemptID, PR.id(), TRI->getName(PR), Ordinal,
+                                  RejectReason(PR));
+    ++Ordinal;
+  }
   return MCRegister();
 }
 
@@ -2405,8 +2564,25 @@ void AMDGPUSSARegisterAllocator::color() {
           } else {
             SmallVector<MCRegister, 4> Hints =
                 collectPhiHints(Reg, MRI->getRegClass(Reg));
+            // E4 AllocationAttemptStarted: record the attempt BEFORE the pick so
+            // the candidate facts (E5/E6/E7) link back to it.
+            uint64_t AttemptID = 0;
+            if (SSAForensicReporter::enabled()) {
+              const TargetRegisterClass *ARC = MRI->getRegClass(Reg);
+              // Full liveness cross-section at the value's def slot (a decision
+              // boundary). collectLiveSet is const and reuses the LIS liveAt
+              // walk; only runs when the reporter is enabled.
+              SmallVector<LiveSetEntry, 32> LiveSet;
+              collectLiveSet(LIS->getInterval(Reg).beginIndex(), LiveSet);
+              AttemptID = Reporter->attemptStarted(
+                  Reg.virtRegIndex(), TRI->getRegSizeInBits(*ARC),
+                  TRI->getRegClassName(ARC),
+                  EnableVirginOrder ? "virgin-order" : "first-fit-order",
+                  LiveSet);
+            }
             Chosen = pickFreePhysReg(MRI->getRegClass(Reg),
-                                     LIS->getInterval(Reg), WiderDefs, Hints);
+                                     LIS->getInterval(Reg), WiderDefs, Hints,
+                                     AttemptID);
             if (!Chosen) {
               // No physreg is free across this value's whole range (the
               // %1072/%560 long-liver-through-tuple-churn case). Do NOT assert
@@ -2415,81 +2591,84 @@ void AMDGPUSSARegisterAllocator::color() {
               // absent. The driver spills all collected values afterward, then
               // colors the short reload remainders in place. Skipping is correct
               // because the value is about to be spilled — it holds no register.
-              LLVM_DEBUG({
+              // The COLORFAIL spill-across facts are needed only for the debug
+              // dump or the forensic snapshot; skip the whole ColorMap scan on
+              // the default path (preserves the original zero-cost behavior).
+              bool WantColorFailFacts = SSAForensicReporter::enabled();
+              LLVM_DEBUG(WantColorFailFacts = true);
+              if (WantColorFailFacts) {
                 const LiveInterval &FVI = LIS->getInterval(Reg);
                 SlotIndex FS = FVI.beginIndex(), FE = FVI.endIndex();
                 const TargetRegisterClass *FRC = MRI->getRegClass(Reg);
-                bool FIsVGPR =
-                    TRI->isVGPRClass(FRC) || TRI->isAGPRClass(FRC);
-                dbgs() << "!!! COLORFAIL " << printReg(Reg, TRI) << " " << FVI
-                       << " class=" << TRI->getRegClassName(FRC) << "\n";
-                // ANSWER "is there a valid reg to spill across R?": count
-                // colored values in R's FILE that are LIVE-THROUGH [FS,FE) with
-                // NO use strictly inside — each such value's register can be
-                // freed across the whole region by spilling it (reload past FE).
-                unsigned NLiveThru = 0, NNoInterior = 0;
-                for (const auto &[V, P] : ColorMap) {
-                  if (V == Reg || !LIS->hasInterval(V))
-                    continue;
-                  const TargetRegisterClass *VRC = MRI->getRegClass(V);
-                  bool VIsVGPR =
-                      TRI->isVGPRClass(VRC) || TRI->isAGPRClass(VRC);
-                  if (VIsVGPR != FIsVGPR)
-                    continue; // wrong file
-                  const LiveInterval &OVI = LIS->getInterval(V);
-                  if (!OVI.liveAt(FS) || !OVI.liveAt(FE.getPrevSlot()))
-                    continue; // not live-through R
-                  ++NLiveThru;
-                  bool UsedInside = false;
-                  for (const MachineOperand &MO : MRI->use_operands(V)) {
-                    SlotIndex U =
-                        LIS->getInstructionIndex(*MO.getParent()).getRegSlot();
-                    if (FS < U && U < FE) {
-                      UsedInside = true;
-                      break;
-                    }
-                  }
-                  if (!UsedInside) {
-                    ++NNoInterior;
-                    dbgs() << "    SPILL-CANDIDATE " << printReg(V, TRI) << " -> "
-                           << TRI->getName(P) << " w="
-                           << TRI->getRegSizeInBits(*VRC) / 32 << "  " << OVI
-                           << "\n";
-                  }
-                }
-                dbgs() << "  >>> VALID SPILL-ACROSS candidates for "
-                       << printReg(Reg, TRI) << " [" << FS << "," << FE
-                       << "): live-through=" << NLiveThru
-                       << " no-interior-use=" << NNoInterior << "\n";
-                // DEBUG-LT: dump the FULL live-across set (reg indices sorted) so a
-                // round-to-round diff shows exactly which vregs newly appear.
-                {
-                  SmallVector<unsigned, 128> LT;
-                  for (const auto &[V, P] : ColorMap) {
-                    if (V == Reg || !LIS->hasInterval(V))
-                      continue;
-                    const TargetRegisterClass *VRC = MRI->getRegClass(V);
-                    bool VIsVGPR =
-                        TRI->isVGPRClass(VRC) || TRI->isAGPRClass(VRC);
-                    if (VIsVGPR != FIsVGPR)
-                      continue;
-                    const LiveInterval &OVI = LIS->getInterval(V);
-                    if (OVI.liveAt(FS) && OVI.liveAt(FE.getPrevSlot()))
-                      LT.push_back(V.virtRegIndex());
-                  }
-                  llvm::sort(LT);
+                bool FIsVGPR = TRI->isVGPRClass(FRC) || TRI->isAGPRClass(FRC);
+                // Extract the spill-across facts once; used by both the debug
+                // dump and the forensic record below.
+                unsigned NLiveThru = 0;
+                SmallVector<SpillAcrossCandidate, 8> Cands;
+                SmallVector<unsigned, 128> LT;
+                collectSpillAcrossCandidates(Reg, FS, FE, FIsVGPR, NLiveThru,
+                                             Cands, LT);
+                LLVM_DEBUG({
+                  dbgs() << "!!! COLORFAIL " << printReg(Reg, TRI) << " " << FVI
+                         << " class=" << TRI->getRegClassName(FRC) << "\n";
+                  // ANSWER "is there a valid reg to spill across R?": count
+                  // colored values in R's FILE that are LIVE-THROUGH [FS,FE)
+                  // with NO use strictly inside — each such value's register can
+                  // be freed across the whole region by spilling it (reload past
+                  // FE).
+                  for (const SpillAcrossCandidate &C : Cands)
+                    dbgs() << "    SPILL-CANDIDATE " << printReg(C.V, TRI)
+                           << " -> " << TRI->getName(C.P) << " w="
+                           << C.WidthDwords << "  " << *C.OVI << "\n";
+                  dbgs() << "  >>> VALID SPILL-ACROSS candidates for "
+                         << printReg(Reg, TRI) << " [" << FS << "," << FE
+                         << "): live-through=" << NLiveThru
+                         << " no-interior-use=" << Cands.size() << "\n";
+                  // DEBUG-LT: dump the FULL live-across set (reg indices sorted)
+                  // so a round-to-round diff shows exactly which vregs newly
+                  // appear.
                   dbgs() << "  DEBUGLT " << printReg(Reg, TRI) << " across("
                          << LT.size() << "): ";
                   for (unsigned I : LT)
                     dbgs() << I << " ";
                   dbgs() << "\n";
+                });
+                // E16 snapshot: record the spill-across facts and the register
+                // occupancy at the failure point (facts only — the live-through
+                // and no-interior counts, plus the occupancy map produced by the
+                // refactored collectOccupancy), each carrying the full liveness
+                // cross-section at the failure slot.
+                if (SSAForensicReporter::enabled()) {
+                  SmallVector<LiveSetEntry, 32> LiveSet;
+                  collectLiveSet(FS, LiveSet);
+                  Reporter->colorFailAnalysis(Reg.virtRegIndex(), NLiveThru,
+                                              Cands.size(), AttemptID);
+                  OccupancyFacts OF;
+                  collectOccupancy(FRC, FS, &FVI, OF);
+                  Reporter->snapshot("colorfail-occupancy", FS, OF, AttemptID,
+                                     LiveSet);
                 }
-              });
+              }
+              // E10 AllocationAttemptFailed: no physreg free across the range.
+              // Carry the full liveness cross-section at the failure boundary.
+              if (SSAForensicReporter::enabled()) {
+                SmallVector<LiveSetEntry, 32> FailLiveSet;
+                collectLiveSet(LIS->getInterval(Reg).beginIndex(), FailLiveSet);
+                Reporter->attemptFailed(AttemptID, Reg.virtRegIndex(),
+                                        "no-free-physreg-across-range",
+                                        FailLiveSet);
+              }
               UncolorableVRegs.push_back(Reg);
               if (EnableVirginOrder)
                 RecordFail(Reg);
               continue;
             }
+            // E9 AllocationAttemptCompleted: the pick succeeded.
+            if (SSAForensicReporter::enabled())
+              Reporter->attemptCompleted(
+                  AttemptID, Reg.virtRegIndex(), Chosen.id(),
+                  TRI->getName(Chosen),
+                  EnableVirginOrder ? "virgin-order" : "first-fit-order");
             LLVM_DEBUG(dbgs() << "    color: " << printReg(Reg, TRI) << " -> "
                               << TRI->getName(Chosen) << "\n");
           }
@@ -3669,9 +3848,20 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "AMDGPUSSARegisterAllocator: Processing " << MF.getName()
                     << "\n");
 
+  // Forensic reporter (observer, default off). Created ONCE per pass instance
+  // (not per function): the sink files are opened once and every function in the
+  // module appends one NDJSON line with an incrementing reportID. Recreating it
+  // per function would reopen+truncate the sink and reset the counter, dropping
+  // all but the last function. E1 RunStarted records the run's identity BEFORE
+  // any allocation, while the MIR is still the untouched input.
+  if (!Reporter)
+    Reporter = std::make_unique<SSAForensicReporter>();
+  Reporter->beginRun(MF, TRI, MRI, LIS);
+
   // Approach-A emitter: spill values that coloring cannot place.
   Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
   Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT, MLI);
+  Emitter->setReporter(Reporter.get());
 
   if (EnableAGPRRescue)
     widenToAVOnUnified(); // before classifyVRegs: widened widths feed the order
@@ -3710,8 +3900,14 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       LLVM_DEBUG(dbgs() << "=== region-rp round " << Round << ": "
                         << UncolorableVRegs.size()
                         << " uncolorable -> spill-across pass ===\n");
-      if (!reduceRegionPressure(MF))
+      // E2 RoundStarted.
+      uint64_t RoundID = Reporter->roundStarted(Round, UncolorableVRegs.size());
+      if (!reduceRegionPressure(MF)) {
+        // E3 RoundCompleted (no spill -> residual for the split path).
+        Reporter->roundCompleted(Round, UncolorableVRegs.size(),
+                                 /*Spilled=*/false, RoundID);
         break; // nothing spilled this round -> residual is split-path work
+      }
       OccupiedRegUnits.clear();
       OccupiedRegUnits.resize(TRI->getNumRegUnits());
       ColorMap.clear();
@@ -3722,6 +3918,9 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       color();
       LLVM_DEBUG(dbgs() << "=== region-rp round " << Round << ": after recolor, "
                         << UncolorableVRegs.size() << " uncolorable remain ===\n");
+      // E3 RoundCompleted (a spill happened this round).
+      Reporter->roundCompleted(Round, UncolorableVRegs.size(),
+                               /*Spilled=*/true, RoundID);
       // NO-PROGRESS BREAK (WIP — under investigation): if a round spilled yet left
       // the IDENTICAL uncolorable set, region-rp's spill-across cannot relieve them
       // (diamond values used inside every crossing region). Break to the per-value
@@ -3778,6 +3977,9 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
                                 : "  (WIDE: spiller under-spilled a tuple)")
                         << "\n");
     }
+    // E17 RunCompleted: flush the forensic record on this early-exit path too
+    // (the colorfail facts were collected during color()).
+    Reporter->endRun(UncolorableVRegs.size());
     // Bail cleanly — no destroySSA on an incompletely-colored function.
     return true;
   }
@@ -3815,6 +4017,8 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       // is Hack-compatible (stays SSA) and avoids spilling Failed itself.
       if (EnableSplitLiveRanges && trySplitColorViaBlocker(Failed, RPLimit)) {
         LLVM_DEBUG(dbgs() << "  FALLBACK: colored via split-blocker\n");
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("split-blocker", Failed.virtRegIndex());
         continue;
       }
       // No live-through blocker to spill around (Failed is itself the long
@@ -3824,6 +4028,8 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       // over-pressure or an unclean split boundary.
       if (EnableSplitLiveRanges && trySelfSplitColor(Failed)) {
         LLVM_DEBUG(dbgs() << "  FALLBACK: colored via self-split\n");
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("self-split", Failed.virtRegIndex());
         continue;
       }
       LLVM_DEBUG(dbgs() << "  FALLBACK: memory-spill Failed itself\n");
@@ -3866,6 +4072,8 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
                                    ColorFreshVReg)) {
             LLVM_DEBUG(dbgs() << "  FALLBACK: web-spilled root "
                               << printReg(WebRoot, TRI) << "\n");
+            if (SSAForensicReporter::enabled())
+              Reporter->transformation("phi-web-spill", WebRoot.virtRegIndex());
             for (Register G : Emitter->lastWebGround())
               ColorInPlace(G);
             for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
@@ -3881,6 +4089,8 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       LLVM_DEBUG(dbgs() << "SSA RA: spilling uncolorable " << printReg(Failed,
                                                                        TRI)
                         << " (kill-at-def) and coloring reloads in place\n");
+      if (SSAForensicReporter::enabled())
+        Reporter->transformation("memory-spill", Failed.virtRegIndex());
 
       // RP-gated reload placement (SSASpillEmitter NeedsReload) keeps each reload
       // from spanning an RP-tight region, so the freed pressure is real and the
@@ -3894,6 +4104,9 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
         ColorInPlace(VMP.getVReg()); // (2) fresh reload redefs
     }
   }
+
+  // E17 RunCompleted: flush this function's record to the configured sinks.
+  Reporter->endRun(UncolorableVRegs.size());
 
   destroySSAAndRewrite(MF);
 

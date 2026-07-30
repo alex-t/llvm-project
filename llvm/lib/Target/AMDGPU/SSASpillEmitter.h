@@ -42,6 +42,8 @@
 
 namespace llvm {
 
+class SSAForensicReporter;
+
 // A spill store emitted by storeRegToStackSlot. Classify via the Spill TSFlag
 // plus mayStore rather than an opcode list: this covers every register file
 // (SGPR, VGPR, AGPR, and the AGPR-or-VGPR "AV" classes on gfx90a+) and every
@@ -142,6 +144,11 @@ class SSASpillEmitter {
   // Set transiently if a reload redef leaves SSA broken; inline repair clears it.
   bool SSAInvalidated = false;
 
+  // Forensic reporter (observer, borrowed, may be null). When non-null and
+  // enabled, spillAtDefinition / phi-web stores (E14) and reload emission (E15)
+  // record observable facts. NEVER mutated by this class beyond recording.
+  SSAForensicReporter *Reporter = nullptr;
+
   // PHI web members erased by the last spillPhiWeb() call (caller prunes ColorMap).
   SmallVector<Register, 32> LastWebErased;
   // Ground operands the last spillPhiWeb() stored (the driver marks them Spilled
@@ -189,6 +196,10 @@ public:
   /// store-at-def memo or stack-slot map (those persist per function) nor
   /// ReloadedRegs (the caller controls that via clearReloadedRegs()).
   void beginPass(bool IsVGPR);
+
+  /// Attach the forensic reporter (observer; may be null). Records spill/reload
+  /// facts (E14/E15) when set and enabled. Does not take ownership.
+  void setReporter(SSAForensicReporter *R) { Reporter = R; }
 
   /// Provide the effective kill block for \p SpillBB after hoisting out of all
   /// enclosing loops (outermost preheader), or \p SpillBB unchanged. The spiller

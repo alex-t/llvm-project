@@ -1,0 +1,32 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -amdgpu-ssa-forensic-json=%t.1.json -o /dev/null %s
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -amdgpu-ssa-forensic-json=%t.2.json -o /dev/null %s
+# RUN: diff %t.1.json %t.2.json
+#
+# Determinism (Test 4): two identical runs must produce byte-identical reports.
+# All DenseMap-derived collections (candidate order, liveSet) are sorted by a
+# stable id before serialization, and the mfHash is a pure function of the input
+# MIR, so the reports match exactly (empty diff = pass).
+
+--- |
+  define amdgpu_kernel void @forensic_determinism() { ret void }
+...
+---
+name:            forensic_determinism
+tracksRegLiveness: true
+isSSA:           true
+registers:
+  - { id: 0, class: vgpr_32 }
+  - { id: 1, class: vgpr_32 }
+  - { id: 2, class: vgpr_32 }
+  - { id: 3, class: sgpr_32 }
+body: |
+  bb.0:
+    %0:vgpr_32 = V_MOV_B32_e32 0, implicit $exec
+    %3:sgpr_32 = S_MOV_B32 7
+    %1:vgpr_32 = V_MOV_B32_e32 1, implicit $exec
+    S_NOP 0, implicit %0, implicit %3
+    %2:vgpr_32 = V_MOV_B32_e32 2, implicit $exec
+    S_ENDPGM 0, implicit %1, implicit %2
+...
