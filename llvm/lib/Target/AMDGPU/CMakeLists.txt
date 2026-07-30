@@ -194,6 +194,7 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPUVerifyPhysRegLiveness.cpp
   AMDGPURebuildSSA.cpp
   AMDGPUPHISimplifier.cpp
+  SSARegisterTree.cpp
 
   LINK_COMPONENTS
   AMDGPUDesc
