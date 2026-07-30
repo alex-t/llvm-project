@@ -118,9 +118,15 @@ private:
   // is never double-counted. Indexed by node number (size 2N).
   BitVector NodeAllocated;
 
+  // FullAtLevel[L] = number of currently fully-occupied aligned blocks of width
+  // 2^L (packing-pressure invariant I2). Maintained incrementally on the
+  // alloc/free root-path walk; size NumLevels + 1.
+  SmallVector<unsigned, 8> FullAtLevel;
+
   // --- geometry helpers (pure functions of a node index) -------------------
   unsigned spanOf(unsigned Node) const;      // leaves covered by Node
   unsigned firstLeafOf(unsigned Node) const; // lowest leaf index under Node
+  unsigned levelOf(unsigned Node) const;     // Log2(spanOf(Node)); root=NumLevels
 
   // Node index of the aligned block [FirstLeaf, FirstLeaf+Width); callers must
   // have validated the arguments with validBlock() first.
