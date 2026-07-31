@@ -284,6 +284,29 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// (returns false -> caller memory-spills) if any slot has zero free PRs.
   bool trySelfSplitColor(Register Failed);
 
+  /// Coloring-time recovery for one value \p Failed that color() could not place.
+  /// Runs the dispatch chain (blocker-split -> self-split -> [PHI-web] ->
+  /// spill-homeless floor) and returns true if Failed was resolved (colored, or
+  /// spilled with its reload redefs placed). Behavior-identical to the old inline
+  /// dispatch when -amdgpu-ssa-recursive-recovery is OFF. When ON (see
+  /// Recursive_Recovery_Fix.md): blocker/self-split run unconditionally as tier-1,
+  /// and a reload redef that cannot color re-enters this method recursively
+  /// (well-founded on strictly-shrinking live-range length), bottoming out at an
+  /// honest point-over-pressure terminal. \p Depth is the recursion depth (0 at
+  /// the top-level call); a defensive cap guards a runaway.
+  bool recoverUncolorable(Register Failed, unsigned Depth = 0);
+
+  /// Honest terminal for the recursive recovery (only reachable with
+  /// -amdgpu-ssa-recursive-recovery ON). Counts the values of \p R's register
+  /// file live at \p R's def point and compares the total dword count to \p
+  /// RPLimit, then report_fatal_error()s with the REAL NUMBERS: either genuine
+  /// point-over-pressure (more live dwords than registers -> no coloring-time
+  /// recovery exists) or, if feasible-yet-unrecovered, an honest allocator-bug
+  /// diagnostic -- never the misleading "needs more up-front spilling". \p Ctx
+  /// labels the call site. Does not return.
+  [[noreturn]] void reportPointOverPressure(Register R, bool IsVGPR,
+                                            unsigned RPLimit, const char *Ctx);
+
   /// Assign \p Piece -> \p PR in ColorMap and bump the file's high-water mark.
   /// Shared by the coloring-time split paths.
   void commitColor(Register Piece, MCRegister PR);

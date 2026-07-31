@@ -102,6 +102,29 @@ static cl::opt<bool> EnablePhiWebSpill(
     "amdgpu-ssa-phi-web-spill", cl::Hidden, cl::init(false),
     cl::desc("region-rp: spill a PHI victim as an in-memory-coalesced web"));
 
+// Recursive coloring-time recovery (see Recursive_Recovery_Fix.md). Makes the
+// spill-homeless floor a FIXPOINT: a reload redef that cannot color re-enters the
+// same recovery (spill/shorten), bottoming out at a genuine point-over-pressure
+// terminal reported honestly WITH REAL NUMBERS instead of the misleading
+// "width-1 remainder must be colorable" assert / "needs more up-front spilling"
+// fatal. When ON it also runs blocker-split + self-split as the DEFAULT tier-1
+// move (not gated behind -amdgpu-ssa-split-live-ranges). Default OFF: the
+// per-Failed dispatch is byte-identical to the pre-refactor path (same order,
+// same gates, same assert). Wraps Parts 2-4 of the fix; Part 1 (the
+// recoverUncolorable refactor) is behavior-neutral and unconditional.
+static cl::opt<bool> EnableRecursiveRecovery(
+    "amdgpu-ssa-recursive-recovery", cl::Hidden, cl::init(false),
+    cl::desc("Recursive coloring-time recovery: reload redefs that cannot color "
+             "re-enter the recovery (spill/shorten) with an honest "
+             "point-over-pressure terminal; also runs blocker/self-split on the "
+             "default recovery path (default off; byte-identical when off)"));
+
+// Backstop only: termination is guaranteed by strictly-shrinking reload ranges
+// (each reload lives [reload-pt, next-use], shorter than its source). This cap
+// merely converts a hypothetical runaway (a bug in that argument) into an honest
+// error instead of a stack overflow. Should never trigger.
+static constexpr unsigned MaxRecoveryDepth = 64;
+
 // Shadow register-tree oracle (SSARegisterTree). When on AND the forensic sink
 // is active, a shadow SSARegisterTree mirrors the VGPR_32 occupancy the
 // allocator maintains and, at each real VGPR_32 pick, LOGS what the tree would
@@ -2295,18 +2318,38 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
       if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
           MRI->reg_nodbg_empty(R))
         return;
-      if (!colorOneInPlace(R)) {
-        std::string Msg;
-        raw_string_ostream OS(Msg);
-        OS << "SSARA: coloring-time recovery exhausted for " << printReg(R, TRI)
-           << " — function is infeasible at coloring time (needs more up-front "
-              "spilling)";
-        report_fatal_error(StringRef(Msg));
+      if (colorOneInPlace(R))
+        return;
+      // Could not place R. When -amdgpu-ssa-recursive-recovery is ON, route
+      // through the recursive recovery (a reload remnant that cannot color is a
+      // strictly-shorter value → recurse; a genuinely infeasible point hits the
+      // honest point-over-pressure terminal). When OFF, keep the historical
+      // (misleading, but unchanged for byte-identical default) fatal.
+      if (EnableRecursiveRecovery) {
+        if (!recoverUncolorable(R, /*Depth=*/1))
+          reportPointOverPressure(R, IsVGPR, RPLimit, "self-split");
+        return;
       }
+      std::string Msg;
+      raw_string_ostream OS(Msg);
+      OS << "SSARA: coloring-time recovery exhausted for " << printReg(R, TRI)
+         << " — function is infeasible at coloring time (needs more up-front "
+            "spilling)";
+      report_fatal_error(StringRef(Msg));
     };
     MustColor(Piece); // surviving stub
-    for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-      MustColor(VMP.getVReg()); // reload remnants
+    if (EnableRecursiveRecovery) {
+      // MustColor may recurse into recoverUncolorable → spillOneVMP, which
+      // APPENDS to Emitter->reloadedRegs(); snapshot before iterating.
+      SmallVector<Register, 8> Remnants;
+      for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+        Remnants.push_back(VMP.getVReg());
+      for (Register RD : Remnants)
+        MustColor(RD); // reload remnants
+    } else {
+      for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+        MustColor(VMP.getVReg()); // reload remnants
+    }
   };
 
   Register Cur = Failed;
@@ -2414,6 +2457,233 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
   LLVM_DEBUG(dbgs() << "  self-split: piece cap -> spill remainder "
                     << printReg(Cur, TRI) << "\n");
   spillPiece(Cur);
+  return true;
+}
+
+void AMDGPUSSARegisterAllocator::reportPointOverPressure(Register R,
+                                                         bool IsVGPR,
+                                                         unsigned RPLimit,
+                                                         const char *Ctx) {
+  // Honest terminal (recursive-recovery ON only). Find the point in R's range
+  // with the most simultaneously-live dwords of R's register file and report the
+  // REAL numbers. If that peak exceeds RPLimit no coloring-time recovery exists
+  // (more values demand registers at one instant than the file has); otherwise
+  // the point is feasible yet unrecovered, which is a genuine allocator bug —
+  // say so, rather than the misleading "needs more up-front spilling".
+  const LiveInterval &RI = LIS->getInterval(R);
+  SlotIndex PeakSlot = RI.beginIndex();
+  unsigned Peak = 0;
+  // Walk every real instruction slot in R's range; at each, sum the dword widths
+  // of same-file vregs live there. R's range is short (a reload remainder), so
+  // this is cheap.
+  for (SlotIndex SI = RI.beginIndex(); SI < RI.endIndex();
+       SI = Indexes->getNextNonNullIndex(SI)) {
+    if (!Indexes->getInstructionFromIndex(SI))
+      continue;
+    unsigned LiveDwords = 0;
+    for (unsigned I = 0, E = MRI->getNumVirtRegs(); I < E; ++I) {
+      Register V = Register::index2VirtReg(I);
+      if (MRI->reg_nodbg_empty(V) || !LIS->hasInterval(V))
+        continue;
+      const LiveInterval &VI = LIS->getInterval(V);
+      if (VI.empty() || !VI.liveAt(SI))
+        continue;
+      const TargetRegisterClass *VRC = MRI->getRegClass(V);
+      bool VIsVGPR = TRI->isVGPRClass(VRC) || TRI->isAGPRClass(VRC);
+      if (VIsVGPR != IsVGPR)
+        continue;
+      LiveDwords += TRI->getRegSizeInBits(*VRC) / 32;
+    }
+    if (LiveDwords > Peak) {
+      Peak = LiveDwords;
+      PeakSlot = SI;
+    }
+  }
+
+  std::string Msg;
+  raw_string_ostream OS(Msg);
+  OS << "SSARA recursive-recovery [" << Ctx << "]: cannot place "
+     << printReg(R, TRI) << " (" << (IsVGPR ? "VGPR" : "SGPR") << " file). ";
+  if (Peak > RPLimit)
+    OS << "GENUINE POINT-OVER-PRESSURE: " << Peak << " dwords live at " << PeakSlot
+       << " but only " << RPLimit
+       << " registers in the file — no coloring-time recovery can fit them.";
+  else
+    OS << "FEASIBLE YET UNRECOVERED (allocator bug): peak " << Peak
+       << " live dwords at " << PeakSlot << " <= " << RPLimit
+       << " registers, so a placement exists but recovery did not find it.";
+  if (SSAForensicReporter::enabled())
+    Reporter->flushNow();
+  report_fatal_error(StringRef(Msg));
+}
+
+bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed,
+                                                    unsigned Depth) {
+  // Coloring-time recovery for one value color() could not place. Behavior when
+  // -amdgpu-ssa-recursive-recovery is OFF is byte-identical to the old inline
+  // dispatch (see runOnMachineFunction): same order, same gates, same
+  // ColorInPlace-with-assert. When ON: blocker/self-split run unconditionally as
+  // tier-1, and a reload redef that cannot color re-enters this method
+  // recursively (Part 2), bottoming out at an honest point-over-pressure terminal
+  // (Part 3). Returns true if Failed was resolved (colored or spilled with its
+  // reload redefs placed).
+  const bool Recursive = EnableRecursiveRecovery;
+
+  // A value coloring could not place: try to recover it — split (blocker or
+  // self), else spill+reload — regardless of width. A WIDE tuple that fails is
+  // usually not over-pressure but an aligned-placement gap (no N aligned free
+  // regs even though N are free scattered); it may still succeed via splitting or
+  // a spill whose reloads decompose to per-dword. Do NOT assert on width here —
+  // let it try its luck; only genuine infeasibility remains.
+  const TargetRegisterClass *RC = MRI->getRegClass(Failed);
+  bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+  const MachineFunction &MF = MRI->getMF();
+  unsigned RPLimit = IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+
+  LLVM_DEBUG(dbgs() << "FALLBACK for " << printReg(Failed, TRI) << " ["
+                    << LIS->getInterval(Failed).beginIndex() << ","
+                    << LIS->getInterval(Failed).endIndex()
+                    << ") SplitLiveRanges=" << EnableSplitLiveRanges
+                    << " Recursive=" << Recursive << " Depth=" << Depth << "\n");
+
+  // Defensive backstop: termination is guaranteed by strictly-shrinking reload
+  // ranges (each reload lives [reload-pt, next-use], shorter than its source), so
+  // this should never trigger. If it does, a bug broke that argument — bail
+  // honestly instead of overflowing the stack.
+  if (Recursive && Depth >= MaxRecoveryDepth)
+    reportPointOverPressure(Failed, IsVGPR, RPLimit, "recursion-depth-cap");
+
+  // TIER 1 — split/spill AROUND a live-through blocker: Failed has no through-lane
+  // across its range, but the file is point-feasible — some physreg's only
+  // occupant across Failed's (short) range is a LIVE-THROUGH liver B (no use
+  // inside). Spilling B across frees B's physreg P over Failed's range with no
+  // interior reload; color Failed into P and keep B's reload in P too. Hack-
+  // compatible (stays SSA). Runs unconditionally under recursive-recovery (it is
+  // the right first move and returns false cleanly when inapplicable); otherwise
+  // gated by -amdgpu-ssa-split-live-ranges to preserve the default path.
+  if ((Recursive || EnableSplitLiveRanges) &&
+      trySplitColorViaBlocker(Failed, RPLimit)) {
+    LLVM_DEBUG(dbgs() << "  FALLBACK: colored via split-blocker\n");
+    if (SSAForensicReporter::enabled())
+      Reporter->transformation("split-blocker", Failed.virtRegIndex());
+    return true;
+  }
+  // TIER 1b — SELF-SPLIT: Failed is itself the long liver (no separate blocker).
+  // Peel off maximal register-resident pieces of Failed's own range, coloring
+  // each into a PR free across it. Succeeds when point-feasible; returns false
+  // (falls through to memory spill) on genuine over-pressure or an unclean split
+  // boundary. Same gating as blocker-split above.
+  if ((Recursive || EnableSplitLiveRanges) && trySelfSplitColor(Failed)) {
+    LLVM_DEBUG(dbgs() << "  FALLBACK: colored via self-split\n");
+    if (SSAForensicReporter::enabled())
+      Reporter->transformation("self-split", Failed.virtRegIndex());
+    return true;
+  }
+  LLVM_DEBUG(dbgs() << "  FALLBACK: memory-spill Failed itself\n");
+
+  // Place a fresh vreg (stub / reload redef) in-place against the frozen
+  // ColorMap. OFF: assert on failure (the old, dominant crash cluster). ON:
+  // recurse — a reload redef that cannot color re-enters recovery (it is a
+  // strictly-shorter value, so recursion is well-founded), and a value that
+  // genuinely cannot be recovered hits the honest point-over-pressure terminal.
+  auto ColorInPlace = [&](Register R) {
+    if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
+        MRI->reg_nodbg_empty(R))
+      return;
+    // Flush the forensic report NOW: colorOneInPlace can hit the hard assert /
+    // fatal below, which abort()s before endRun runs and would otherwise lose the
+    // buffered obs0. flushNow is idempotent, so if colorOneInPlace succeeds the
+    // later endRun is a no-op emit and no double-write occurs.
+    if (SSAForensicReporter::enabled())
+      Reporter->flushNow();
+    bool OK = colorOneInPlace(R);
+    if (!Recursive) {
+      assert(OK && "width-1 remainder must be colorable");
+      (void)OK;
+      return;
+    }
+    if (OK)
+      return;
+    // Could not place R in a register. Decide honestly: if R's range peaks over
+    // the file limit, that instant is genuinely infeasible (no recovery exists) —
+    // terminate with real numbers. Otherwise recurse: recovery will spill R,
+    // shortening it, until it colors or a point-over-pressure instant is exposed.
+    if (!recoverUncolorable(R, Depth + 1))
+      reportPointOverPressure(R, IsVGPR, RPLimit, "spill-floor");
+  };
+
+  // WEB DISPATCH (WIP — SUSPECT: introduced the corpus "Use not jointly dominated
+  // by defs" SSA-corruption regression on some 1024 configs). A Failed value that
+  // is a PHI result / PHI operand cannot be resolved by a plain spillOneVMP (its
+  // reload lands at the saturated join edge -> colorOneInPlace assert, the %1036
+  // case). Route it through the web spill instead. Kept gated on its own suspect
+  // flag and UNCHANGED under recursive-recovery.
+  Emitter->beginPass(IsVGPR);
+  if (EnablePhiWebSpill) {
+    MachineInstr *FDef = MRI->getUniqueVRegDef(Failed);
+    Register WebRoot;
+    if (FDef && FDef->isPHI())
+      WebRoot = Failed;
+    else
+      for (MachineInstr &U : MRI->use_nodbg_instructions(Failed))
+        if (U.isPHI()) {
+          WebRoot = U.getOperand(0).getReg();
+          break;
+        }
+    if (WebRoot) {
+      auto ColorFreshVReg = [&](Register C) {
+        if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
+          colorOneInPlace(C);
+      };
+      SlotIndex Invalid;
+      if (Emitter->spillPhiWeb(WebRoot, RPLimit, Invalid, Invalid,
+                               ColorFreshVReg)) {
+        LLVM_DEBUG(dbgs() << "  FALLBACK: web-spilled root "
+                          << printReg(WebRoot, TRI) << "\n");
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("phi-web-spill", WebRoot.virtRegIndex());
+        for (Register G : Emitter->lastWebGround())
+          ColorInPlace(G);
+        for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+          ColorInPlace(VMP.getVReg());
+        return true;
+      }
+    }
+  }
+
+  // SPILL-HOMELESS FLOOR: send Failed to memory (store-at-def + dominance
+  // reloads), then color its surviving stub and each fresh reload redef in place.
+  MachineInstr *DefMI = MRI->getVRegDef(Failed);
+  assert(DefMI && "uncolorable value must have a def in SSA");
+  SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
+  LLVM_DEBUG(dbgs() << "SSA RA: spilling uncolorable " << printReg(Failed, TRI)
+                    << " (kill-at-def) and coloring reloads in place\n");
+  if (SSAForensicReporter::enabled())
+    Reporter->transformation("memory-spill", Failed.virtRegIndex());
+
+  // RP-gated reload placement (SSASpillEmitter NeedsReload) keeps each reload from
+  // spanning an RP-tight region, so the freed pressure is real and the remainders
+  // settle in place.
+  Emitter->spillOneVMP(VRegMaskPair(Failed, MRI->getMaxLaneMaskForVReg(Failed)),
+                       KillIdx, RPLimit);
+
+  if (!Recursive) {
+    ColorInPlace(Failed); // (1) original value's surviving stub
+    for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+      ColorInPlace(VMP.getVReg()); // (2) fresh reload redefs
+    return true;
+  }
+
+  // Recursive path: ColorInPlace may recurse into recoverUncolorable, which calls
+  // spillOneVMP again and APPENDS to the shared Emitter->reloadedRegs() vector —
+  // iterating it by reference would invalidate the iterator. Snapshot the redef
+  // vregs first, then place each (recursing on any that cannot color).
+  SmallVector<Register, 8> Redefs;
+  for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+    Redefs.push_back(VMP.getVReg());
+  ColorInPlace(Failed); // (1) original value's surviving stub
+  for (Register RD : Redefs)
+    ColorInPlace(RD); // (2) fresh reload redefs (recurse if uncolorable)
   return true;
 }
 
@@ -4233,121 +4503,9 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       if (ColorMap.count(Failed) || MRI->reg_nodbg_empty(Failed) ||
           !LIS->hasInterval(Failed) || LIS->getInterval(Failed).empty())
         continue;
-      // A value coloring could not place: try to recover it — split (blocker or
-      // self), else spill+reload — regardless of width. A WIDE tuple that fails
-      // is usually not over-pressure but an aligned-placement gap (no N aligned
-      // free regs even though N are free scattered); it may still succeed via
-      // splitting or a spill whose reloads decompose to per-dword. Do NOT assert
-      // on width here — let it try its luck; only genuine infeasibility remains.
-      const TargetRegisterClass *RC = MRI->getRegClass(Failed);
-      bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
-      unsigned RPLimit =
-          IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
-
-      LLVM_DEBUG(dbgs() << "FALLBACK for " << printReg(Failed, TRI)
-                        << " [" << LIS->getInterval(Failed).beginIndex() << ","
-                        << LIS->getInterval(Failed).endIndex()
-                        << ") SplitLiveRanges=" << EnableSplitLiveRanges << "\n");
-      // LIVE-RANGE SPLITTING (experiment): Failed has no through-lane across its
-      // range, but the file is point-feasible — some physreg's only occupant
-      // across Failed's (short) range is a LIVE-THROUGH liver B (no use inside).
-      // Spilling B across frees B's physreg P over Failed's range with no
-      // interior reload; color Failed into P and keep B's reload in P too. This
-      // is Hack-compatible (stays SSA) and avoids spilling Failed itself.
-      if (EnableSplitLiveRanges && trySplitColorViaBlocker(Failed, RPLimit)) {
-        LLVM_DEBUG(dbgs() << "  FALLBACK: colored via split-blocker\n");
-        if (SSAForensicReporter::enabled())
-          Reporter->transformation("split-blocker", Failed.virtRegIndex());
-        continue;
-      }
-      // No live-through blocker to spill around (Failed is itself the long
-      // liver). Try SELF-SPLIT: peel off maximal register-resident pieces of
-      // Failed's own range, coloring each into a PR free across it. Succeeds when
-      // point-feasible; returns false (falls through to memory spill) on genuine
-      // over-pressure or an unclean split boundary.
-      if (EnableSplitLiveRanges && trySelfSplitColor(Failed)) {
-        LLVM_DEBUG(dbgs() << "  FALLBACK: colored via self-split\n");
-        if (SSAForensicReporter::enabled())
-          Reporter->transformation("self-split", Failed.virtRegIndex());
-        continue;
-      }
-      LLVM_DEBUG(dbgs() << "  FALLBACK: memory-spill Failed itself\n");
-
-      auto ColorInPlace = [&](Register R) {
-        if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
-            MRI->reg_nodbg_empty(R))
-          return;
-        // Flush the forensic report NOW: colorOneInPlace can hit the hard
-        // assert below (the dominant crash cluster), which abort()s before
-        // endRun runs and would otherwise lose the buffered obs0. flushNow is
-        // idempotent, so if colorOneInPlace succeeds the later endRun is a
-        // no-op emit and no double-write occurs.
-        if (SSAForensicReporter::enabled())
-          Reporter->flushNow();
-        bool OK = colorOneInPlace(R);
-        assert(OK && "width-1 remainder must be colorable");
-        (void)OK;
-      };
-
-      // WEB DISPATCH (WIP — under investigation; SUSPECT: introduced the corpus
-      // "Use not jointly dominated by defs" SSA-corruption regression on some 1024
-      // configs). A Failed value that is a PHI result / PHI operand cannot be
-      // resolved by a plain spillOneVMP (its reload lands at the saturated join
-      // edge -> colorOneInPlace assert, the %1036 case). Route it through the web
-      // spill instead. Tomorrow: the invalid-RegS/RegE web path here is unsound —
-      // fix the SSA repair before trusting this.
-      Emitter->beginPass(IsVGPR);
-      if (EnablePhiWebSpill) {
-        MachineInstr *FDef = MRI->getUniqueVRegDef(Failed);
-        Register WebRoot;
-        if (FDef && FDef->isPHI())
-          WebRoot = Failed;
-        else
-          for (MachineInstr &U : MRI->use_nodbg_instructions(Failed))
-            if (U.isPHI()) {
-              WebRoot = U.getOperand(0).getReg();
-              break;
-            }
-        if (WebRoot) {
-          auto ColorFreshVReg = [&](Register C) {
-            if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
-              colorOneInPlace(C);
-          };
-          SlotIndex Invalid;
-          if (Emitter->spillPhiWeb(WebRoot, RPLimit, Invalid, Invalid,
-                                   ColorFreshVReg)) {
-            LLVM_DEBUG(dbgs() << "  FALLBACK: web-spilled root "
-                              << printReg(WebRoot, TRI) << "\n");
-            if (SSAForensicReporter::enabled())
-              Reporter->transformation("phi-web-spill", WebRoot.virtRegIndex());
-            for (Register G : Emitter->lastWebGround())
-              ColorInPlace(G);
-            for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-              ColorInPlace(VMP.getVReg());
-            continue;
-          }
-        }
-      }
-
-      MachineInstr *DefMI = MRI->getVRegDef(Failed);
-      assert(DefMI && "uncolorable value must have a def in SSA");
-      SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
-      LLVM_DEBUG(dbgs() << "SSA RA: spilling uncolorable " << printReg(Failed,
-                                                                       TRI)
-                        << " (kill-at-def) and coloring reloads in place\n");
-      if (SSAForensicReporter::enabled())
-        Reporter->transformation("memory-spill", Failed.virtRegIndex());
-
-      // RP-gated reload placement (SSASpillEmitter NeedsReload) keeps each reload
-      // from spanning an RP-tight region, so the freed pressure is real and the
-      // remainders settle in place.
-      Emitter->spillOneVMP(
-          VRegMaskPair(Failed, MRI->getMaxLaneMaskForVReg(Failed)), KillIdx,
-          RPLimit);
-
-      ColorInPlace(Failed); // (1) original value's surviving stub
-      for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-        ColorInPlace(VMP.getVReg()); // (2) fresh reload redefs
+      // Dispatch to the per-value recovery (Part 1: dispatch factored into a
+      // method; behavior-identical when -amdgpu-ssa-recursive-recovery is OFF).
+      recoverUncolorable(Failed);
     }
   }
 
