@@ -1,0 +1,267 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx900 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -amdgpu-ssa-virgin-order -amdgpu-ssa-experiment-bail \
+# RUN:   -amdgpu-ssa-forensic-json=%t.json -o /dev/null %s
+# RUN: FileCheck %s --input-file=%t.json
+#
+# Colorfail-function scope gate (default ON): over a module with one CLEAN
+# function (scope_clean) and one function that COLORFAILS (scope_fail), the
+# reporter emits a record ONLY for the failing function. The clean function is
+# dropped entirely, so the NDJSON has exactly ONE line and its reportID is 1
+# (reportID advances only over emitted functions — dense numbering over the
+# colorfail set). The emitted record keeps the FULL event stream: both the
+# attempt-failed events AND the successful attempt-completed events, so the
+# passing attempts survive as contrast against the failures.
+#
+# Exactly one NDJSON line, and it is the FAILING function with reportID 1.
+# CHECK-NOT: "function":"scope_clean"
+# CHECK: "reportID":1,"function":"scope_fail"
+# CHECK-SAME: "kind":"attempt-completed"
+# CHECK-SAME: "kind":"attempt-failed"
+# CHECK-NOT: "function":"scope_clean"
+
+--- |
+  define amdgpu_kernel void @scope_clean() { ret void }
+  define amdgpu_kernel void @scope_fail() { ret void }
+...
+---
+name:            scope_clean
+tracksRegLiveness: true
+isSSA:           true
+registers:
+  - { id: 0, class: sgpr_32 }
+  - { id: 1, class: sgpr_32 }
+body: |
+  bb.0:
+    %0:sgpr_32 = S_MOV_B32 0
+    %1:sgpr_32 = S_MOV_B32 1
+    S_ENDPGM 0, implicit %0, implicit %1
+...
+---
+name:            scope_fail
+tracksRegLiveness: true
+isSSA:           true
+registers:
+  - { id: 0, class: sgpr_32 }
+  - { id: 1, class: sgpr_32 }
+  - { id: 2, class: sgpr_32 }
+  - { id: 3, class: sgpr_32 }
+  - { id: 4, class: sgpr_32 }
+  - { id: 5, class: sgpr_32 }
+  - { id: 6, class: sgpr_32 }
+  - { id: 7, class: sgpr_32 }
+  - { id: 8, class: sgpr_32 }
+  - { id: 9, class: sgpr_32 }
+  - { id: 10, class: sgpr_32 }
+  - { id: 11, class: sgpr_32 }
+  - { id: 12, class: sgpr_32 }
+  - { id: 13, class: sgpr_32 }
+  - { id: 14, class: sgpr_32 }
+  - { id: 15, class: sgpr_32 }
+  - { id: 16, class: sgpr_32 }
+  - { id: 17, class: sgpr_32 }
+  - { id: 18, class: sgpr_32 }
+  - { id: 19, class: sgpr_32 }
+  - { id: 20, class: sgpr_32 }
+  - { id: 21, class: sgpr_32 }
+  - { id: 22, class: sgpr_32 }
+  - { id: 23, class: sgpr_32 }
+  - { id: 24, class: sgpr_32 }
+  - { id: 25, class: sgpr_32 }
+  - { id: 26, class: sgpr_32 }
+  - { id: 27, class: sgpr_32 }
+  - { id: 28, class: sgpr_32 }
+  - { id: 29, class: sgpr_32 }
+  - { id: 30, class: sgpr_32 }
+  - { id: 31, class: sgpr_32 }
+  - { id: 32, class: sgpr_32 }
+  - { id: 33, class: sgpr_32 }
+  - { id: 34, class: sgpr_32 }
+  - { id: 35, class: sgpr_32 }
+  - { id: 36, class: sgpr_32 }
+  - { id: 37, class: sgpr_32 }
+  - { id: 38, class: sgpr_32 }
+  - { id: 39, class: sgpr_32 }
+  - { id: 40, class: sgpr_32 }
+  - { id: 41, class: sgpr_32 }
+  - { id: 42, class: sgpr_32 }
+  - { id: 43, class: sgpr_32 }
+  - { id: 44, class: sgpr_32 }
+  - { id: 45, class: sgpr_32 }
+  - { id: 46, class: sgpr_32 }
+  - { id: 47, class: sgpr_32 }
+  - { id: 48, class: sgpr_32 }
+  - { id: 49, class: sgpr_32 }
+  - { id: 50, class: sgpr_32 }
+  - { id: 51, class: sgpr_32 }
+  - { id: 52, class: sgpr_32 }
+  - { id: 53, class: sgpr_32 }
+  - { id: 54, class: sgpr_32 }
+  - { id: 55, class: sgpr_32 }
+  - { id: 56, class: sgpr_32 }
+  - { id: 57, class: sgpr_32 }
+  - { id: 58, class: sgpr_32 }
+  - { id: 59, class: sgpr_32 }
+  - { id: 60, class: sgpr_32 }
+  - { id: 61, class: sgpr_32 }
+  - { id: 62, class: sgpr_32 }
+  - { id: 63, class: sgpr_32 }
+  - { id: 64, class: sgpr_32 }
+  - { id: 65, class: sgpr_32 }
+  - { id: 66, class: sgpr_32 }
+  - { id: 67, class: sgpr_32 }
+  - { id: 68, class: sgpr_32 }
+  - { id: 69, class: sgpr_32 }
+  - { id: 70, class: sgpr_32 }
+  - { id: 71, class: sgpr_32 }
+  - { id: 72, class: sgpr_32 }
+  - { id: 73, class: sgpr_32 }
+  - { id: 74, class: sgpr_32 }
+  - { id: 75, class: sgpr_32 }
+  - { id: 76, class: sgpr_32 }
+  - { id: 77, class: sgpr_32 }
+  - { id: 78, class: sgpr_32 }
+  - { id: 79, class: sgpr_32 }
+  - { id: 80, class: sgpr_32 }
+  - { id: 81, class: sgpr_32 }
+  - { id: 82, class: sgpr_32 }
+  - { id: 83, class: sgpr_32 }
+  - { id: 84, class: sgpr_32 }
+  - { id: 85, class: sgpr_32 }
+  - { id: 86, class: sgpr_32 }
+  - { id: 87, class: sgpr_32 }
+  - { id: 88, class: sgpr_32 }
+  - { id: 89, class: sgpr_32 }
+  - { id: 90, class: sgpr_32 }
+  - { id: 91, class: sgpr_32 }
+  - { id: 92, class: sgpr_32 }
+  - { id: 93, class: sgpr_32 }
+  - { id: 94, class: sgpr_32 }
+  - { id: 95, class: sgpr_32 }
+  - { id: 96, class: sgpr_32 }
+  - { id: 97, class: sgpr_32 }
+  - { id: 98, class: sgpr_32 }
+  - { id: 99, class: sgpr_32 }
+  - { id: 100, class: sgpr_32 }
+  - { id: 101, class: sgpr_32 }
+  - { id: 102, class: sgpr_32 }
+  - { id: 103, class: sgpr_32 }
+  - { id: 104, class: sgpr_32 }
+  - { id: 105, class: sgpr_32 }
+  - { id: 106, class: sgpr_32 }
+  - { id: 107, class: sgpr_32 }
+  - { id: 108, class: sgpr_32 }
+  - { id: 109, class: sgpr_32 }
+body: |
+  bb.0:
+    %0:sgpr_32 = S_MOV_B32 0
+    %1:sgpr_32 = S_MOV_B32 1
+    %2:sgpr_32 = S_MOV_B32 2
+    %3:sgpr_32 = S_MOV_B32 3
+    %4:sgpr_32 = S_MOV_B32 4
+    %5:sgpr_32 = S_MOV_B32 5
+    %6:sgpr_32 = S_MOV_B32 6
+    %7:sgpr_32 = S_MOV_B32 7
+    %8:sgpr_32 = S_MOV_B32 8
+    %9:sgpr_32 = S_MOV_B32 9
+    %10:sgpr_32 = S_MOV_B32 10
+    %11:sgpr_32 = S_MOV_B32 11
+    %12:sgpr_32 = S_MOV_B32 12
+    %13:sgpr_32 = S_MOV_B32 13
+    %14:sgpr_32 = S_MOV_B32 14
+    %15:sgpr_32 = S_MOV_B32 15
+    %16:sgpr_32 = S_MOV_B32 16
+    %17:sgpr_32 = S_MOV_B32 17
+    %18:sgpr_32 = S_MOV_B32 18
+    %19:sgpr_32 = S_MOV_B32 19
+    %20:sgpr_32 = S_MOV_B32 20
+    %21:sgpr_32 = S_MOV_B32 21
+    %22:sgpr_32 = S_MOV_B32 22
+    %23:sgpr_32 = S_MOV_B32 23
+    %24:sgpr_32 = S_MOV_B32 24
+    %25:sgpr_32 = S_MOV_B32 25
+    %26:sgpr_32 = S_MOV_B32 26
+    %27:sgpr_32 = S_MOV_B32 27
+    %28:sgpr_32 = S_MOV_B32 28
+    %29:sgpr_32 = S_MOV_B32 29
+    %30:sgpr_32 = S_MOV_B32 30
+    %31:sgpr_32 = S_MOV_B32 31
+    %32:sgpr_32 = S_MOV_B32 32
+    %33:sgpr_32 = S_MOV_B32 33
+    %34:sgpr_32 = S_MOV_B32 34
+    %35:sgpr_32 = S_MOV_B32 35
+    %36:sgpr_32 = S_MOV_B32 36
+    %37:sgpr_32 = S_MOV_B32 37
+    %38:sgpr_32 = S_MOV_B32 38
+    %39:sgpr_32 = S_MOV_B32 39
+    %40:sgpr_32 = S_MOV_B32 40
+    %41:sgpr_32 = S_MOV_B32 41
+    %42:sgpr_32 = S_MOV_B32 42
+    %43:sgpr_32 = S_MOV_B32 43
+    %44:sgpr_32 = S_MOV_B32 44
+    %45:sgpr_32 = S_MOV_B32 45
+    %46:sgpr_32 = S_MOV_B32 46
+    %47:sgpr_32 = S_MOV_B32 47
+    %48:sgpr_32 = S_MOV_B32 48
+    %49:sgpr_32 = S_MOV_B32 49
+    %50:sgpr_32 = S_MOV_B32 50
+    %51:sgpr_32 = S_MOV_B32 51
+    %52:sgpr_32 = S_MOV_B32 52
+    %53:sgpr_32 = S_MOV_B32 53
+    %54:sgpr_32 = S_MOV_B32 54
+    %55:sgpr_32 = S_MOV_B32 55
+    %56:sgpr_32 = S_MOV_B32 56
+    %57:sgpr_32 = S_MOV_B32 57
+    %58:sgpr_32 = S_MOV_B32 58
+    %59:sgpr_32 = S_MOV_B32 59
+    %60:sgpr_32 = S_MOV_B32 60
+    %61:sgpr_32 = S_MOV_B32 61
+    %62:sgpr_32 = S_MOV_B32 62
+    %63:sgpr_32 = S_MOV_B32 63
+    %64:sgpr_32 = S_MOV_B32 64
+    %65:sgpr_32 = S_MOV_B32 65
+    %66:sgpr_32 = S_MOV_B32 66
+    %67:sgpr_32 = S_MOV_B32 67
+    %68:sgpr_32 = S_MOV_B32 68
+    %69:sgpr_32 = S_MOV_B32 69
+    %70:sgpr_32 = S_MOV_B32 70
+    %71:sgpr_32 = S_MOV_B32 71
+    %72:sgpr_32 = S_MOV_B32 72
+    %73:sgpr_32 = S_MOV_B32 73
+    %74:sgpr_32 = S_MOV_B32 74
+    %75:sgpr_32 = S_MOV_B32 75
+    %76:sgpr_32 = S_MOV_B32 76
+    %77:sgpr_32 = S_MOV_B32 77
+    %78:sgpr_32 = S_MOV_B32 78
+    %79:sgpr_32 = S_MOV_B32 79
+    %80:sgpr_32 = S_MOV_B32 80
+    %81:sgpr_32 = S_MOV_B32 81
+    %82:sgpr_32 = S_MOV_B32 82
+    %83:sgpr_32 = S_MOV_B32 83
+    %84:sgpr_32 = S_MOV_B32 84
+    %85:sgpr_32 = S_MOV_B32 85
+    %86:sgpr_32 = S_MOV_B32 86
+    %87:sgpr_32 = S_MOV_B32 87
+    %88:sgpr_32 = S_MOV_B32 88
+    %89:sgpr_32 = S_MOV_B32 89
+    %90:sgpr_32 = S_MOV_B32 90
+    %91:sgpr_32 = S_MOV_B32 91
+    %92:sgpr_32 = S_MOV_B32 92
+    %93:sgpr_32 = S_MOV_B32 93
+    %94:sgpr_32 = S_MOV_B32 94
+    %95:sgpr_32 = S_MOV_B32 95
+    %96:sgpr_32 = S_MOV_B32 96
+    %97:sgpr_32 = S_MOV_B32 97
+    %98:sgpr_32 = S_MOV_B32 98
+    %99:sgpr_32 = S_MOV_B32 99
+    %100:sgpr_32 = S_MOV_B32 100
+    %101:sgpr_32 = S_MOV_B32 101
+    %102:sgpr_32 = S_MOV_B32 102
+    %103:sgpr_32 = S_MOV_B32 103
+    %104:sgpr_32 = S_MOV_B32 104
+    %105:sgpr_32 = S_MOV_B32 105
+    %106:sgpr_32 = S_MOV_B32 106
+    %107:sgpr_32 = S_MOV_B32 107
+    %108:sgpr_32 = S_MOV_B32 108
+    %109:sgpr_32 = S_MOV_B32 109
+    S_ENDPGM 0, implicit %0, implicit %1, implicit %2, implicit %3, implicit %4, implicit %5, implicit %6, implicit %7, implicit %8, implicit %9, implicit %10, implicit %11, implicit %12, implicit %13, implicit %14, implicit %15, implicit %16, implicit %17, implicit %18, implicit %19, implicit %20, implicit %21, implicit %22, implicit %23, implicit %24, implicit %25, implicit %26, implicit %27, implicit %28, implicit %29, implicit %30, implicit %31, implicit %32, implicit %33, implicit %34, implicit %35, implicit %36, implicit %37, implicit %38, implicit %39, implicit %40, implicit %41, implicit %42, implicit %43, implicit %44, implicit %45, implicit %46, implicit %47, implicit %48, implicit %49, implicit %50, implicit %51, implicit %52, implicit %53, implicit %54, implicit %55, implicit %56, implicit %57, implicit %58, implicit %59, implicit %60, implicit %61, implicit %62, implicit %63, implicit %64, implicit %65, implicit %66, implicit %67, implicit %68, implicit %69, implicit %70, implicit %71, implicit %72, implicit %73, implicit %74, implicit %75, implicit %76, implicit %77, implicit %78, implicit %79, implicit %80, implicit %81, implicit %82, implicit %83, implicit %84, implicit %85, implicit %86, implicit %87, implicit %88, implicit %89, implicit %90, implicit %91, implicit %92, implicit %93, implicit %94, implicit %95, implicit %96, implicit %97, implicit %98, implicit %99, implicit %100, implicit %101, implicit %102, implicit %103, implicit %104, implicit %105, implicit %106, implicit %107, implicit %108, implicit %109
+...

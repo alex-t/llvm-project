@@ -1,9 +1,14 @@
 # RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
 # RUN:   -o %t.off.mir %s
 # RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -amdgpu-ssa-forensic-colorfail-only=false \
 # RUN:   -amdgpu-ssa-forensic-json=%t.json -o %t.on.mir %s
 # RUN: diff %t.off.mir %t.on.mir
 # RUN: FileCheck %s --input-file=%t.json
+#
+# Both functions color cleanly, so the colorfail-function scope gate (default ON)
+# would drop both records; -amdgpu-ssa-forensic-colorfail-only=false disables the
+# gate to validate per-function line emission and dense reportID sequencing.
 #
 # Multi-function NDJSON (regression for the per-function truncation bug): the
 # reporter is a pass member created ONCE across the module, so a module with >=2

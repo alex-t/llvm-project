@@ -1,6 +1,11 @@
 # RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -run-pass=amdgpu-ssa-register-allocator \
+# RUN:   -amdgpu-ssa-forensic-colorfail-only=false \
 # RUN:   -amdgpu-ssa-forensic-json=%t.json -o /dev/null %s
 # RUN: FileCheck %s --input-file=%t.json
+#
+# This function colors cleanly, so the colorfail-function scope gate (default ON)
+# would drop its record. -amdgpu-ssa-forensic-colorfail-only=false disables the
+# gate so we can validate the NDJSON schema shape on a simple passing function.
 #
 # JSON smoke (Test 2): the reporter emits well-formed NDJSON with the versioned
 # header and the ordered event stream. One JSON object per function per line.

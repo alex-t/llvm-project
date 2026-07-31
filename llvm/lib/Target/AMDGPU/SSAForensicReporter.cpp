@@ -48,6 +48,14 @@ cl::opt<std::string> SSAForensicTraceFile(
     cl::desc("Write a human-readable forensic allocation trace to this file. "
              "Enables the reporter."));
 
+cl::opt<bool> SSAForensicColorfailOnly(
+    "amdgpu-ssa-forensic-colorfail-only", cl::Hidden, cl::init(true),
+    cl::desc("Colorfail-function scope gate (default ON): emit a function's "
+             "forensic record ONLY IF that function had >= 1 attempt-failed "
+             "event; drop clean functions entirely. For a failing function the "
+             "FULL event stream is emitted (successful attempts kept as "
+             "contrast). Set =false to dump every function (schema tests)."));
+
 cl::opt<bool> EnableSSAForensicCounterfactual(
     "amdgpu-ssa-forensic-counterfactual", cl::Hidden, cl::init(false),
     cl::desc("Reserved (Phase 3): collect counterfactual/replay data. Unused "
@@ -216,7 +224,12 @@ void SSAForensicReporter::beginRun(const MachineFunction &MFn,
   MFHash = hashMIR(MFn);
   Events.clear();
   EventCtr = 0;
-  ++ReportCtr;
+  FailingFunction = false;
+  Emitted = false;
+  // ReportCtr is NOT bumped here: reportID numbers only EMITTED (failing)
+  // functions, so the NDJSON is densely numbered 1,2,3.. over the functions
+  // that colorfailed. It is incremented at flush time in endRun, gated on
+  // FailingFunction. mfHash remains per-function regardless.
 
   ForensicEvent &E = newEvent(ForensicEventKind::RunStarted);
   E.StrFacts.push_back({"function", FunctionName});
@@ -224,24 +237,65 @@ void SSAForensicReporter::beginRun(const MachineFunction &MFn,
   E.IntFacts.push_back({"numVirtRegs", (int64_t)MRIn->getNumVirtRegs()});
 }
 
+// The single shared flush path used by BOTH endRun() and flushNow(). Idempotent
+// per function via Emitted, so a flushNow() (early, pre-abort) followed by the
+// normal endRun does not double-emit. Applies the colorfail-only gate; does NOT
+// reset per-function state (the caller owns that).
+void SSAForensicReporter::emitReport() {
+  if (Emitted)
+    return;
+  // Nothing buffered means beginRun never ran (or already reset) — nothing to
+  // emit. Guards flushNow() called before any beginRun.
+  if (Events.empty())
+    return;
+
+  // Colorfail-function scope gate: when SSAForensicColorfailOnly (default ON),
+  // emit this function's record ONLY IF it had >= 1 attempt-failed event. Clean
+  // functions are dropped entirely (no NDJSON line, no trace line) to keep the
+  // corpus-wide output to the colorfail set. The full event stream (including
+  // the successful attempts of a failing function) is preserved as contrast.
+  // reportID advances only for emitted functions so the NDJSON is densely
+  // numbered 1,2,3.. over the emitted functions.
+  if (!SSAForensicColorfailOnly || FailingFunction) {
+    ++ReportCtr;
+    ensureSinks();
+    if (JSONOut)
+      flushJSON();
+    if (TraceOut)
+      flushTrace();
+  }
+  // Mark emitted even when the gate dropped this (clean) function: a later
+  // flushNow()/endRun must not re-run the gate and emit it then.
+  Emitted = true;
+}
+
 void SSAForensicReporter::endRun(uint64_t Uncolorable) {
   if (!enabled())
     return;
-  ForensicEvent &E = newEvent(ForensicEventKind::RunCompleted);
-  E.IntFacts.push_back({"uncolorableRemaining", (int64_t)Uncolorable});
-  E.IntFacts.push_back({"totalEvents", (int64_t)Events.size()});
-
-  ensureSinks();
-  if (JSONOut)
-    flushJSON();
-  if (TraceOut)
-    flushTrace();
+  // If a flushNow() already emitted this function's record early (pre-abort
+  // path that then recovered), don't append a second RunCompleted or re-emit.
+  // Still reset per-function state so the next function starts clean.
+  if (!Emitted) {
+    ForensicEvent &E = newEvent(ForensicEventKind::RunCompleted);
+    E.IntFacts.push_back({"uncolorableRemaining", (int64_t)Uncolorable});
+    E.IntFacts.push_back({"totalEvents", (int64_t)Events.size()});
+    emitReport();
+  }
 
   Events.clear();
   MF = nullptr;
   TRI = nullptr;
   MRI = nullptr;
   LIS = nullptr;
+}
+
+// Flush the current function's buffered record EARLY (before endRun), so a
+// colorfail path that ends in a hard assert/abort still leaves its report on
+// disk. Idempotent and format-identical to endRun's flush (see emitReport).
+void SSAForensicReporter::flushNow() {
+  if (!enabled())
+    return;
+  emitReport();
 }
 
 //===----------------------------------------------------------------------===//
@@ -314,6 +368,9 @@ void SSAForensicReporter::attemptFailed(uint64_t AttemptCause, unsigned VRegIdx,
   E.IntFacts.push_back({"vreg", (int64_t)VRegIdx});
   E.StrFacts.push_back({"reason", Reason.str()});
   attachLiveSet(E, LiveSet);
+  // Colorfail-function scope gate: this function had a coloring failure, so its
+  // whole record will be flushed at endRun (clean functions are dropped).
+  FailingFunction = true;
   uint64_t ID = E.ID;
   link(AttemptCause, ID);
 }

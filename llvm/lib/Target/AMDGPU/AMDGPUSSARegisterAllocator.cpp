@@ -4277,6 +4277,13 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
         if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
             MRI->reg_nodbg_empty(R))
           return;
+        // Flush the forensic report NOW: colorOneInPlace can hit the hard
+        // assert below (the dominant crash cluster), which abort()s before
+        // endRun runs and would otherwise lose the buffered obs0. flushNow is
+        // idempotent, so if colorOneInPlace succeeds the later endRun is a
+        // no-op emit and no double-write occurs.
+        if (SSAForensicReporter::enabled())
+          Reporter->flushNow();
         bool OK = colorOneInPlace(R);
         assert(OK && "width-1 remainder must be colorable");
         (void)OK;

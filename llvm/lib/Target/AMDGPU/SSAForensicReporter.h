@@ -60,6 +60,9 @@ class TargetRegisterClass;
 extern cl::opt<bool> EnableSSAForensic;
 extern cl::opt<std::string> SSAForensicJSONFile;
 extern cl::opt<std::string> SSAForensicTraceFile;
+// Colorfail-function scope gate (default TRUE). When true, only functions with
+// >= 1 attempt-failed event are flushed; clean functions are dropped entirely.
+extern cl::opt<bool> SSAForensicColorfailOnly;
 // Reserved (Phase 3 / out of scope for v1) — the flag exists so downstream
 // tooling can be wired to it, but nothing reads it yet.
 extern cl::opt<bool> EnableSSAForensicCounterfactual;
@@ -166,6 +169,18 @@ public:
   /// configured sinks and reset per-function state. \p Uncolorable is the final
   /// count left for the fallback paths.
   void endRun(uint64_t Uncolorable);
+
+  /// Flush this function's buffered record to the sinks EARLY, before the
+  /// normal endRun. This exists so a colorfail path that ends in a hard
+  /// assert/abort() (which fires before endRun) still gets its forensic report
+  /// on disk. It performs the SAME gated flush endRun does (colorfail-only gate
+  /// respected) via the shared emitReport() helper, so the on-disk format and
+  /// gate semantics are unchanged — it is purely "flush the same report
+  /// earlier". IDEMPOTENT: a second flushNow(), or the normal endRun after a
+  /// flushNow(), does not double-emit. No-op if called before beginRun or when
+  /// disabled. Unlike endRun it does NOT reset per-function state (the caller is
+  /// typically about to abort, or endRun runs later and does the reset).
+  void flushNow();
 
   // === Region-RP rounds (E2/E3) ===
 
@@ -280,6 +295,12 @@ private:
   void flushJSON();
   void flushTrace();
 
+  /// The single shared flush path used by BOTH endRun() and flushNow(). Applies
+  /// the colorfail-only gate, opens the sinks, writes the JSON/trace records,
+  /// bumps ReportCtr — but only once per function (guarded by \ref Emitted).
+  /// Does NOT reset per-function state; the caller owns that.
+  void emitReport();
+
   // Borrowed const analysis pointers (name/id lookup only; never mutated).
   const MachineFunction *MF = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
@@ -299,6 +320,23 @@ private:
   std::string FunctionName;
   std::string MFHash; // MD5 over dom-tree-ordered MIR
   std::vector<ForensicEvent> Events;
+
+  // Colorfail-function scope gate. Set true when this function records >= 1
+  // attempt-failed event; read at flush time (endRun). When false the whole
+  // function record is dropped (no NDJSON / no trace line) — the corpus run
+  // cares only about functions that colorfailed, so dumping every function
+  // would produce GBs of noise. Reset per function in beginRun. Note this
+  // gates ONLY whether the buffered record is flushed; it does NOT change what
+  // events are captured, so an on-vs-off run stays byte-identical. For a
+  // function that DID fail, the FULL event stream is emitted (including the
+  // successful attempts) so the analyst has the passing attempts as contrast.
+  bool FailingFunction = false;
+
+  // Idempotence guard for the shared flush path. Set true by emitReport() when
+  // it actually writes this function's record; reset per function in beginRun.
+  // Ensures a flushNow() (early, pre-abort) followed by the normal endRun does
+  // NOT double-emit, and that two flushNow() calls emit at most once.
+  bool Emitted = false;
 
   // Lazily opened output streams (persist across functions within a run).
   std::unique_ptr<raw_fd_ostream> JSONOut;
