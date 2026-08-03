@@ -113,11 +113,12 @@ static cl::opt<bool> EnablePhiWebSpill(
 // same gates, same assert). Wraps Parts 2-4 of the fix; Part 1 (the
 // recoverUncolorable refactor) is behavior-neutral and unconditional.
 static cl::opt<bool> EnableRecursiveRecovery(
-    "amdgpu-ssa-recursive-recovery", cl::Hidden, cl::init(false),
+    "amdgpu-ssa-recursive-recovery", cl::Hidden, cl::init(true),
     cl::desc("Recursive coloring-time recovery: reload redefs that cannot color "
              "re-enter the recovery (spill/shorten) with an honest "
              "point-over-pressure terminal; also runs blocker/self-split on the "
-             "default recovery path (default off; byte-identical when off)"));
+             "default recovery path (default ON as of the cycle-2 win: crashes "
+             "68->27, zero regressions; disable to get the old inline behavior)"));
 
 // Backstop only: termination is guaranteed by strictly-shrinking reload ranges
 // (each reload lives [reload-pt, next-use], shorter than its source). This cap
