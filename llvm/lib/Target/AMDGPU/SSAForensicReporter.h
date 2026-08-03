@@ -86,6 +86,7 @@ enum class ForensicEventKind : uint8_t {
   RunCompleted,               // E17
   Rollback,                   // reserved (Q-A) — unused in v1
   ShadowTreePick,             // E18 — SSARegisterTree shadow-oracle comparison
+  RecoveryWindow,             // E19 — recovery-classifier Stage 1 observation
 };
 
 /// One value live at a decision-boundary slot — the full liveness cross-section
@@ -279,6 +280,17 @@ public:
   /// (physreg outside the mapped VGPR_32 order), or "unmapped".
   void shadowTreeSkip(uint64_t AttemptCause, unsigned VRegIdx, unsigned WidthDwords,
                       StringRef Reason);
+
+  /// E19. Recovery-classifier Stage 1 observation: the recovery window computed
+  /// for an uncolored value. Plain fields (not the allocator's RecoveryWindow
+  /// struct) to avoid a layering dependency. \p Crossers is the spill-candidate
+  /// universe as vreg indices (width derived consumer-side). Endpoints are BLOCK
+  /// NUMBERS (not slot ordinals — layout order is not program order). \p WebPhiIdx
+  /// is the PHI result reg the value merges into, or 0 if none. Purely
+  /// descriptive — records what the classifier saw; drives nothing.
+  void recoveryWindow(unsigned UncoloredVRegIdx, int StartBlock, int EndBlock,
+                      ArrayRef<unsigned> Crossers, StringRef StopReason,
+                      unsigned WebPhiIdx);
 
   // === Causality ===
 

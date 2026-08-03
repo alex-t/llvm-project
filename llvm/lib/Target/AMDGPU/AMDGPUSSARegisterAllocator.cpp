@@ -1464,6 +1464,179 @@ void AMDGPUSSARegisterAllocator::findTightRegions(
   }
 }
 
+// [Recovery classifier, Stage 1] ----------------------------------------------
+
+AMDGPUSSARegisterAllocator::RegFile
+AMDGPUSSARegisterAllocator::fileOf(const TargetRegisterClass *RC) const {
+  // AGPR folds into VGPR so this matches pressureOf(VGPR)'s unified count; only
+  // SGPR classes are the SGPR file.
+  return TRI->isSGPRClass(RC) ? RegFile::SGPR : RegFile::VGPR;
+}
+
+// THE single source of truth for slot ordering. Dominance-based — NEVER block
+// layout / SlotIndex numeric distance (layout order != program order).
+AMDGPUSSARegisterAllocator::SlotOrder
+AMDGPUSSARegisterAllocator::compareSlots(SlotIndex A, SlotIndex B) const {
+  if (A == B)
+    return SlotOrder::Same;
+  MachineInstr *MIA = LIS->getInstructionFromIndex(A);
+  MachineInstr *MIB = LIS->getInstructionFromIndex(B);
+  // Callers pass real instruction slots (def/use RegSlots). Boundary slots are
+  // not supported — add them (with a test) only if a caller ever needs them.
+  assert(MIA && MIB && "compareSlots expects instruction slots, not boundaries");
+  // MDT->dominates(MI, MI) already handles the same-MBB case (falls back to
+  // intra-block instruction order), so no special-casing needed.
+  if (MDT->dominates(MIA, MIB))
+    return SlotOrder::Before;
+  if (MDT->dominates(MIB, MIA))
+    return SlotOrder::After;
+  return SlotOrder::Incomparable; // divergent paths (e.g. sibling diamond arms)
+}
+
+AMDGPUSSARegisterAllocator::RecoveryWindow
+AMDGPUSSARegisterAllocator::collectRecoveryWindow(Register Uncolored) const {
+  // SIDE-EFFECT-FREE observation: builds the forward window from Uncolored's def
+  // to the first non-PHI point where real RP drops below the file limit, plus the
+  // set of already-colored same-file crossers that have no use inside the window.
+  // Uses the trusted upward RP tracker only (the downward one is buggy). Mutates
+  // no allocator state.
+  RecoveryWindow W;
+  W.Uncolored = Uncolored;
+
+  MachineInstr *DefMI = MRI->getVRegDef(Uncolored);
+  assert(DefMI && "uncolored value has no def");
+  MachineBasicBlock *BB = DefMI->getParent(); // walk cursor
+  MachineFunction &MF = *BB->getParent();
+  // Guard against walking into a loop back-edge: a single-successor block whose
+  // successor is already on our path would re-enter a visited block and spin
+  // (observed: %951 walked backward via a bb->bb.1 back-edge). Treat a revisit
+  // as a hard stop (like divergence) — the window is truncated, not looped.
+  SmallPtrSet<MachineBasicBlock *, 8> Visited;
+  Visited.insert(BB);
+  const SlotIndex Start = LIS->getInstructionIndex(*DefMI).getRegSlot();
+  W.Start = Start;
+  W.End = Start; // updated as the top-down pass advances
+
+  const RegFile File = fileOf(MRI->getRegClass(Uncolored));
+  const unsigned Limit = allocatablePool(MF, File);
+  const unsigned MaxWindowSlots = 4096;
+
+  // Spill-candidate universe: colored, same-file crossers with no in-window use.
+  // Seeded from the def's live-out (below) and pruned as uses are met top-down.
+  SmallDenseSet<Register, 32> Live;
+
+  // Per-block RP fill (bottom-up with the upward tracker), reused across blocks.
+  // Keyed by the defining/using MachineInstr (SlotIndex has no DenseMapInfo and
+  // its ordinal accessor is private); each in-window slot maps 1:1 to an MI.
+  DenseMap<const MachineInstr *, unsigned> RPAt;
+
+  GCNUpwardRPTracker Tracker(*LIS);
+
+  // --- Def block: bottom-up RP fill from block end DOWN to the def, and capture
+  // the crosser seed at the def's live-out. Reverse iteration visits block-end
+  // first, so by the time we reach DefMI every in-window slot below the def is
+  // already filled; we then capture the live-out and STOP (nothing above the def
+  // is in the window). ------------------------------------------------------
+  Tracker.reset(*BB);
+  for (MachineInstr &MI : llvm::reverse(*BB)) {
+    if (MI.isDebugInstr())
+      continue;
+    if (&MI == DefMI) {
+      // Tracker has receded from block-end down to just below the def: its state
+      // IS the def's live-out. Capture the crosser seed and the def-slot RP
+      // (pre-recede), then stop — we never need RP above the def.
+      for (const auto &LR : Tracker.getLiveRegs()) {
+        Register V(LR.first); // upward tracker keys virtuals by vreg
+        if (V.isVirtual() && V != Uncolored && ColorMap.count(V) &&
+            fileOf(MRI->getRegClass(V)) == File)
+          Live.insert(V);
+      }
+      RPAt[DefMI] = pressureOf(Tracker.getPressure(), File);
+      break;
+    }
+    Tracker.recede(MI);
+    RPAt[&MI] = pressureOf(Tracker.getPressure(), File);
+  }
+
+  // --- Top-down pass. Start after the def in the def block; continue into unique
+  // successors, refilling RP per full block. Close at the first non-PHI slot with
+  // real RP < Limit. -----------------------------------------------------------
+  unsigned SlotsWalked = 0;
+  MachineBasicBlock::iterator Cur = std::next(DefMI->getIterator());
+  auto Finalize = [&]() {
+    W.Crossers.assign(Live.begin(), Live.end());
+    llvm::sort(W.Crossers, [](Register A, Register B) {
+      return A.virtRegIndex() < B.virtRegIndex();
+    });
+    // PHI-web membership — one CFG primitive: Uncolored feeds a PHI (a value-
+    // merge node). Loop-carried vs. divergent-diamond is a later cost-model
+    // distinction, not a detection concern (YAGNI now). Record the first PHI the
+    // value merges into as the analyst signal.
+    for (MachineInstr &UseMI : MRI->use_nodbg_instructions(Uncolored))
+      if (UseMI.isPHI()) {
+        W.WebPhi = UseMI.getOperand(0).getReg();
+        break;
+      }
+  };
+
+  while (true) {
+    for (MachineBasicBlock::iterator E = BB->end(); Cur != E; ++Cur) {
+      MachineInstr &MI = *Cur;
+      if (MI.isDebugInstr())
+        continue;
+      const SlotIndex S = LIS->getInstructionIndex(MI).getRegSlot();
+      W.End = S;
+      // Drop crossers whose use lands at this instruction.
+      for (const MachineOperand &MO : MI.uses())
+        if (MO.isReg() && MO.getReg().isVirtual())
+          Live.erase(MO.getReg());
+      // Close only at NON-PHI slots (PHIs carry no real pressure and their RP
+      // was not filled).
+      if (!MI.isPHI() && RPAt.lookup(&MI) < Limit) {
+        Finalize();
+        return W;
+      }
+      if (++SlotsWalked >= MaxWindowSlots) {
+        W.Stop = WindowStop::Cap;
+        Finalize();
+        return W;
+      }
+    }
+    // Block transition: follow the UNIQUE successor only; stop at divergence
+    // (>1 successor) or a function exit (0 successors).
+    if (BB->succ_size() != 1) {
+      W.Stop = WindowStop::ForkDivergence;
+      Finalize();
+      return W;
+    }
+    MachineBasicBlock *Succ = *BB->succ_begin();
+    // Back-edge: the unique successor is already on our path (loop). Stop rather
+    // than re-enter and spin. (Loop-carried-web classification is a SEPARATE,
+    // walk-independent structural check done in Finalize — a value can be
+    // loop-carried while the window stops for a different reason.)
+    if (!Visited.insert(Succ).second) {
+      W.Stop = WindowStop::BackEdge;
+      Finalize();
+      return W;
+    }
+    BB = Succ;
+    if (BB->empty()) {
+      // Degenerate empty successor: nothing to walk; keep following if unique.
+      Cur = BB->end();
+      continue;
+    }
+    Cur = BB->begin();
+    // Refill RP for the whole successor block (bottom-up, upward tracker).
+    Tracker.reset(*BB);
+    for (MachineInstr &MI : llvm::reverse(*BB)) {
+      if (MI.isDebugInstr())
+        continue;
+      Tracker.recede(MI);
+      RPAt[&MI] = pressureOf(Tracker.getPressure(), File);
+    }
+  }
+}
+
 AMDGPUSSARegisterAllocator::SpillCost
 AMDGPUSSARegisterAllocator::costOfSpilling(Register B, const TightRegion &R) {
   const unsigned Width = TRI->getRegSizeInBits(*MRI->getRegClass(B)) / 32;
@@ -2546,6 +2719,34 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed,
                     << LIS->getInterval(Failed).endIndex()
                     << ") SplitLiveRanges=" << EnableSplitLiveRanges
                     << " Recursive=" << Recursive << " Depth=" << Depth << "\n");
+
+  // [Recovery classifier, Stage 1] OBSERVE + LOG ONLY. Collect the recovery
+  // window for the failing value and emit it forensically. Side-effect-free:
+  // this changes no decision below (it is wired nowhere in the dispatch path);
+  // it exists so the tech lead can SEE the windows the classifier computes on the
+  // real colorfail values before any stage drives on them.
+  if (EnableRecursiveRecovery && SSAForensicReporter::enabled()) {
+    RecoveryWindow RW = collectRecoveryWindow(Failed);
+    SmallVector<unsigned, 16> CrosserIdx;
+    for (Register C : RW.Crossers)
+      CrosserIdx.push_back(C.virtRegIndex()); // width derived consumer-side from ID
+    // Window endpoints are identified by their BLOCK NUMBERS, never SlotIndex
+    // numeric distance — layout/ordinal order is not program order (comparing
+    // slot distances is forbidden and previously produced a phantom back-edge).
+    MachineBasicBlock *StartBB = LIS->getMBBFromIndex(RW.Start);
+    MachineBasicBlock *EndBB = LIS->getMBBFromIndex(RW.End);
+    StringRef StopStr;
+    switch (RW.Stop) {
+    case WindowStop::RPRecovered:    StopStr = "RPRecovered"; break;
+    case WindowStop::ForkDivergence: StopStr = "ForkDivergence"; break;
+    case WindowStop::BackEdge:       StopStr = "BackEdge"; break;
+    case WindowStop::Cap:            StopStr = "Cap"; break;
+    }
+    Reporter->recoveryWindow(Failed.virtRegIndex(),
+                             StartBB ? StartBB->getNumber() : -1,
+                             EndBB ? EndBB->getNumber() : -1, CrosserIdx, StopStr,
+                             RW.WebPhi ? RW.WebPhi.virtRegIndex() : 0);
+  }
 
   // Defensive backstop: termination is guaranteed by strictly-shrinking reload
   // ranges (each reload lives [reload-pt, next-use], shorter than its source), so

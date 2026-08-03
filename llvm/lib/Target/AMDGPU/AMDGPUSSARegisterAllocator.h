@@ -250,6 +250,55 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void findTightRegions(MachineFunction &MF, RegFile File,
                         SmallVectorImpl<TightRegion> &Out) const;
 
+  /// [Recovery classifier, Stage 1] Register file of a class for the recovery
+  /// window. AGPR folds into VGPR so the file matches pressureOf(VGPR)'s unified
+  /// count (SGPR classes -> SGPR, everything else -> VGPR).
+  RegFile fileOf(const TargetRegisterClass *RC) const;
+
+  /// Control-flow ordering of two slots. THE SINGLE SOURCE OF TRUTH for "does
+  /// slot A come before slot B" — based on DOMINANCE, never on block layout /
+  /// SlotIndex numeric distance (layout order is NOT program order; comparing
+  /// slot ordinals is a bug and is forbidden). Same block -> instruction order;
+  /// different blocks -> dominator-tree relation; divergent paths -> Incomparable
+  /// (neither precedes the other — e.g. sibling diamond arms).
+  enum class SlotOrder { Before, After, Same, Incomparable };
+  SlotOrder compareSlots(SlotIndex A, SlotIndex B) const;
+
+  /// [Recovery classifier, Stage 1] A "recovery window" for one uncolored value:
+  /// the forward slot span from the value's def down to the first non-PHI point
+  /// where real register pressure drops below the file limit, plus the universe
+  /// of already-colored, same-file crossers with NO use inside the window (the
+  /// spill-candidate universe a later stage will draw from). SIDE-EFFECT-FREE:
+  /// collected and logged only; it drives nothing in Stage 1.
+  /// Why a recovery window stopped growing. Exactly one reason per window.
+  /// BackEdge is the loop-carried-web signal (the window's single hop to a loop
+  /// header PHI) and is distinct from ForkDivergence — do NOT lump them.
+  enum class WindowStop {
+    RPRecovered,    // closed cleanly: first non-PHI slot with RP < Limit
+    ForkDivergence, // stopped at a >1-successor (or 0-successor) block
+    BackEdge,       // followed a unique successor back into a visited block (loop)
+    Cap             // hit MaxWindowSlots without RP recovering
+  };
+
+  struct RecoveryWindow {
+    Register Uncolored;
+    SlotIndex Start;                    // def slot of Uncolored
+    SlotIndex End;                      // first non-PHI slot fwd with real RP < Limit
+    SmallVector<Register, 16> Crossers; // spill-candidate universe (see collect)
+    WindowStop Stop = WindowStop::RPRecovered;
+    // PHI-web membership — the analyst signal. A PHI-web is one CFG primitive:
+    // Uncolored feeds a PHI (a value-merge node). Loop-carried vs. divergent-
+    // diamond is a LATER cost-model distinction, not a detection concern (YAGNI
+    // now). WebPhi = the PHI result reg this value merges into, or invalid if the
+    // value feeds no PHI. See Recursive_Recovery_Fix.md.
+    Register WebPhi;
+  };
+
+  /// [Recovery classifier, Stage 1] Collect the recovery window for \p Uncolored
+  /// (see RecoveryWindow). Uses the trusted GCNUpwardRPTracker only. Const —
+  /// reads LIS / MRI / ColorMap; mutates no allocator state.
+  RecoveryWindow collectRecoveryWindow(Register Uncolored) const;
+
   /// [Stage 2] Cost of spilling candidate \p B to relieve region \p R.
   ///   Feasible : no use is strictly inside R (case 2) nor in R's loop (case 3),
   ///              and every reload's post-spill RP <= R.Limit (Test 2). Else B

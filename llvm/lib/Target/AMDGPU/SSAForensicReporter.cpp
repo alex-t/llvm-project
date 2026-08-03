@@ -100,6 +100,8 @@ static const char *kindName(ForensicEventKind K) {
     return "rollback"; // reserved (Q-A) — never emitted in v1
   case ForensicEventKind::ShadowTreePick:
     return "shadow-tree-pick";
+  case ForensicEventKind::RecoveryWindow:
+    return "recovery-window";
   }
   return "unknown";
 }
@@ -563,6 +565,41 @@ void SSAForensicReporter::shadowTreeSkip(uint64_t AttemptCause, unsigned VRegIdx
   E.StrFacts.push_back({"skipped", Reason.str()});
   uint64_t ID = E.ID;
   link(AttemptCause, ID);
+}
+
+//===----------------------------------------------------------------------===//
+// Recovery classifier, Stage 1 (E19).
+//===----------------------------------------------------------------------===//
+
+void SSAForensicReporter::recoveryWindow(unsigned UncoloredVRegIdx,
+                                         int StartBlock, int EndBlock,
+                                         ArrayRef<unsigned> Crossers,
+                                         StringRef StopReason,
+                                         unsigned WebPhiIdx) {
+  if (!enabled())
+    return;
+  ForensicEvent &E = newEvent(ForensicEventKind::RecoveryWindow);
+  E.IntFacts.push_back({"uncolored", (int64_t)UncoloredVRegIdx});
+  // Endpoints as BLOCK NUMBERS (not slot ordinals — layout != program order).
+  E.IntFacts.push_back({"startBlock", (int64_t)StartBlock});
+  E.IntFacts.push_back({"endBlock", (int64_t)EndBlock});
+  E.IntFacts.push_back({"crosserCount", (int64_t)Crossers.size()});
+  // Why the window stopped: RPRecovered / ForkDivergence / BackEdge / Cap.
+  E.StrFacts.push_back({"stopReason", StopReason.str()});
+  // PHI-web membership: the PHI result reg the value merges into (analyst signal
+  // for a deferred web-spill candidate). 0 = feeds no PHI.
+  E.IntFacts.push_back({"webPhi", (int64_t)WebPhiIdx});
+  // Spill-candidate universe as comma-joined vreg indices, in the order given
+  // (the allocator sorts by vreg index for determinism). Width is intentionally
+  // NOT logged — the consumer derives it from the vreg's register class.
+  std::string List;
+  raw_string_ostream OS(List);
+  for (size_t I = 0, N = Crossers.size(); I < N; ++I) {
+    if (I)
+      OS << ",";
+    OS << Crossers[I];
+  }
+  E.StrFacts.push_back({"crossers", OS.str()});
 }
 
 //===----------------------------------------------------------------------===//
