@@ -1520,6 +1520,8 @@ AMDGPUSSARegisterAllocator::collectRecoveryWindow(Register Uncolored) const {
   const RegFile File = fileOf(MRI->getRegClass(Uncolored));
   const unsigned Limit = allocatablePool(MF, File);
   const unsigned MaxWindowSlots = 4096;
+  W.UncoloredWidth =
+      TRI->getRegSizeInBits(*MRI->getRegClass(Uncolored)) / 32; // dwords
 
   // Spill-candidate universe: colored, same-file crossers with no in-window use.
   // Seeded from the def's live-out (below) and pruned as uses are met top-down.
@@ -1547,11 +1549,28 @@ AMDGPUSSARegisterAllocator::collectRecoveryWindow(Register Uncolored) const {
       // (pre-recede), then stop — we never need RP above the def.
       for (const auto &LR : Tracker.getLiveRegs()) {
         Register V(LR.first); // upward tracker keys virtuals by vreg
-        if (V.isVirtual() && V != Uncolored && ColorMap.count(V) &&
-            fileOf(MRI->getRegClass(V)) == File)
-          Live.insert(V);
+        if (!V.isVirtual() || V == Uncolored || !ColorMap.count(V))
+          continue;
+        const TargetRegisterClass *VRC = MRI->getRegClass(V);
+        // Crosser precondition, explicit — a spill-around candidate must be:
+        // (1) same reg FILE as Failed (File(F) == File(B)), and
+        // (2) at least as WIDE as Failed — freeing a narrower crosser cannot
+        //     vacate a lane wide enough to hold Failed (spilling a width-1 to
+        //     place a width-4 is useless).
+        if (fileOf(VRC) != File)
+          continue;
+        if (TRI->getRegSizeInBits(*VRC) / 32 < W.UncoloredWidth)
+          continue;
+        Live.insert(V);
       }
-      RPAt[DefMI] = pressureOf(Tracker.getPressure(), File);
+      unsigned DefRP = pressureOf(Tracker.getPressure(), File);
+      RPAt[DefMI] = DefRP;
+      // The def slot is where the value failed to color and is the first
+      // in-window slot; the top-down pass starts AFTER the def, so fold the
+      // def-slot overshoot in here (else a value that only overshoots at its own
+      // def reports rpOvershoot=0).
+      if (DefRP > Limit)
+        W.RPOvershoot = std::max(W.RPOvershoot, DefRP - Limit);
       break;
     }
     Tracker.recede(MI);
@@ -1591,10 +1610,15 @@ AMDGPUSSARegisterAllocator::collectRecoveryWindow(Register Uncolored) const {
         if (MO.isReg() && MO.getReg().isVirtual())
           Live.erase(MO.getReg());
       // Close only at NON-PHI slots (PHIs carry no real pressure and their RP
-      // was not filled).
-      if (!MI.isPHI() && RPAt.lookup(&MI) < Limit) {
-        Finalize();
-        return W;
+      // was not filled). At each in-window non-PHI slot, track the peak overshoot
+      // (RP - Limit) — the spill-1-vs-spill-N signal for stage-2 dispatch.
+      if (!MI.isPHI()) {
+        unsigned RP = RPAt.lookup(&MI);
+        if (RP < Limit) {
+          Finalize();
+          return W;
+        }
+        W.RPOvershoot = std::max(W.RPOvershoot, RP - Limit);
       }
       if (++SlotsWalked >= MaxWindowSlots) {
         W.Stop = WindowStop::Cap;
@@ -2745,7 +2769,8 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed,
     Reporter->recoveryWindow(Failed.virtRegIndex(),
                              StartBB ? StartBB->getNumber() : -1,
                              EndBB ? EndBB->getNumber() : -1, CrosserIdx, StopStr,
-                             RW.WebPhi ? RW.WebPhi.virtRegIndex() : 0);
+                             RW.WebPhi ? RW.WebPhi.virtRegIndex() : 0,
+                             RW.UncoloredWidth, RW.RPOvershoot);
   }
 
   // Defensive backstop: termination is guaranteed by strictly-shrinking reload

@@ -575,7 +575,9 @@ void SSAForensicReporter::recoveryWindow(unsigned UncoloredVRegIdx,
                                          int StartBlock, int EndBlock,
                                          ArrayRef<unsigned> Crossers,
                                          StringRef StopReason,
-                                         unsigned WebPhiIdx) {
+                                         unsigned WebPhiIdx,
+                                         unsigned UncoloredWidth,
+                                         unsigned RPOvershoot) {
   if (!enabled())
     return;
   ForensicEvent &E = newEvent(ForensicEventKind::RecoveryWindow);
@@ -589,6 +591,10 @@ void SSAForensicReporter::recoveryWindow(unsigned UncoloredVRegIdx,
   // PHI-web membership: the PHI result reg the value merges into (analyst signal
   // for a deferred web-spill candidate). 0 = feeds no PHI.
   E.IntFacts.push_back({"webPhi", (int64_t)WebPhiIdx});
+  // Stage-2 dispatch inputs: failing value width (dwords) + peak RP overshoot
+  // (RP - Limit) across the window. Per-crosser widths derived consumer-side.
+  E.IntFacts.push_back({"uncoloredWidth", (int64_t)UncoloredWidth});
+  E.IntFacts.push_back({"rpOvershoot", (int64_t)RPOvershoot});
   // Spill-candidate universe as comma-joined vreg indices, in the order given
   // (the allocator sorts by vreg index for determinism). Width is intentionally
   // NOT logged — the consumer derives it from the vreg's register class.

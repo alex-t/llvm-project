@@ -292,6 +292,12 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
     // now). WebPhi = the PHI result reg this value merges into, or invalid if the
     // value feeds no PHI. See Recursive_Recovery_Fix.md.
     Register WebPhi;
+    // Stage-2 dispatch inputs (spill-around ranking). Per-crosser widths are NOT
+    // stored — derived from the vreg id (consumer-side for the analyst, live for
+    // the in-allocator dispatcher).
+    unsigned UncoloredWidth = 0; // width of Uncolored in dwords (aligned-tuple feasibility)
+    unsigned RPOvershoot = 0;    // peak (RP - Limit) across the window; 0 if never over
+                                 // (spill-1 vs spill-N signal)
   };
 
   /// [Recovery classifier, Stage 1] Collect the recovery window for \p Uncolored

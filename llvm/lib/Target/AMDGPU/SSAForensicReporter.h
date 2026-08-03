@@ -290,7 +290,8 @@ public:
   /// descriptive — records what the classifier saw; drives nothing.
   void recoveryWindow(unsigned UncoloredVRegIdx, int StartBlock, int EndBlock,
                       ArrayRef<unsigned> Crossers, StringRef StopReason,
-                      unsigned WebPhiIdx);
+                      unsigned WebPhiIdx, unsigned UncoloredWidth,
+                      unsigned RPOvershoot);
 
   // === Causality ===
 
