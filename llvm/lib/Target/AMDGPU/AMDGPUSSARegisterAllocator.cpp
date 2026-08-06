@@ -32,10 +32,6 @@ using namespace llvm;
 // OFF so the tree matches the committed `ssara` baseline; flip on to develop it.
 // The spiller reads this via a declaration in AMDGPUSSARegisterSpiller.cpp.
 namespace llvm {
-// Defined in AMDGPUSSARegisterSpiller.cpp; the allocator's coloring-time split
-// path reads it to gate blocker-splitting on the same flag as the spiller side.
-extern cl::opt<bool> EnableSplitLiveRanges;
-
 cl::opt<bool> EnableAMDGPUSSAACLColoring(
     "amdgpu-ssa-acl-coloring",
     cl::desc("Enable around-call-liver two-phase coloring and the spiller's "
@@ -101,30 +97,6 @@ static cl::opt<bool> EnableRegionRP(
 static cl::opt<bool> EnablePhiWebSpill(
     "amdgpu-ssa-phi-web-spill", cl::Hidden, cl::init(false),
     cl::desc("region-rp: spill a PHI victim as an in-memory-coalesced web"));
-
-// Recursive coloring-time recovery (see Recursive_Recovery_Fix.md). Makes the
-// spill-homeless floor a FIXPOINT: a reload redef that cannot color re-enters the
-// same recovery (spill/shorten), bottoming out at a genuine point-over-pressure
-// terminal reported honestly WITH REAL NUMBERS instead of the misleading
-// "width-1 remainder must be colorable" assert / "needs more up-front spilling"
-// fatal. When ON it also runs blocker-split + self-split as the DEFAULT tier-1
-// move (not gated behind -amdgpu-ssa-split-live-ranges). Default OFF: the
-// per-Failed dispatch is byte-identical to the pre-refactor path (same order,
-// same gates, same assert). Wraps Parts 2-4 of the fix; Part 1 (the
-// recoverUncolorable refactor) is behavior-neutral and unconditional.
-static cl::opt<bool> EnableRecursiveRecovery(
-    "amdgpu-ssa-recursive-recovery", cl::Hidden, cl::init(true),
-    cl::desc("Recursive coloring-time recovery: reload redefs that cannot color "
-             "re-enter the recovery (spill/shorten) with an honest "
-             "point-over-pressure terminal; also runs blocker/self-split on the "
-             "default recovery path (default ON as of the cycle-2 win: crashes "
-             "68->27, zero regressions; disable to get the old inline behavior)"));
-
-// Backstop only: termination is guaranteed by strictly-shrinking reload ranges
-// (each reload lives [reload-pt, next-use], shorter than its source). This cap
-// merely converts a hypothetical runaway (a bug in that argument) into an honest
-// error instead of a stack overflow. Should never trigger.
-static constexpr unsigned MaxRecoveryDepth = 64;
 
 // Shadow register-tree oracle (SSARegisterTree). When on AND the forensic sink
 // is active, a shadow SSARegisterTree mirrors the VGPR_32 occupancy the
@@ -775,7 +747,7 @@ void AMDGPUSSARegisterAllocator::analyzeTierRank(
 
 void AMDGPUSSARegisterAllocator::scanOverlappersForVI(
     const LiveInterval &VI, BitVector &OccupiedUnits,
-    SmallVectorImpl<std::pair<Register, MCRegister>> *Overlappers) {
+    SmallVectorImpl<std::pair<Register, MCRegister>> *Overlappers) const {
   // ONE walk over ColorMap: record which colored values' intervals overlap VI
   // (the full-live-interval test, catching same-width gaps a point check misses)
   // and OR their physreg units into OccupiedUnits. \p Overlappers is optional —
@@ -1402,6 +1374,27 @@ unsigned AMDGPUSSARegisterAllocator::pressureOf(const GCNRegPressure &P,
   llvm_unreachable("bad RegFile");
 }
 
+// Feasibility policy moved from the Emitter (which is pure spill/reload mechanics).
+// Bit-identical to the former SSASpillEmitter bodies: getVGPRNum(hasGFX90A), NOT
+// pressureOf's getArchVGPRNum (they differ by the AGPR term on non-unified targets;
+// see reloadRPBeforeUse header note).
+unsigned AMDGPUSSARegisterAllocator::reloadRPBeforeUse(const MachineInstr *UseMI,
+                                                       bool IsVGPR) const {
+  GCNUpwardRPTracker Tracker(*LIS);
+  Tracker.reset(*UseMI);
+  Tracker.recede(*UseMI);
+  GCNRegPressure P = Tracker.getPressure();
+  return IsVGPR ? P.getVGPRNum(ST->hasGFX90AInsts()) : P.getSGPRNum();
+}
+
+unsigned AMDGPUSSARegisterAllocator::reloadRPAtBlockEnd(const MachineBasicBlock *NCD,
+                                                        bool IsVGPR) const {
+  GCNUpwardRPTracker Tracker(*LIS);
+  Tracker.reset(*NCD);
+  GCNRegPressure P = Tracker.getPressure();
+  return IsVGPR ? P.getVGPRNum(ST->hasGFX90AInsts()) : P.getSGPRNum();
+}
+
 void AMDGPUSSARegisterAllocator::findTightRegions(
     MachineFunction &MF, RegFile File,
     SmallVectorImpl<TightRegion> &Out) const {
@@ -1791,7 +1784,7 @@ AMDGPUSSARegisterAllocator::costOfSpilling(Register B, const TightRegion &R) {
   };
   uint64_t WeightedReloads;
   SlotIndex NCDEnd = (NCD ? LIS->getMBBEndIdx(NCD) : SlotIndex());
-  bool UseHoist = HoistOK && Emitter->reloadRPAtBlockEnd(NCD) +
+  bool UseHoist = HoistOK && reloadRPAtBlockEnd(NCD, WantVG) +
                                      uncoloredSpanAt(NCDEnd) <=
                                  R.Limit;
   if (UseHoist) {
@@ -1800,7 +1793,7 @@ AMDGPUSSARegisterAllocator::costOfSpilling(Register B, const TightRegion &R) {
   } else {
     LLVM_DEBUG(if (HoistOK) dbgs()
                << "      cost " << printReg(B, TRI) << ": hoist infeasible (NCD-end RP "
-               << Emitter->reloadRPAtBlockEnd(NCD) << " > " << R.Limit
+               << reloadRPAtBlockEnd(NCD, WantVG) << " > " << R.Limit
                << ") -> trying per-use\n");
     // Per-use reloads land at DISTINCT slots (each use) and die immediately
     // (rolling window), so they do not accumulate against one another. But each
@@ -1813,7 +1806,7 @@ AMDGPUSSARegisterAllocator::costOfSpilling(Register B, const TightRegion &R) {
       if (UseMI->isPHI())
         continue;
       SlotIndex UAt = LIS->getInstructionIndex(*UseMI).getRegSlot();
-      unsigned Pad = Emitter->reloadRPBeforeUse(UseMI) + uncoloredSpanAt(UAt);
+      unsigned Pad = reloadRPBeforeUse(UseMI, WantVG) + uncoloredSpanAt(UAt);
       if (Pad > R.Limit) {
         LLVM_DEBUG(dbgs() << "      cost " << printReg(B, TRI)
                           << ": INFEASIBLE test2-peruse (reload RP " << Pad << " > "
@@ -1981,118 +1974,6 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
       return Mx;
     };
 
-    // Uncolored values of THIS file still spanning slot At (they still need a
-    // register there). Shared by the web-reload gate below and mirrors the term
-    // added to costOfSpilling. (Req 2)
-    auto uncoloredSpanAt = [&](SlotIndex At, Register Skip) -> unsigned {
-      if (!At.isValid())
-        return 0;
-      unsigned WSum = 0;
-      for (Register F : UncolorableVRegs) {
-        if (F == Skip || !LIS->hasInterval(F) || MRI->reg_nodbg_empty(F))
-          continue;
-        const TargetRegisterClass *FRC = MRI->getRegClass(F);
-        bool IsVG = TRI->isVGPRClass(FRC) || TRI->isAGPRClass(FRC);
-        if (IsVG != WantVGPR)
-          continue;
-        if (LIS->getInterval(F).liveAt(At))
-          WSum += TRI->getRegSizeInBits(*FRC) / 32;
-      }
-      return WSum;
-    };
-
-    // Web-reload feasibility (req 1 + req 2). A web spill of the victim erases its
-    // PHIs but reloads each web member's EXTERNAL uses from the shared slot. Close
-    // the web, group those reload sites by landing block, and require, per block:
-    //   colored pad RP (at block end) + Σ this web's reload widths there (req 1)
-    //   + uncolored values spanning the block end (req 2)   <=  Limit.
-    // Rejecting protects an uncolored value (e.g. %886) whose range the web's
-    // reloads would otherwise inflate round over round.
-    auto webReloadFeasible = [&](Register Victim, unsigned Lim,
-                                 bool WantVG) -> bool {
-      // Resolve the web root: Victim is a PHI result, or a PHI operand feeding one.
-      Register Root;
-      if (MachineInstr *D = MRI->getUniqueVRegDef(Victim); D && D->isPHI())
-        Root = Victim;
-      else
-        for (MachineInstr &U : MRI->use_nodbg_instructions(Victim))
-          if (U.isPHI()) {
-            Root = U.getOperand(0).getReg();
-            break;
-          }
-      if (!Root)
-        return true; // not actually a web -> nothing web-specific to gate
-
-      // Close the web (PHI members) exactly as the emitter does: bidirectional
-      // over PHI operand/result edges.
-      SmallDenseSet<Register, 32> Members;
-      SmallVector<Register, 32> Work{Root};
-      Members.insert(Root);
-      while (!Work.empty()) {
-        Register M = Work.pop_back_val();
-        if (MachineInstr *D = MRI->getUniqueVRegDef(M); D && D->isPHI())
-          for (unsigned I = 1, E = D->getNumOperands(); I + 1 < E; I += 2) {
-            MachineOperand &Op = D->getOperand(I);
-            if (Op.isReg() && Op.getReg().isVirtual() && !Op.isUndef()) {
-              MachineInstr *OD = MRI->getUniqueVRegDef(Op.getReg());
-              if (OD && OD->isPHI() && Members.insert(Op.getReg()).second)
-                Work.push_back(Op.getReg());
-            }
-          }
-        for (MachineInstr &U : MRI->use_nodbg_instructions(M))
-          if (U.isPHI() && Members.insert(U.getOperand(0).getReg()).second)
-            Work.push_back(U.getOperand(0).getReg());
-      }
-
-      // External uses = uses of a member NOT on an internal web PHI edge. A web
-      // reload lands right BEFORE each such use (mid-block, where the use reads it),
-      // NOT at block end. Collect (useMI, memberWidth); req 1 accumulates web
-      // reload width per landing BLOCK (several members reloaded in the same block
-      // coexist there), and each use slot's pad pressure is measured at the use.
-      Emitter->beginPass(WantVG);
-      DenseMap<MachineBasicBlock *, unsigned> PadCumW; // req-1 running total
-      SmallVector<std::pair<MachineInstr *, unsigned>, 32> ExtUses;
-      for (Register M : Members) {
-        unsigned MW = LIS->hasInterval(M)
-                          ? TRI->getRegSizeInBits(*MRI->getRegClass(M)) / 32
-                          : 0;
-        for (MachineInstr &U : MRI->use_nodbg_instructions(M)) {
-          if (U.isPHI() && Members.count(U.getOperand(0).getReg()))
-            continue; // internal edge -> vanishes with the erased PHIs
-          if (U.isPHI())
-            continue; // PHI-edge reload lands at a pred end (low-RP); not the wall
-          ExtUses.push_back({&U, MW});
-        }
-      }
-      for (auto &[U, MW] : ExtUses) {
-        MachineBasicBlock *PadBB = U->getParent();
-        unsigned &Cum = PadCumW[PadBB];
-        Cum += MW; // req 1: this web's reloads accumulate in the landing block
-        SlotIndex UAt = LIS->getInstructionIndex(*U).getRegSlot();
-        // Pad pressure at the use = colored RP before the use (rolling window,
-        // already counts the reloaded value via -W+W) + uncolored spanners (req 2)
-        // + the OTHER web reloads sharing this block that are simultaneously live
-        // (req 1: Cum - MW, since reloadRPBeforeUse already includes this one).
-        unsigned RPb = Emitter->reloadRPBeforeUse(U);
-        unsigned Unc = uncoloredSpanAt(UAt, Victim);
-        unsigned Pad = RPb + Unc + (Cum - MW);
-        LLVM_DEBUG(dbgs() << "      webprobe " << printReg(Victim, TRI) << " use@"
-                          << UAt << " bb." << PadBB->getNumber() << " RP=" << RPb
-                          << " unc=" << Unc << " webcum=" << (Cum - MW)
-                          << " pad=" << Pad << " lim=" << Lim << "\n");
-        if (Pad > Lim) {
-          LLVM_DEBUG(dbgs()
-                     << "      web " << printReg(Victim, TRI)
-                     << ": INFEASIBLE pad bb." << PadBB->getNumber() << " @ " << UAt
-                     << " (RP " << Emitter->reloadRPBeforeUse(U) << " + uncolored "
-                     << uncoloredSpanAt(UAt, Victim) << " + webcum " << (Cum - MW)
-                     << " > " << Lim << ")\n");
-          return false;
-        }
-      }
-      return true;
-    };
-
     // Per region: keep spilling max-coverage victims until peak <= Limit.
     for (Region &R : Regions) {
       LLVM_DEBUG(dbgs() << "  region [" << R.S << "," << R.E
@@ -2146,21 +2027,14 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
           // the exact candidates the web is meant to handle. BYPASS the gate for
           // web candidates and give a fixed cost (feasible by construction, the
           // monotone wall-dissolution). Only when the flag is on.
-          bool IsWebCand = false;
-          if (EnablePhiWebSpill) {
-            MachineInstr *D = MRI->getUniqueVRegDef(I.VReg);
-            if (D && D->isPHI())
-              IsWebCand = true;
-            else
-              for (MachineInstr &U : MRI->use_nodbg_instructions(I.VReg))
-                if (U.isPHI()) {
-                  IsWebCand = true;
-                  break;
-                }
-          }
+          PhiWeb Web;
+          if (EnablePhiWebSpill)
+            Web = closePhiWeb(I.VReg);
           double Ratio;
-          if (IsWebCand) {
-            if (!webReloadFeasible(I.VReg, Limit, WantVGPR)) {
+          if (Web.valid()) {
+            // RA-side feasibility (shared gate): decline if any web reload would
+            // land where post-spill RP still exceeds Limit.
+            if (!webReloadFeasible(Web, WantVGPR, Limit)) {
               Rejected.insert(I.VReg);
               continue;
             }
@@ -2192,11 +2066,6 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
                           << " w=" << BestW << " -> peak " << R.Peak << "->"
                           << (R.Peak - long(BestW)) << "\n");
         Emitter->beginPass(WantVGPR);
-        // getUniqueVRegDef (NOT getVRegDef, which ASSERTS on multi-def): a value
-        // that a prior reload redefined at several sites has multiple defs and is
-        // never a PHI — getUniqueVRegDef returns null there, routing it to the
-        // normal single-value spill path.
-        MachineInstr *BestDef = MRI->getUniqueVRegDef(BestB);
         bool DidWeb = false;
         if (EnablePhiWebSpill) {
           // Route to the PHI-web spill when the victim participates in a PHI web —
@@ -2204,21 +2073,13 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
           // picks) it is a PHI OPERAND feeding a web PHI. A PHI operand cannot be
           // resolved by a plain spill (it must be live at the PHI edge); only the
           // web spill (store operands, reload result-uses, erase the PHIs)
-          // dissolves the join wall. Spill the web keyed on the consuming PHI's
-          // RESULT — spillPhiWeb closes the whole web from there.
-          Register WebRoot;
-          if (BestDef && BestDef->isPHI())
-            WebRoot = BestB;
-          else
-            for (MachineInstr &U : MRI->use_nodbg_instructions(BestB))
-              if (U.isPHI()) {
-                WebRoot = U.getOperand(0).getReg();
-                break;
-              }
-          if (WebRoot) {
+          // dissolves the join wall. closePhiWeb keys the whole web on the
+          // consuming PHI's result and runs the soundness gate.
+          PhiWeb Web = closePhiWeb(BestB);
+          if (Web.valid()) {
             LLVM_DEBUG(dbgs() << "    region-rp region [" << R.S << "," << R.E
                               << ") victim=" << printReg(BestB, TRI) << " -> WEB root="
-                              << printReg(WebRoot, TRI) << "\n");
+                              << printReg(Web.Root, TRI) << "\n");
             // No shared color is forced (the SGPR-lane assert is a per-store WIDTH
             // check, not a color/count check — see spillPhiWeb doc). Ground ops keep
             // their colors and are stored directly; a sub-register operand is
@@ -2229,7 +2090,8 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
               if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
                 colorOneInPlace(C);
             };
-            DidWeb = Emitter->spillPhiWeb(WebRoot, Limit, R.S, R.E, ColorFreshVReg);
+            Emitter->spillPhiWeb(Web, Limit, ColorFreshVReg);
+            DidWeb = true;
           }
         }
         if (!DidWeb) {
@@ -2282,58 +2144,227 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
   return AnySpill;
 }
 
-bool AMDGPUSSARegisterAllocator::trySplitColorViaBlocker(Register Failed,
-                                                         unsigned RPLimit) {
+PhiWeb AMDGPUSSARegisterAllocator::closePhiWeb(Register Seed) const {
+  PhiWeb Web;
+  // Resolve the web root: Seed is a PHI result, or a PHI operand feeding one.
+  // getUniqueVRegDef throughout (NOT getVRegDef, which asserts on multi-def): a
+  // reload-created value has several redefs; treat it as a non-PHI ground/leaf.
+  if (MachineInstr *D = MRI->getUniqueVRegDef(Seed); D && D->isPHI())
+    Web.Root = Seed;
+  else
+    for (MachineInstr &U : MRI->use_nodbg_instructions(Seed))
+      if (U.isPHI()) {
+        Web.Root = U.getOperand(0).getReg();
+        break;
+      }
+  if (!Web.Root)
+    return Web; // invalid: Seed feeds no PHI
+
+  // --- Close the equivalence class (analysis only; slot stays virtual). ---
+  // The web equivalence result<->operand is BIDIRECTIONAL. Close it BOTH ways:
+  //  - DOWN: a member PHI's operands (a PHI operand joins the web; a ground def is
+  //    a store site).
+  //  - UP: any PHI that USES the member as an operand (that consuming PHI is in the
+  //    same class). Without the up-edge, a bb.N-Flow PHI reached as an operand of a
+  //    bb.M-end PHI would be its OWN single-PHI web, and the edge to the end PHI
+  //    would look EXTERNAL -> reloaded per-predecessor back into the join wall (the
+  //    exact defect: web=1 everywhere, 128 reloads into RP=129 bb.1). Closing up
+  //    makes that edge internal so it vanishes with the erased PHIs.
+  SmallVector<Register, 32> Work;
+  Web.PhiMembers.insert(Web.Root);
+  Work.push_back(Web.Root);
+  while (!Work.empty()) {
+    Register R = Work.pop_back_val();
+    MachineInstr *D = MRI->getUniqueVRegDef(R);
+    if (D && D->isPHI()) {
+      // DOWN: operands of this member PHI.
+      for (unsigned I = 1, E = D->getNumOperands(); I + 1 < E; I += 2) {
+        MachineOperand &Op = D->getOperand(I);
+        if (!Op.isReg() || !Op.getReg().isVirtual())
+          continue;
+        // An UNDEF PHI operand (`undef %r.subN, %bb`) carries no live value on that
+        // edge — %r is not live-out there. Storing it would emit a COPY reading an
+        // undefined register (verifier: "reading vreg without a def"). Skip it: the
+        // reload on that path reads whatever the slot holds, which is sound because
+        // the incoming value was undef anyway.
+        if (Op.isUndef())
+          continue;
+        Register OpReg = Op.getReg();
+        MachineInstr *OpDef = MRI->getUniqueVRegDef(OpReg);
+        if (OpDef && OpDef->isPHI()) {
+          if (Web.PhiMembers.insert(OpReg))
+            Work.push_back(OpReg);
+        } else {
+          // Ground operand on this PHI edge. The block operand is I+1. Record
+          // EVERY edge (no dedup): only one edge executes at runtime, so each edge
+          // carrying a web value must write the slot, even if the same vreg flows
+          // on two edges. GroundOps stays unique for the interference gate/relief.
+          MachineBasicBlock *PredBB = D->getOperand(I + 1).getMBB();
+          Web.GroundOps.insert(OpReg);
+          Web.GroundEdges.push_back({OpReg, Op.getSubReg(), PredBB, D, I});
+        }
+      }
+    }
+    // UP: any PHI consuming R as an operand joins the class.
+    for (MachineInstr &U : MRI->use_nodbg_instructions(R)) {
+      if (!U.isPHI())
+        continue;
+      Register UResult = U.getOperand(0).getReg();
+      if (Web.PhiMembers.insert(UResult))
+        Work.push_back(UResult);
+    }
+  }
+  if (Web.GroundOps.empty()) {
+    Web.Root = Register(); // invalid: all-undef web -> caller falls back
+    return Web;
+  }
+
+  // SOUNDNESS GATE (option 2): all ground ops of the web share ONE stack slot. That
+  // is only correct if no two of them are ever SIMULTANEOUSLY LIVE — i.e. the PHIs
+  // are copy-less control-flow merges where exactly one incoming value reaches the
+  // join on any path. If two operands interfere, the shared slot would clobber one
+  // (the second store overwrites the first while the first is still needed) — a
+  // MISCOMPILE. In-memory coalescing is register-coalescing with a slot as the
+  // color, so it needs the SAME non-interference precondition. Prove it here; if any
+  // pair interferes, DECLINE the web (invalidate) and let the caller fall back to a
+  // plain per-value spill. (This is why 1024's divergent-select bitcast is safe: its
+  // two operands come from mutually-exclusive cmp.true/cmp.false predecessors.)
+  {
+    SmallVector<Register, 16> GV(Web.GroundOps.begin(), Web.GroundOps.end());
+    auto HasLive = [&](Register R) {
+      return LIS->hasInterval(R) && !LIS->getInterval(R).empty();
+    };
+    for (unsigned A = 0; A < GV.size(); ++A)
+      for (unsigned B = A + 1; B < GV.size(); ++B)
+        if (HasLive(GV[A]) && HasLive(GV[B]) &&
+            LIS->getInterval(GV[A]).overlaps(LIS->getInterval(GV[B]))) {
+          LLVM_DEBUG(dbgs()
+                     << "closePhiWeb(): DECLINE root " << printReg(Web.Root, TRI)
+                     << " — operands " << printReg(GV[A], TRI) << " and "
+                     << printReg(GV[B], TRI)
+                     << " interfere (shared slot would clobber)\n");
+          Web.Root = Register(); // invalid: shared slot would clobber
+          return Web;
+        }
+  }
+  return Web;
+}
+
+bool AMDGPUSSARegisterAllocator::webReloadFeasible(const PhiWeb &Web, bool IsVGPR,
+                                                   unsigned Limit) const {
+  // A web spill only REMOVES pressure at the join, so the sole failure mode is a
+  // reload landing where post-spill RP still exceeds Limit. Check that at each web
+  // member's EXTERNAL (non-PHI-edge) use — the reload sites — via the one shared
+  // helper. Internal PHI-edge uses vanish with the erased PHIs; PHI-edge reloads
+  // land at a low-RP predecessor end, not the wall.
+  for (Register M : Web.PhiMembers)
+    for (MachineInstr &U : MRI->use_nodbg_instructions(M)) {
+      if (U.isPHI())
+        continue;
+      if (reloadRPBeforeUse(&U, IsVGPR) > Limit)
+        return false;
+    }
+  return true;
+}
+
+bool AMDGPUSSARegisterAllocator::hasCleanCrossLiver(Register Failed,
+                                                    unsigned RPLimit) const {
+  // spillBlocker precondition (see spillBlocker for the mechanics). A blocker B
+  // is a CLEAN candidate iff: colored + same file (freeing P opens a Failed-legal
+  // reg), live at F's END with NO use strictly inside (so B's reload lands after
+  // FE, no round-trip into F's window), AND that reload's post-spill RP stays
+  // within RPLimit (else the reload re-saturates a tight region — the C1
+  // long-reload pathology). Covers BOTH live-through (frees all of F) and
+  // born-in-F (frees F's tail) blockers. Returns true if any such B exists, so
+  // the classifier picks CrossLiver when spillBlocker has a candidate.
   const TargetRegisterClass *RC = MRI->getRegClass(Failed);
+  bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
   const LiveInterval &FI = LIS->getInterval(Failed);
   SlotIndex FS = FI.beginIndex(), FE = FI.endIndex();
 
-  // Candidate blockers: colored values whose physreg P is (a) legal for Failed's
-  // RC, (b) occupied across Failed's whole range ONLY by B (B overlaps FI), and
-  // (c) B is LIVE-THROUGH FI — no use of B strictly inside [FS,FE). Such a B can
-  // be spilled across FI with its reload landing AFTER FE, so P frees over all of
-  // FI with no interior reload (the only sound way to vacate a lane at full
-  // point-pressure — a used-inside interferer would re-thread).
-  // Collect blockers from the SHARED scan (one ColorMap walk, reused by the gap
-  // pick). Overlappers already satisfies "B != none, has interval, overlaps FI",
-  // so this loop only applies the split-specific filters (PLegal, live-through,
-  // used-inside) — no second ColorMap walk.
   SmallVector<std::pair<Register, MCRegister>, 16> Overlappers;
   BitVector OccupiedUnits;
   scanOverlappersForVI(FI, OccupiedUnits, &Overlappers);
 
-  SmallVector<std::pair<Register, MCRegister>, 4> Candidates;
-  unsigned NOverlap = 0, NLiveThru = 0, NNotUsed = 0;
   for (const auto &[B, P] : Overlappers) {
     if (B == Failed)
       continue;
-    // B's physreg must overlap a register Failed could use: some reg unit of P
-    // (or of a wider B's aligned tuple) must be a unit Failed's RC can hold. For
-    // a width-1 Failed, any B whose color includes a Failed-legal lane qualifies
-    // (a wide B occupies several lanes; freeing it frees all of them).
-    bool PLegal = false;
-    for (MCRegister Cand : RegClassInfo.getOrder(RC)) {
-      for (MCRegUnit CU : TRI->regunits(Cand)) {
-        for (MCRegUnit PU : TRI->regunits(P))
-          if (CU == PU) {
-            PLegal = true;
-            break;
-          }
-        if (PLegal)
-          break;
-      }
-      if (PLegal)
+    const TargetRegisterClass *PRC = TRI->getPhysRegBaseClass(P);
+    if (!TRI->getCommonSubClass(RC, PRC))
+      continue; // freeing P opens no Failed-legal register (different file)
+    const LiveInterval &BI = LIS->getInterval(B);
+    if (!BI.liveAt(FE.getPrevSlot()))
+      continue; // not live at F's end (neither live-through nor born-in-F)
+    bool Clean = true;
+    for (const MachineOperand &MO : MRI->use_operands(B)) {
+      const MachineInstr *UMI = MO.getParent();
+      SlotIndex U = LIS->getInstructionIndex(*UMI).getRegSlot();
+      if (FS < U && U < FE) { // used strictly inside -> not spillable-around
+        Clean = false;
         break;
+      }
+      // B's reload lands at its after-FE use; its post-spill RP must fit.
+      if (U >= FE && reloadRPBeforeUse(UMI, IsVGPR) > RPLimit) {
+        Clean = false;
+        break;
+      }
     }
-    if (!PLegal)
+    if (Clean)
+      return true;
+  }
+  return false;
+}
+
+bool AMDGPUSSARegisterAllocator::floorViable(Register R, bool IsVGPR,
+                                             unsigned RPLimit) const {
+  // A memory spill of R relieves it only if some non-PHI use reloads where
+  // post-spill RP fits; else the reload re-enters the same saturation (thrash).
+  // No non-PHI use -> nothing to reload -> trivially viable (store-only).
+  bool HasUse = false;
+  for (MachineInstr &U : MRI->use_nodbg_instructions(R)) {
+    if (U.isPHI())
+      continue;
+    HasUse = true;
+    if (reloadRPBeforeUse(&U, IsVGPR) <= RPLimit)
+      return true;
+  }
+  return !HasUse;
+}
+
+AMDGPUSSARegisterAllocator::RecoveryResult
+AMDGPUSSARegisterAllocator::spillBlocker(Register Failed, unsigned RPLimit,
+                                         Register &Remnant) {
+  const TargetRegisterClass *RC = MRI->getRegClass(Failed);
+  const LiveInterval &FI = LIS->getInterval(Failed);
+  SlotIndex FS = FI.beginIndex(), FE = FI.endIndex();
+  bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+
+  // Candidate blockers from the SHARED overlapper scan. A clean candidate is a
+  // colored value B whose physreg P is legal for Failed (same file), that is live
+  // at F's END and has NO use strictly inside (FS,FE) — so B's reload lands past
+  // FE and cannot round-trip into F's window. Two classes by where B STARTS:
+  //  - LIVE-THROUGH (B.def <= FS, i.e. liveAt(FS)): freeing P clears ALL of F.
+  //  - BORN-IN-F   (B.def in (FS,FE)):              freeing P clears F's TAIL.
+  SmallVector<std::pair<Register, MCRegister>, 16> Overlappers;
+  BitVector OccupiedUnits;
+  scanOverlappersForVI(FI, OccupiedUnits, &Overlappers);
+
+  SmallVector<std::tuple<Register, MCRegister, bool>, 4> Cands; // (B, P, liveThru)
+  unsigned NOverlap = 0, NClean = 0;
+  for (const auto &[B, P] : Overlappers) {
+    if (B == Failed)
+      continue;
+    // Same file: freeing P must open a Failed-legal register.
+    const TargetRegisterClass *PRC = TRI->getPhysRegBaseClass(P);
+    if (!TRI->getCommonSubClass(RC, PRC))
       continue;
     const LiveInterval &BI = LIS->getInterval(B);
-    // (overlap(FI) already guaranteed by the shared scan)
     ++NOverlap;
-    // Live-through: B must be live at FS and FE and have no use inside (FS,FE).
-    if (!BI.liveAt(FS) || !BI.liveAt(FE.getPrevSlot()))
+    // Live at F's end covers BOTH classes (live-through: liveAt(FS)&&liveAt(FE);
+    // born-in-F: B.end>FE => liveAt(FE.prev)).
+    if (!BI.liveAt(FE.getPrevSlot()))
       continue;
-    ++NLiveThru;
+    // No use of B strictly inside (FS,FE): guarantees B's reload lands past FE.
     bool UsedInside = false;
     for (const MachineOperand &MO : MRI->use_operands(B)) {
       SlotIndex U = LIS->getInstructionIndex(*MO.getParent()).getRegSlot();
@@ -2344,76 +2375,147 @@ bool AMDGPUSSARegisterAllocator::trySplitColorViaBlocker(Register Failed,
     }
     if (UsedInside)
       continue;
-    ++NNotUsed;
-    Candidates.emplace_back(B, P);
+    ++NClean;
+    Cands.emplace_back(B, P, BI.liveAt(FS));
   }
 
-  LLVM_DEBUG(dbgs() << "  split-color: " << printReg(Failed, TRI) << " ["
+  LLVM_DEBUG(dbgs() << "  spill-blocker: " << printReg(Failed, TRI) << " ["
                     << FS << "," << FE << ") candidates: overlap=" << NOverlap
-                    << " livethru=" << NLiveThru << " notused=" << NNotUsed
-                    << " final=" << Candidates.size() << "\n");
+                    << " clean=" << NClean << "\n");
 
-  if (Candidates.empty())
-    return false;
+  if (Cands.empty())
+    return RecoveryResult::NoOp;
 
-  // Select only when there is a choice. >1: prefer the blocker whose live range
-  // extends farthest past FE (most wasteful to hold P for one lane; its reload is
-  // furthest from FI). ==1: take it.
-  auto Pick = Candidates[0];
-  if (Candidates.size() > 1) {
-    SlotIndex Best;
-    for (const auto &C : Candidates) {
-      SlotIndex E = LIS->getInterval(C.first).endIndex();
-      if (!Best.isValid() || Best < E) {
-        Best = E;
-        Pick = C;
-      }
+  // COVERAGE pick: a live-through blocker frees ALL of F (take the first one).
+  // Otherwise the born-in-F blocker with the EARLIEST def frees the longest tail
+  // [B.def,FE). Blocker LI LENGTH is irrelevant (the reload lands at the use).
+  Register B;
+  MCRegister P;
+  bool LiveThrough = false;
+  SlotIndex BestDef;
+  for (const auto &[CB, CP, CLive] : Cands) {
+    if (CLive) {
+      B = CB;
+      P = CP;
+      LiveThrough = true;
+      break; // whole-F relief; nothing beats it
+    }
+    SlotIndex D = LIS->getInterval(CB).beginIndex();
+    if (!B || D < BestDef) {
+      B = CB;
+      P = CP;
+      BestDef = D;
     }
   }
-  Register B = Pick.first;
-  MCRegister P = Pick.second;
 
-  LLVM_DEBUG(dbgs() << "  split-color: spilling live-through blocker "
-                    << printReg(B, TRI) << " (phys " << TRI->getName(P)
-                    << ") across " << printReg(Failed, TRI) << " ["
-                    << FS << "," << FE << ")\n");
-
-  // Spill B across FI: store at B's def, free at FS, reload at B's uses reachable
-  // from FS — all after FE (live-through guarantee), so P is free over all of FI.
-  bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
-  Emitter->beginPass(IsVGPR);
-  Emitter->spillOneVMP(VRegMaskPair(B, MRI->getMaxLaneMaskForVReg(B)), FS,
-                       RPLimit);
-
-  // B's whole-range assignment P is now invalid: spillOneVMP replaced B's long
-  // range with a short head stub + fresh narrow reload redefs. Drop P and RE-
-  // COLOR each surviving piece with colorOneInPlace (the proven width-safe path
-  // used by the ordinary coloring-time spill). Forcing P onto the reloads is
-  // UNSOUND when B is wide: spillOneVMP decomposes a wide B into narrower reload
-  // chunks (e.g. AV64 pieces of a 1024-bit tuple), and a narrow reload cannot
-  // hold the wide physreg P -> "incorrect register class" verifier error.
-  // Freeing B's units is what opens the lane for Failed; the colorer then places
-  // B's head, B's reloads, and Failed each at its correct width.
-  ColorMap.erase(B);
   auto ColorInPlace = [&](Register R) -> bool {
     if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
         MRI->reg_nodbg_empty(R))
       return true;
     return colorOneInPlace(R);
   };
-  bool OK = ColorInPlace(B); // surviving head stub
-  for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-    OK &= ColorInPlace(VMP.getVReg()); // fresh reload redefs
-  OK &= ColorInPlace(Failed);          // the value we set out to place
 
-  if (!OK) {
-    LLVM_DEBUG(dbgs() << "  split-color: a piece remained uncolorable after "
-                         "blocker spill\n");
-    return false;
+  if (LiveThrough) {
+    LLVM_DEBUG(dbgs() << "  spill-blocker: live-through " << printReg(B, TRI)
+                      << " (phys " << TRI->getName(P) << ") across "
+                      << printReg(Failed, TRI) << "\n");
+    // Store at B's def, reload at B's post-FE uses -> P free over all of FI.
+    // spillOneVMP replaces B's long range with a head stub + narrow reload
+    // redefs; recolor each surviving piece (forcing P onto a narrow reload is
+    // unsound for a wide B). Freeing B's units opens the lane for Failed.
+    Emitter->beginPass(IsVGPR);
+    ColorMap.erase(B);
+    Emitter->spillOneVMP(VRegMaskPair(B, MRI->getMaxLaneMaskForVReg(B)), FS,
+                         RPLimit);
+    bool OK = ColorInPlace(B); // surviving head stub
+    for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+      OK &= ColorInPlace(VMP.getVReg()); // fresh reload redefs
+    OK &= ColorInPlace(Failed);          // the value we set out to place
+    if (!OK) {
+      LLVM_DEBUG(dbgs() << "  spill-blocker: a piece stayed uncolorable\n");
+      return RecoveryResult::NoOp;
+    }
+    return RecoveryResult::Resolved;
   }
-  LLVM_DEBUG(dbgs() << "  split-color: colored " << printReg(Failed, TRI)
-                    << " via split of " << printReg(B, TRI) << "\n");
-  return true;
+
+  // BORN-IN-F: freeing P clears the TAIL [B.def,FE). colorOneInPlace is
+  // whole-range, so split F at B.def: color the tail into B's freed reg and hand
+  // the HEAD [FS,B.def) back as the (strictly shorter) remnant -> Reduced.
+  // A PHI-defined B has no mid-block def to split F at (splitLiveRangeAt needs a
+  // real instruction); decline cleanly rather than mis-place the cut.
+  MachineInstr *BDef = MRI->getVRegDef(B);
+  assert(BDef && "colored blocker must have a def in SSA");
+  if (BDef->isPHI())
+    return RecoveryResult::NoOp;
+
+  // CLEAN-CUT GATE. splitLiveRangeAt redirects uses by REACHING-VNI, not by slot:
+  // it moves only the uses that read the VNI live just before the cut. F may be
+  // MULTI-VNI (product of earlier splits); if a use at/after B.def reads a
+  // DIFFERENT VNI, that use stays on F, F's endpoint does NOT move, and F is left
+  // half-transformed and uncolored (an emit-time abort). Take born-in-F ONLY when
+  // the cut is clean: every non-debug use of F at/after B.def reads the single VNI
+  // live at B.def (and none is a PHI use — a value merge is inherently multi-VNI).
+  // Then all tail uses redirect and F truly shrinks to [FS,B.def). Otherwise
+  // decline (NoOp) and let SelfSplit/Floor handle F.
+  SlotIndex BDefSlot = LIS->getInstructionIndex(*BDef).getRegSlot();
+  VNInfo *CutVNI = FI.getVNInfoBefore(BDefSlot);
+  if (!CutVNI)
+    return RecoveryResult::NoOp;
+  for (const MachineOperand &MO : MRI->use_operands(Failed)) {
+    const MachineInstr *UMI = MO.getParent();
+    if (UMI->isDebugInstr())
+      continue;
+    SlotIndex U = LIS->getInstructionIndex(*UMI).getRegSlot();
+    if (U < BDefSlot)
+      continue; // head use: keeps reading F after the cut — fine
+    if (UMI->isPHI() || FI.getVNInfoBefore(U) != CutVNI)
+      return RecoveryResult::NoOp; // tail use won't redirect -> cut not clean
+  }
+
+  LLVM_DEBUG(dbgs() << "  spill-blocker: born-in-F " << printReg(B, TRI)
+                    << " (phys " << TRI->getName(P) << ") frees tail of "
+                    << printReg(Failed, TRI) << " at " << BestDef << "\n");
+  Register Tail = Emitter->splitLiveRangeAt(Failed, BDef->getIterator());
+  if (!Tail)
+    return RecoveryResult::NoOp; // split redirected nothing -> Failed unchanged
+  Emitter->beginPass(IsVGPR);
+  ColorMap.erase(B);
+  Emitter->spillOneVMP(VRegMaskPair(B, MRI->getMaxLaneMaskForVReg(B)),
+                       LIS->getInterval(B).beginIndex(), RPLimit);
+  // Split + spill are now COMMITTED to LIS/MIR — there is no rollback. Any piece
+  // that cannot color in place must be RE-QUEUED (dropping it leaks an uncolored
+  // vreg to final rewrite = the emit-time abort); NoOp here would strand exactly
+  // those pieces. Color what we can, queue the rest for the worklist fixpoint.
+  // The pieces to place: B's SURVIVING range, B's reload redefs, and F's tail.
+  // B is NOT always fully consumed — kill-at-def only removes B's range past its
+  // def, but when B is itself a short split-Tail whose def is a COPY, a tiny stub
+  // survives (def + store) that we erased from ColorMap and must re-place. So run
+  // B through the same guarded path: it colors if a stub survives, skips if truly
+  // consumed. (The live-through path kills at FS > B.def, always leaving a stub.)
+  // Skip-guard the members: reloadedRegs() is CUMULATIVE across every spill in
+  // the pass (beginPass does not clear it, only clearReloadedRegs does, which no
+  // caller invokes per-spill), so it also contains STALE reloads from earlier
+  // spills that are already colored / dead / interval-less. Skip those; only a
+  // fresh, live, uncolored member that colorOneInPlace declines is a real queue.
+  // TODO(honest fix): call Emitter->clearReloadedRegs() before spillOneVMP so
+  // reloadedRegs() returns ONLY this spill's redefs; then the reload loop's skip
+  // guard collapses to a strict assert (every member fresh+live). Left for its own
+  // change — clearing is shared emitter state read by the driver.
+  auto ColorOrQueue = [&](Register R) {
+    if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
+        MRI->reg_nodbg_empty(R))
+      return;
+    if (!colorOneInPlace(R))
+      UncolorableVRegs.push_back(R);
+  };
+  ColorOrQueue(B); // B's surviving stub, if kill-at-def did not consume it
+  for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+    ColorOrQueue(VMP.getVReg()); // this + prior spills' reload redefs (cumulative)
+  ColorOrQueue(Tail);            // F's tail into B's freed register
+  // Clean-cut gate guarantees F's endpoint moved to B.def, so the head remnant is
+  // strictly shorter -> hand it back for re-dispatch.
+  Remnant = Failed;
+  return RecoveryResult::Reduced;
 }
 
 void AMDGPUSSARegisterAllocator::commitColor(Register Piece, MCRegister PR) {
@@ -2474,88 +2576,49 @@ SlotIndex AMDGPUSSARegisterAllocator::firstBlockAfter(
   return Best;
 }
 
-bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
+AMDGPUSSARegisterAllocator::RecoveryResult
+AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed, Register &Remnant) {
   // SELF-SPLIT — Failed IS ITSELF the long liver: no single PR is free across its
-  // whole range, and no separate live-through blocker exists to spill around
-  // (trySplitColorViaBlocker returned false). Unlike the memory-spill fallback
-  // (which sends the WHOLE value to memory), self-split keeps as much of Failed
-  // register-resident as possible: repeatedly peel off the maximal PREFIX that
-  // some PR is free across, color that piece into that PR, and recurse on the
-  // tail. Each peel = one splitLiveRangeAt (a COPY + reaching-VNI use redirect,
-  // staying in SSA -> graph stays chordal -> Hack-compatible). We settle ANY
-  // colorable piece rather than requiring a gap for the whole LI.
+  // whole range, and no separate live-through blocker exists to spill around.
+  // Keep as much of Failed register-resident as possible: repeatedly peel off the
+  // maximal PREFIX that some PR is free across, color that piece into that PR, and
+  // recurse on the tail. Each peel = one splitLiveRangeAt (a COPY + reaching-VNI
+  // use redirect, staying in SSA -> graph stays chordal -> Hack-compatible).
   //
-  // Soundness guard: if no PR is free even at a piece's START slot, that point is
-  // genuine over-pressure (needs a memory spill, not a split) -> return false and
-  // let the caller fall through to the width-1 spill path. First cut also bails on
-  // a boundary that is not a clean non-PHI instruction.
+  // Outcomes (NO memory-spill here — the Floor owns that):
+  //  - Resolved : every piece colored.
+  //  - Reduced  : peeled >=1 prefix but a piece could not settle in a register;
+  //               the SHORTER remnant is returned in \p Remnant for the driver to
+  //               re-dispatch (a shorter range may now expose a clean cross-liver;
+  //               deferring via the worklist could close that opportunity).
+  //  - NoOp     : could not peel anything (the first piece == whole Failed is
+  //               already tight) -> driver floors the original Failed.
   const TargetRegisterClass *RC = MRI->getRegClass(Failed);
   bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
   const MachineFunction &MF = MRI->getMF();
   unsigned RPLimit = IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+  (void)RPLimit;
 
-  // Spill a piece we could not settle in a register (the genuinely-tight tail),
-  // then color its reload remnants. CRUCIAL: once we have peeled/colored ANY
-  // earlier piece we are mid-mutation, so we must NOT return false and orphan the
-  // current piece — we spill it. This is the SOLE recovery for a piece that
-  // cannot be settled in a register (whether it is the first piece == whole
-  // Failed, or a tail): store-at-def + reload-at-use, then color the stub and the
-  // reload remnants. It must succeed: a reload remnant that still cannot be
-  // colored means the function is genuinely infeasible at coloring time (needs
-  // MORE up-front spilling) — report that LOUDLY at the real cause rather than
-  // leaving an uncolored operand for a confusing downstream crash.
-  auto spillPiece = [&](Register Piece) {
-    MachineInstr *DefMI = MRI->getVRegDef(Piece);
-    if (!DefMI)
-      report_fatal_error("SSARA self-split: piece to spill has no def");
-    SlotIndex Kill = LIS->getInstructionIndex(*DefMI).getRegSlot();
-    Emitter->beginPass(IsVGPR);
-    Emitter->spillOneVMP(VRegMaskPair(Piece, MRI->getMaxLaneMaskForVReg(Piece)),
-                         Kill, RPLimit);
-    auto MustColor = [&](Register R) {
-      if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
-          MRI->reg_nodbg_empty(R))
-        return;
-      if (colorOneInPlace(R))
-        return;
-      // Could not place R. When -amdgpu-ssa-recursive-recovery is ON, route
-      // through the recursive recovery (a reload remnant that cannot color is a
-      // strictly-shorter value → recurse; a genuinely infeasible point hits the
-      // honest point-over-pressure terminal). When OFF, keep the historical
-      // (misleading, but unchanged for byte-identical default) fatal.
-      if (EnableRecursiveRecovery) {
-        if (!recoverUncolorable(R, /*Depth=*/1))
-          reportPointOverPressure(R, IsVGPR, RPLimit, "self-split");
-        return;
-      }
-      std::string Msg;
-      raw_string_ostream OS(Msg);
-      OS << "SSARA: coloring-time recovery exhausted for " << printReg(R, TRI)
-         << " — function is infeasible at coloring time (needs more up-front "
-            "spilling)";
-      report_fatal_error(StringRef(Msg));
-    };
-    MustColor(Piece); // surviving stub
-    if (EnableRecursiveRecovery) {
-      // MustColor may recurse into recoverUncolorable → spillOneVMP, which
-      // APPENDS to Emitter->reloadedRegs(); snapshot before iterating.
-      SmallVector<Register, 8> Remnants;
-      for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-        Remnants.push_back(VMP.getVReg());
-      for (Register RD : Remnants)
-        MustColor(RD); // reload remnants
-    } else {
-      for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-        MustColor(VMP.getVReg()); // reload remnants
-    }
+  // A piece that cannot settle in a register is NOT memory-spilled here (the Floor
+  // owns memory-spilling). If nothing has been peeled yet it is a NoOp (driver
+  // floors the original Failed); if >=1 prefix was peeled the shorter remnant is
+  // handed back as Reduced for the driver to re-dispatch.
+  auto handBack = [&](Register Cur, unsigned Pieces) -> RecoveryResult {
+    if (Pieces == 0)
+      return RecoveryResult::NoOp;
+    Remnant = Cur;
+    return RecoveryResult::Reduced;
   };
 
   Register Cur = Failed;
   unsigned Pieces = 0;
   const unsigned MaxPieces = 64; // runaway guard
   while (Pieces < MaxPieces) {
-    if (!LIS->hasInterval(Cur))
-      return Pieces > 0; // already mutated: caller must not re-spill Failed
+    // Cur is either Failed (which color() must hand over WITH an interval) or a
+    // splitLiveRangeAt Tail (which computes its interval). A missing interval here
+    // is malformed input / a broken split — a real bug, not a normal exit.
+    assert(LIS->hasInterval(Cur) &&
+           "self-split: piece lost its live interval (malformed split/input)");
     const LiveInterval &CI = LIS->getInterval(Cur);
     SlotIndex S = CI.beginIndex(), E = CI.endIndex();
 
@@ -2578,13 +2641,9 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
       }
     }
 
-    // No free PR at S, or the free run does not even reach the next use
-    // (genuine over-pressure, not fragmentation — peeling here would grind the
-    // region into use-less confetti). This PIECE can't be settled in a register:
-    // spill it. If we have not mutated yet (Pieces==0, Cur==Failed) we can still
-    // cleanly hand the whole value to the caller's spill by returning false;
-    // otherwise we are mid-split and MUST spill this piece here to avoid orphaning
-    // it (the caller only re-spills the original Failed, not our tail pieces).
+    // No free PR at S, or the free run does not even reach the next use (genuine
+    // over-pressure, not fragmentation — peeling here would grind the region into
+    // use-less confetti). This piece can't settle in a register: hand it back.
     bool NoFreeRun = !BestPR;
     if (!NoFreeRun && BestBound < E) {
       SlotIndex FirstUse;
@@ -2597,16 +2656,9 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
         NoFreeRun = true;
     }
     if (NoFreeRun) {
-      // This piece cannot be settled in a register (no free PR at its start, or
-      // the free run does not reach its first use). Spill it — for the first
-      // piece this IS the whole Failed (same as a plain kill-at-def spill); for a
-      // tail it is the tight remainder. Uniform recovery: no "return false and
-      // hope the caller's whole-spill helps" — that would just move the crash for
-      // genuine over-pressure at the def.
       LLVM_DEBUG(dbgs() << "  self-split: piece " << printReg(Cur, TRI)
-                        << " cannot be placed -> spill it\n");
-      spillPiece(Cur);
-      return true;
+                        << " cannot be placed -> hand back\n");
+      return handBack(Cur, Pieces);
     }
 
     if (BestBound >= E) {
@@ -2615,14 +2667,13 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
       LLVM_DEBUG(dbgs() << "  self-split: colored final piece "
                         << printReg(Cur, TRI) << " -> " << TRI->getName(BestPR)
                         << " (" << (Pieces + 1) << " pieces total)\n");
-      return true;
+      return RecoveryResult::Resolved;
     }
 
     // Split at the boundary (where BestPR becomes occupied). splitLiveRangeAt
     // needs a clean non-PHI, mid-block instruction; if the boundary lands on a
     // PHI/gap, back up to the nearest earlier real instruction in (S, BestBound)
-    // (the head is still a prefix of the free run). If none exists, spill this
-    // piece rather than orphan it.
+    // (the head is still a prefix of the free run). If none exists, hand back.
     MachineInstr *SplitMI = LIS->getInstructionFromIndex(BestBound);
     SlotIndex Probe = BestBound;
     while ((!SplitMI || SplitMI->isPHI() || SplitMI->isDebugInstr()) &&
@@ -2633,15 +2684,12 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
     if (!SplitMI || SplitMI->isPHI() || SplitMI->isDebugInstr() ||
         LIS->getInstructionIndex(*SplitMI).getRegSlot() <= S) {
       LLVM_DEBUG(dbgs() << "  self-split: no clean split point for piece "
-                        << printReg(Cur, TRI) << " -> spill it\n");
-      spillPiece(Cur);
-      return true;
+                        << printReg(Cur, TRI) << " -> hand back\n");
+      return handBack(Cur, Pieces);
     }
     Register Tail = Emitter->splitLiveRangeAt(Cur, SplitMI->getIterator());
-    if (!Tail) {
-      spillPiece(Cur);
-      return true;
-    }
+    if (!Tail)
+      return handBack(Cur, Pieces);
     // Head piece (Cur, now [S,BestBound)) is free on BestPR: color it.
     commitColor(Cur, BestPR);
     LLVM_DEBUG(dbgs() << "  self-split: peeled piece " << printReg(Cur, TRI)
@@ -2651,18 +2699,17 @@ bool AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
     Cur = Tail;
     ++Pieces;
   }
-  // Hit the piece cap mid-split: spill whatever remains rather than orphan it.
-  LLVM_DEBUG(dbgs() << "  self-split: piece cap -> spill remainder "
+  // Hit the piece cap mid-split: hand back the remainder (Pieces>0 here).
+  LLVM_DEBUG(dbgs() << "  self-split: piece cap -> hand back remainder "
                     << printReg(Cur, TRI) << "\n");
-  spillPiece(Cur);
-  return true;
+  return handBack(Cur, Pieces);
 }
 
 void AMDGPUSSARegisterAllocator::reportPointOverPressure(Register R,
                                                          bool IsVGPR,
                                                          unsigned RPLimit,
                                                          const char *Ctx) {
-  // Honest terminal (recursive-recovery ON only). Find the point in R's range
+  // Honest terminal for the classifier's no-pattern floor. Find the point in R's range
   // with the most simultaneously-live dwords of R's register file and report the
   // REAL numbers. If that peak exceeds RPLimit no coloring-time recovery exists
   // (more values demand registers at one instant than the file has); otherwise
@@ -2715,24 +2762,94 @@ void AMDGPUSSARegisterAllocator::reportPointOverPressure(Register R,
   report_fatal_error(StringRef(Msg));
 }
 
-bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed,
-                                                    unsigned Depth) {
-  // Coloring-time recovery for one value color() could not place. Behavior when
-  // -amdgpu-ssa-recursive-recovery is OFF is byte-identical to the old inline
-  // dispatch (see runOnMachineFunction): same order, same gates, same
-  // ColorInPlace-with-assert. When ON: blocker/self-split run unconditionally as
-  // tier-1, and a reload redef that cannot color re-enters this method
-  // recursively (Part 2), bottoming out at an honest point-over-pressure terminal
-  // (Part 3). Returns true if Failed was resolved (colored or spilled with its
-  // reload redefs placed).
-  const bool Recursive = EnableRecursiveRecovery;
+void AMDGPUSSARegisterAllocator::emitRecoveryWindow(
+    Register Failed, const RecoveryWindow &RW) const {
+  SmallVector<unsigned, 16> CrosserIdx;
+  for (Register C : RW.Crossers)
+    CrosserIdx.push_back(C.virtRegIndex()); // width derived consumer-side
+  // Window endpoints are identified by their BLOCK NUMBERS, never SlotIndex
+  // numeric distance — layout/ordinal order is not program order (comparing slot
+  // distances is forbidden and previously produced a phantom back-edge).
+  MachineBasicBlock *StartBB = LIS->getMBBFromIndex(RW.Start);
+  MachineBasicBlock *EndBB = LIS->getMBBFromIndex(RW.End);
+  StringRef StopStr;
+  switch (RW.Stop) {
+  case WindowStop::RPRecovered:    StopStr = "RPRecovered"; break;
+  case WindowStop::ForkDivergence: StopStr = "ForkDivergence"; break;
+  case WindowStop::BackEdge:       StopStr = "BackEdge"; break;
+  case WindowStop::Cap:            StopStr = "Cap"; break;
+  }
+  Reporter->recoveryWindow(Failed.virtRegIndex(),
+                           StartBB ? StartBB->getNumber() : -1,
+                           EndBB ? EndBB->getNumber() : -1, CrosserIdx, StopStr,
+                           RW.WebPhi ? RW.WebPhi.virtRegIndex() : 0,
+                           RW.UncoloredWidth, RW.RPOvershoot);
+}
 
-  // A value coloring could not place: try to recover it — split (blocker or
-  // self), else spill+reload — regardless of width. A WIDE tuple that fails is
-  // usually not over-pressure but an aligned-placement gap (no N aligned free
-  // regs even though N are free scattered); it may still succeed via splitting or
-  // a spill whose reloads decompose to per-dword. Do NOT assert on width here —
-  // let it try its luck; only genuine infeasibility remains.
+AMDGPUSSARegisterAllocator::RecoveryState
+AMDGPUSSARegisterAllocator::classifyRecovery(const RecoveryWindow &RW) const {
+  // FSM entry: classify RW into the FIRST handler state (or a terminal). Cheap
+  // structural + feasibility preconditions, in priority order. Heavy proof lives in
+  // the precondition helpers (reload-RP), evaluated ONCE here so the chosen handler
+  // does not spill-then-fail.
+  const TargetRegisterClass *RC = MRI->getRegClass(RW.Uncolored);
+  bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+  const MachineFunction &MF = MRI->getMF();
+  unsigned RPLimit = IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+
+  // 1. WEB — the value feeds a PHI (divergent-diamond / loop-carried value merge).
+  if (EnablePhiWebSpill && RW.WebPhi)
+    return RecoveryState::Web;
+  // 2. CROSS-LIVER — a cleanly-spillable blocker exists (live-through OR
+  //    born-in-F; hasCleanCrossLiver covers both). This IS the remnant router
+  //    (option a): a remnant that needs a blocker freed matches here; one that
+  //    can be peeled falls through to SelfSplit.
+  if (!RW.Crossers.empty() && hasCleanCrossLiver(RW.Uncolored, RPLimit))
+    return RecoveryState::CrossLiver;
+  // 3. SELF-SPLIT — the value is the long liver; peel register-resident prefixes.
+  //    (No cheap precondition — trySelfSplitColor reports NoOp if it can't peel,
+  //    and the FSM then transitions to the terminal fork.) Enter whenever there
+  //    are crossers to peel around; else go straight to the terminal fork.
+  if (!RW.Crossers.empty())
+    return RecoveryState::SelfSplit;
+  // 4. TERMINAL — nothing structural applies. Memory-spill Failed iff a reload
+  //    fits (Floor); else genuine point-over-pressure (Infeasible).
+  return floorViable(RW.Uncolored, IsVGPR, RPLimit) ? RecoveryState::Floor
+                                                    : RecoveryState::Infeasible;
+}
+
+AMDGPUSSARegisterAllocator::RecoveryState
+AMDGPUSSARegisterAllocator::nextRecoveryState(RecoveryState S,
+                                              RecoveryResult R) const {
+  // Recovery transition table (see project_recovery_pattern_classifier). The
+  // driver runs S's handler, gets R, and advances here. This maps the DECLINE
+  // outcome (NoOp) to the next state; Resolved returns OK from the driver, and
+  // Reduced is handled IN the driver by re-classifying the strictly-shorter
+  // remnant (option a: classifier priority is the router). So this table is a
+  // FORWARD-ONLY chain Web -> CrossLiver -> SelfSplit -> Floor (acyclic; the only
+  // back-edges are Reduced re-classifications, each on a shorter candidate).
+  (void)R;
+  switch (S) {
+  case RecoveryState::Web:
+    return RecoveryState::CrossLiver;
+  case RecoveryState::CrossLiver:
+    return RecoveryState::SelfSplit;
+  case RecoveryState::SelfSplit:
+    return RecoveryState::Floor;
+  default:
+    return RecoveryState::Floor;
+  }
+}
+
+bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
+  // Coloring-time recovery FSM driver. classifyRecovery gives the first handler
+  // STATE; a handler's NoOp advances the FORWARD-ONLY chain (Web -> CrossLiver ->
+  // SelfSplit -> Floor) via nextRecoveryState; a handler's Reduced hands back a
+  // STRICTLY SHORTER remnant, which we RE-CLASSIFY from scratch (option a: the
+  // classifier priority IS the remnant router). Termination without a step cap:
+  // the forward chain is acyclic, and every back-edge (Reduced) strictly shrinks
+  // the candidate (bounded below by 0). No recursion; a redef that cannot color
+  // in place is re-queued to the caller's no-progress worklist fixpoint.
   const TargetRegisterClass *RC = MRI->getRegClass(Failed);
   bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
   const MachineFunction &MF = MRI->getMF();
@@ -2740,178 +2857,151 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed,
 
   LLVM_DEBUG(dbgs() << "FALLBACK for " << printReg(Failed, TRI) << " ["
                     << LIS->getInterval(Failed).beginIndex() << ","
-                    << LIS->getInterval(Failed).endIndex()
-                    << ") SplitLiveRanges=" << EnableSplitLiveRanges
-                    << " Recursive=" << Recursive << " Depth=" << Depth << "\n");
+                    << LIS->getInterval(Failed).endIndex() << ")\n");
 
-  // [Recovery classifier, Stage 1] OBSERVE + LOG ONLY. Collect the recovery
-  // window for the failing value and emit it forensically. Side-effect-free:
-  // this changes no decision below (it is wired nowhere in the dispatch path);
-  // it exists so the tech lead can SEE the windows the classifier computes on the
-  // real colorfail values before any stage drives on them.
-  if (EnableRecursiveRecovery && SSAForensicReporter::enabled()) {
-    RecoveryWindow RW = collectRecoveryWindow(Failed);
-    SmallVector<unsigned, 16> CrosserIdx;
-    for (Register C : RW.Crossers)
-      CrosserIdx.push_back(C.virtRegIndex()); // width derived consumer-side from ID
-    // Window endpoints are identified by their BLOCK NUMBERS, never SlotIndex
-    // numeric distance — layout/ordinal order is not program order (comparing
-    // slot distances is forbidden and previously produced a phantom back-edge).
-    MachineBasicBlock *StartBB = LIS->getMBBFromIndex(RW.Start);
-    MachineBasicBlock *EndBB = LIS->getMBBFromIndex(RW.End);
-    StringRef StopStr;
-    switch (RW.Stop) {
-    case WindowStop::RPRecovered:    StopStr = "RPRecovered"; break;
-    case WindowStop::ForkDivergence: StopStr = "ForkDivergence"; break;
-    case WindowStop::BackEdge:       StopStr = "BackEdge"; break;
-    case WindowStop::Cap:            StopStr = "Cap"; break;
-    }
-    Reporter->recoveryWindow(Failed.virtRegIndex(),
-                             StartBB ? StartBB->getNumber() : -1,
-                             EndBB ? EndBB->getNumber() : -1, CrosserIdx, StopStr,
-                             RW.WebPhi ? RW.WebPhi.virtRegIndex() : 0,
-                             RW.UncoloredWidth, RW.RPOvershoot);
-  }
-
-  // Defensive backstop: termination is guaranteed by strictly-shrinking reload
-  // ranges (each reload lives [reload-pt, next-use], shorter than its source), so
-  // this should never trigger. If it does, a bug broke that argument — bail
-  // honestly instead of overflowing the stack.
-  if (Recursive && Depth >= MaxRecoveryDepth)
-    reportPointOverPressure(Failed, IsVGPR, RPLimit, "recursion-depth-cap");
-
-  // TIER 1 — split/spill AROUND a live-through blocker: Failed has no through-lane
-  // across its range, but the file is point-feasible — some physreg's only
-  // occupant across Failed's (short) range is a LIVE-THROUGH liver B (no use
-  // inside). Spilling B across frees B's physreg P over Failed's range with no
-  // interior reload; color Failed into P and keep B's reload in P too. Hack-
-  // compatible (stays SSA). Runs unconditionally under recursive-recovery (it is
-  // the right first move and returns false cleanly when inapplicable); otherwise
-  // gated by -amdgpu-ssa-split-live-ranges to preserve the default path.
-  if ((Recursive || EnableSplitLiveRanges) &&
-      trySplitColorViaBlocker(Failed, RPLimit)) {
-    LLVM_DEBUG(dbgs() << "  FALLBACK: colored via split-blocker\n");
-    if (SSAForensicReporter::enabled())
-      Reporter->transformation("split-blocker", Failed.virtRegIndex());
-    return true;
-  }
-  // TIER 1b — SELF-SPLIT: Failed is itself the long liver (no separate blocker).
-  // Peel off maximal register-resident pieces of Failed's own range, coloring
-  // each into a PR free across it. Succeeds when point-feasible; returns false
-  // (falls through to memory spill) on genuine over-pressure or an unclean split
-  // boundary. Same gating as blocker-split above.
-  if ((Recursive || EnableSplitLiveRanges) && trySelfSplitColor(Failed)) {
-    LLVM_DEBUG(dbgs() << "  FALLBACK: colored via self-split\n");
-    if (SSAForensicReporter::enabled())
-      Reporter->transformation("self-split", Failed.virtRegIndex());
-    return true;
-  }
-  LLVM_DEBUG(dbgs() << "  FALLBACK: memory-spill Failed itself\n");
-
-  // Place a fresh vreg (stub / reload redef) in-place against the frozen
-  // ColorMap. OFF: assert on failure (the old, dominant crash cluster). ON:
-  // recurse — a reload redef that cannot color re-enters recovery (it is a
-  // strictly-shorter value, so recursion is well-founded), and a value that
-  // genuinely cannot be recovered hits the honest point-over-pressure terminal.
+  // Color a fresh vreg (stub / reload redef) in place; a redef that cannot color
+  // is re-queued to the worklist (the caller's no-progress fixpoint is its bottom).
   auto ColorInPlace = [&](Register R) {
     if (!R.isVirtual() || !LIS->hasInterval(R) || ColorMap.count(R) ||
         MRI->reg_nodbg_empty(R))
       return;
-    // Flush the forensic report NOW: colorOneInPlace can hit the hard assert /
-    // fatal below, which abort()s before endRun runs and would otherwise lose the
-    // buffered obs0. flushNow is idempotent, so if colorOneInPlace succeeds the
-    // later endRun is a no-op emit and no double-write occurs.
     if (SSAForensicReporter::enabled())
       Reporter->flushNow();
-    bool OK = colorOneInPlace(R);
-    if (!Recursive) {
-      assert(OK && "width-1 remainder must be colorable");
-      (void)OK;
-      return;
-    }
-    if (OK)
-      return;
-    // Could not place R in a register. Decide honestly: if R's range peaks over
-    // the file limit, that instant is genuinely infeasible (no recovery exists) —
-    // terminate with real numbers. Otherwise recurse: recovery will spill R,
-    // shortening it, until it colors or a point-over-pressure instant is exposed.
-    if (!recoverUncolorable(R, Depth + 1))
-      reportPointOverPressure(R, IsVGPR, RPLimit, "spill-floor");
+    if (!colorOneInPlace(R))
+      UncolorableVRegs.push_back(R);
   };
 
-  // WEB DISPATCH (WIP — SUSPECT: introduced the corpus "Use not jointly dominated
-  // by defs" SSA-corruption regression on some 1024 configs). A Failed value that
-  // is a PHI result / PHI operand cannot be resolved by a plain spillOneVMP (its
-  // reload lands at the saturated join edge -> colorOneInPlace assert, the %1036
-  // case). Route it through the web spill instead. Kept gated on its own suspect
-  // flag and UNCHANGED under recursive-recovery.
-  Emitter->beginPass(IsVGPR);
-  if (EnablePhiWebSpill) {
-    MachineInstr *FDef = MRI->getUniqueVRegDef(Failed);
-    Register WebRoot;
-    if (FDef && FDef->isPHI())
-      WebRoot = Failed;
-    else
-      for (MachineInstr &U : MRI->use_nodbg_instructions(Failed))
-        if (U.isPHI()) {
-          WebRoot = U.getOperand(0).getReg();
-          break;
-        }
-    if (WebRoot) {
-      auto ColorFreshVReg = [&](Register C) {
-        if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
-          colorOneInPlace(C);
-      };
-      SlotIndex Invalid;
-      if (Emitter->spillPhiWeb(WebRoot, RPLimit, Invalid, Invalid,
-                               ColorFreshVReg)) {
-        LLVM_DEBUG(dbgs() << "  FALLBACK: web-spilled root "
-                          << printReg(WebRoot, TRI) << "\n");
+  auto curLen = [&](Register R) {
+    return LIS->hasInterval(R)
+               ? LIS->getInterval(R).beginIndex().distance(
+                     LIS->getInterval(R).endIndex())
+               : 0u;
+  };
+
+  Register Cur = Failed;
+  RecoveryWindow RW = collectRecoveryWindow(Cur);
+  if (SSAForensicReporter::enabled())
+    emitRecoveryWindow(Cur, RW);
+  RecoveryState State = classifyRecovery(RW);
+
+  // Re-classify a STRICTLY SHORTER remnant (the only back-edge). \p LenBefore is
+  // Cur's length captured BEFORE the handler ran: a born-in-F spillBlocker hands
+  // back Failed truncated IN PLACE (Rem == Cur, same vreg), so the remnant must be
+  // measured against the pre-dispatch length, not against Cur's now-truncated one.
+  // The assert makes the termination argument load-bearing: a Reduced that did not
+  // shrink the candidate is a handler bug (would loop forever).
+  auto reclassify = [&](Register Rem, unsigned LenBefore) -> RecoveryState {
+    assert(curLen(Rem) < LenBefore &&
+           "Reduced must hand back a strictly shorter remnant");
+    (void)LenBefore;
+    Cur = Rem;
+    RecoveryWindow NRW = collectRecoveryWindow(Cur);
+    if (SSAForensicReporter::enabled())
+      emitRecoveryWindow(Cur, NRW);
+    return classifyRecovery(NRW);
+  };
+
+  while (true) {
+    switch (State) {
+    case RecoveryState::Web:
+      if (PhiWeb Web = closePhiWeb(Cur);
+          Web.valid() && webReloadFeasible(Web, IsVGPR, RPLimit)) {
+        Emitter->beginPass(IsVGPR);
+        auto CFV = [&](Register C) {
+          if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
+            colorOneInPlace(C);
+        };
+        Emitter->spillPhiWeb(Web, RPLimit, CFV);
         if (SSAForensicReporter::enabled())
-          Reporter->transformation("phi-web-spill", WebRoot.virtRegIndex());
+          Reporter->transformation("phi-web-spill", Web.Root.virtRegIndex());
         for (Register G : Emitter->lastWebGround())
           ColorInPlace(G);
         for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
           ColorInPlace(VMP.getVReg());
-        return true;
+        return true; // OK
       }
+      State = nextRecoveryState(State, RecoveryResult::NoOp);
+      continue;
+
+    case RecoveryState::CrossLiver: {
+      Register Rem;
+      unsigned LenBefore = curLen(Cur);
+      RecoveryResult R = spillBlocker(Cur, RPLimit, Rem);
+      if (R == RecoveryResult::Resolved) {
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("spill-blocker", Cur.virtRegIndex());
+        return true; // OK
+      }
+      if (R == RecoveryResult::Reduced) {
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("spill-blocker", Cur.virtRegIndex());
+        // Born-in-F freed F's tail; Rem is Cur truncated in place. The truncation
+        // is real ONLY if Failed's interval actually shrank — splitLiveRangeAt
+        // redirects by reaching-VNI, so a multi-VNI Failed whose near-end use
+        // reads a different VNI keeps its endpoint. When it DID shrink,
+        // re-dispatch the shorter remnant; otherwise the blocker spill still
+        // freed a register, so advance to SelfSplit to peel with the new room.
+        if (curLen(Rem) < LenBefore) {
+          State = reclassify(Rem, LenBefore);
+          continue;
+        }
+        State = nextRecoveryState(State, RecoveryResult::NoOp); // -> SelfSplit
+        continue;
+      }
+      State = nextRecoveryState(State, R); // NoOp -> SelfSplit
+      continue;
+    }
+
+    case RecoveryState::SelfSplit: {
+      Register Rem;
+      unsigned LenBefore = curLen(Cur);
+      RecoveryResult R = trySelfSplitColor(Cur, Rem);
+      if (R == RecoveryResult::Resolved) {
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("self-split", Cur.virtRegIndex());
+        return true; // OK
+      }
+      if (R == RecoveryResult::Reduced) {
+        // Peeled >=1 prefix; re-dispatch the shorter remnant (may now expose a
+        // clean spillBlocker candidate the full-length value lacked).
+        State = reclassify(Rem, LenBefore);
+        continue;
+      }
+      State = nextRecoveryState(State, R); // NoOp -> Floor
+      continue;
+    }
+
+    case RecoveryState::Floor: {
+      // Terminal decision on the CURRENT candidate: memory-spill iff a reload
+      // fits, else genuine over-pressure.
+      if (!floorViable(Cur, IsVGPR, RPLimit))
+        reportPointOverPressure(Cur, IsVGPR, RPLimit, "no-reload-fits"); // noreturn
+      LLVM_DEBUG(dbgs() << "  spill-self floor\n");
+      Emitter->beginPass(IsVGPR);
+      MachineInstr *DefMI = MRI->getVRegDef(Cur);
+      assert(DefMI && "uncolorable value must have a def in SSA");
+      SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
+      if (SSAForensicReporter::enabled())
+        Reporter->transformation("memory-spill", Cur.virtRegIndex());
+      Emitter->spillOneVMP(VRegMaskPair(Cur, MRI->getMaxLaneMaskForVReg(Cur)),
+                           KillIdx, RPLimit);
+      SmallVector<Register, 8> Redefs;
+      for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+        Redefs.push_back(VMP.getVReg());
+      ColorInPlace(Cur);
+      for (Register RD : Redefs)
+        ColorInPlace(RD);
+      return true; // OK
+    }
+
+    case RecoveryState::Infeasible:
+      reportPointOverPressure(Cur, IsVGPR, RPLimit, "classified-infeasible"); // noreturn
+
+    case RecoveryState::Start:
+    case RecoveryState::OK:
+      llvm_unreachable("unexpected recovery state in loop");
     }
   }
-
-  // SPILL-HOMELESS FLOOR: send Failed to memory (store-at-def + dominance
-  // reloads), then color its surviving stub and each fresh reload redef in place.
-  MachineInstr *DefMI = MRI->getVRegDef(Failed);
-  assert(DefMI && "uncolorable value must have a def in SSA");
-  SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
-  LLVM_DEBUG(dbgs() << "SSA RA: spilling uncolorable " << printReg(Failed, TRI)
-                    << " (kill-at-def) and coloring reloads in place\n");
-  if (SSAForensicReporter::enabled())
-    Reporter->transformation("memory-spill", Failed.virtRegIndex());
-
-  // RP-gated reload placement (SSASpillEmitter NeedsReload) keeps each reload from
-  // spanning an RP-tight region, so the freed pressure is real and the remainders
-  // settle in place.
-  Emitter->spillOneVMP(VRegMaskPair(Failed, MRI->getMaxLaneMaskForVReg(Failed)),
-                       KillIdx, RPLimit);
-
-  if (!Recursive) {
-    ColorInPlace(Failed); // (1) original value's surviving stub
-    for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-      ColorInPlace(VMP.getVReg()); // (2) fresh reload redefs
-    return true;
-  }
-
-  // Recursive path: ColorInPlace may recurse into recoverUncolorable, which calls
-  // spillOneVMP again and APPENDS to the shared Emitter->reloadedRegs() vector —
-  // iterating it by reference would invalidate the iterator. Snapshot the redef
-  // vregs first, then place each (recursing on any that cannot color).
-  SmallVector<Register, 8> Redefs;
-  for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-    Redefs.push_back(VMP.getVReg());
-  ColorInPlace(Failed); // (1) original value's surviving stub
-  for (Register RD : Redefs)
-    ColorInPlace(RD); // (2) fresh reload redefs (recurse if uncolorable)
-  return true;
 }
 
 void AMDGPUSSARegisterAllocator::color() {
@@ -4722,17 +4812,49 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
 
   if (!UncolorableVRegs.empty()) {
     NumTierSpills += UncolorableVRegs.size();
-    for (Register Failed : UncolorableVRegs) {
-      // WIP (under investigation): a prior web spill in THIS loop may have already
-      // resolved this value (web-spilling one root erases sibling PHIs / empties
-      // web members that are themselves in UncolorableVRegs). Skip a def-less/empty
-      // value, else getVRegDef asserts below.
-      if (ColorMap.count(Failed) || MRI->reg_nodbg_empty(Failed) ||
-          !LIS->hasInterval(Failed) || LIS->getInterval(Failed).empty())
+    // Worklist fixpoint. recoverUncolorable resolves its value (colors or spills
+    // it) and RE-QUEUES any fresh redef it cannot color (ColorInPlace ->
+    // push_back). A re-queued value is retried in a later pass, when other spills
+    // may have freed RP. Stop when a full pass COLORS nothing new -> the survivors
+    // are genuine over-pressure.
+    //
+    // Consume by INDEX into a local Register: recoverUncolorable push_backs into
+    // this same SmallVector (possibly REALLOCATING), so a reference/iterator held
+    // across the call would dangle.
+    auto colored = [&](Register R) { return ColorMap.count(R) != 0; };
+    auto skip = [&](Register R) { // def-less/empty: not a live value to process
+      return MRI->reg_nodbg_empty(R) || !LIS->hasInterval(R) ||
+             LIS->getInterval(R).empty();
+    };
+    size_t Cursor = 0, PassEnd = UncolorableVRegs.size();
+    bool Progress = false;
+    while (Cursor < UncolorableVRegs.size()) {
+      Register Failed = UncolorableVRegs[Cursor++];
+      if (colored(Failed)) {
+        Progress = true; // resolved (possibly by a prior web spill this run)
+      } else if (!skip(Failed)) {
+        recoverUncolorable(Failed);
+        if (colored(Failed))
+          Progress = true;
+      }
+      if (Cursor == PassEnd) { // drain-pass boundary
+        if (!Progress)
+          break;               // fixpoint: nothing colored this pass
+        Progress = false;
+        PassEnd = UncolorableVRegs.size(); // absorb values queued this pass
+      }
+    }
+    // Survivors still live + uncolored after a no-progress pass are genuinely
+    // infeasible: honest terminal, per value (names the real over-pressure point).
+    for (size_t I = Cursor; I < UncolorableVRegs.size(); ++I) {
+      Register R = UncolorableVRegs[I];
+      if (colored(R) || skip(R))
         continue;
-      // Dispatch to the per-value recovery (Part 1: dispatch factored into a
-      // method; behavior-identical when -amdgpu-ssa-recursive-recovery is OFF).
-      recoverUncolorable(Failed);
+      const TargetRegisterClass *RC = MRI->getRegClass(R);
+      bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+      unsigned RPLimit =
+          IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+      reportPointOverPressure(R, IsVGPR, RPLimit, "worklist-drained");
     }
   }
 

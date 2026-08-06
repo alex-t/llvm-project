@@ -55,6 +55,25 @@ class MachineDominatorTree;
 //     created a register of a specific class), caller can provide NewVReg
 //   - This gives full control over register class selection when needed
 //===----------------------------------------------------------------------===//
+
+/// A frozen deep copy of a vreg's LiveInterval plus the allocator backing its
+/// subrange VNInfos. The two are a lifetime pair: the subranges live in Alloc,
+/// so LI must be destroyed before Alloc — the member order below guarantees it
+/// (members destroy in reverse declaration order). Produced by
+/// MachineLaneSSAUpdater::freezeInterval() and passed back to
+/// repairSSAForNewDef() so several incremental redefs of the same vreg share ONE
+/// snapshot without re-freezing. Move-only (it owns the allocator).
+struct FrozenInterval {
+  BumpPtrAllocator Alloc;
+  std::unique_ptr<LiveInterval> LI; // declared after Alloc -> destroyed first
+  FrozenInterval() = default;
+  FrozenInterval(FrozenInterval &&) = default;
+  FrozenInterval &operator=(FrozenInterval &&) = default;
+  FrozenInterval(const FrozenInterval &) = delete;
+  FrozenInterval &operator=(const FrozenInterval &) = delete;
+  bool valid() const { return LI != nullptr; }
+};
+
 class MachineLaneSSAUpdater {
 public:
   MachineLaneSSAUpdater(MachineFunction &MF, LiveIntervals &LIS,
@@ -79,8 +98,28 @@ public:
   //   5. Perform SSA repair (insert PHIs, rewrite uses)
   //
   // Returns: The newly created SSA-repaired virtual register
+  //
+  //   Oracle: optional caller-owned frozen reaching snapshot (see
+  //   freezeInterval). When non-null it is used as the reaching oracle instead of
+  //   the internal self-freeze — the caller guarantees it was taken AFTER all
+  //   redefs of OrigVReg in this session were emitted. When null (default) the
+  //   updater self-freezes on the first call per OrigVReg; standalone callers pass
+  //   nothing and behave exactly as before.
+  // (Oracle is non-const only because the internal reaching-query helpers take a
+  // non-const LiveInterval&; the updater never mutates the snapshot. Making those
+  // helpers const-correct would let this be const FrozenInterval* — a later
+  // polish, kept out of this additive change.)
   Register repairSSAForNewDef(MachineInstr &NewDefMI, Register OrigVReg,
-                              SmallVectorImpl<MachineOperand *> &PHIRegDefOps);
+                              SmallVectorImpl<MachineOperand *> &PHIRegDefOps,
+                              FrozenInterval *Oracle = nullptr);
+
+  /// Take a frozen deep copy of \p OrigVReg's current LiveInterval (value numbers
+  /// and subranges preserved) with its own backing allocator. The caller owns the
+  /// result and passes it to repairSSAForNewDef() as the reaching oracle. This is
+  /// the same content the updater would self-freeze — factored out so a caller
+  /// emitting several redefs can freeze ONCE, after placement, and skip
+  /// resetSession() churn. Read-only w.r.t. the live interval (deep copy).
+  FrozenInterval freezeInterval(Register OrigVReg) const;
 
   /// Invalidate the per-OrigVReg repair session so the next repairSSAForNewDef
   /// re-freezes OrigVReg's interval. Required when new defs (e.g. spiller
@@ -173,6 +212,18 @@ private:
   // copy, which is all the lookup needs).
   BumpPtrAllocator FrozenAlloc;
   std::unique_ptr<LiveInterval> FrozenOrigLI;
+
+  // When a caller passes an external FrozenInterval oracle to repairSSAForNewDef,
+  // this points at its LiveInterval and the self-frozen FrozenOrigLI is left
+  // empty. Reaching queries read frozenLI() which returns this when set. Null =>
+  // self-freeze path (FrozenOrigLI). Reset per session.
+  LiveInterval *ExternalFrozen = nullptr;
+
+  // The reaching-def oracle in effect this session: the caller-provided external
+  // snapshot when set, else the self-frozen copy. All reaching queries go here.
+  LiveInterval *frozenLI() const {
+    return ExternalFrozen ? ExternalFrozen : FrozenOrigLI.get();
+  }
 
   // Dedup for the reaching-VNI path's per-subrange PHIs (approach A): reuse the
   // PHI already built for a (join block, lane group) instead of creating a

@@ -51,9 +51,24 @@ using namespace llvm;
 // MachineLaneSSAUpdater Implementation
 //===----------------------------------------------------------------------===//
 
+FrozenInterval MachineLaneSSAUpdater::freezeInterval(Register OrigVReg) const {
+  // Deep copy of OrigVReg's current interval into a caller-owned allocator. Same
+  // content the session self-freeze produces: assign copies the value numbers,
+  // and each subrange is copied by lane mask. Read-only w.r.t. the live interval.
+  FrozenInterval F;
+  F.LI = std::make_unique<LiveInterval>(OrigVReg, 0.0f);
+  if (LIS.hasInterval(OrigVReg)) {
+    LiveInterval &Src = LIS.getInterval(OrigVReg);
+    F.LI->assign(Src, F.Alloc);
+    for (const LiveInterval::SubRange &S : Src.subranges())
+      F.LI->createSubRangeFrom(F.Alloc, S.LaneMask, S);
+  }
+  return F;
+}
+
 Register MachineLaneSSAUpdater::repairSSAForNewDef(
     MachineInstr &NewDefMI, Register OrigVReg,
-    SmallVectorImpl<MachineOperand *> &PHIRegDefOps) {
+    SmallVectorImpl<MachineOperand *> &PHIRegDefOps, FrozenInterval *Oracle) {
   LLVM_DEBUG(dbgs() << "MachineLaneSSAUpdater::repairSSAForNewDef VReg="
                     << OrigVReg << "\n");
 
@@ -67,22 +82,30 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
     LanePHIs.clear();
     SuperUseRSCache.clear();
 
-    // Freeze a deep copy of OrigVReg's original LiveInterval as the
-    // reaching-def oracle for this session. Must be taken BEFORE any def is
-    // renamed, since renaming (in place) removes that def's VNInfo from the
-    // live OrigVReg interval when it is later recomputed. The copy preserves
-    // each VNInfo's def SlotIndex and isPHIDef flag, which is all reaching
-    // resolution needs. Destroy the previous frozen interval BEFORE reclaiming
-    // its backing allocator: its subranges live in FrozenAlloc, so resetting
-    // the allocator first makes the old interval's destructor double-free them.
+    // Reaching-def oracle for this session: a frozen deep copy of OrigVReg's
+    // interval whose VNInfos (def SlotIndex + isPHIDef) survive the in-place
+    // renames done during repair (renaming strips a def's VNInfo from the live
+    // interval when it is recomputed). Two sources:
+    //  - EXTERNAL: the caller froze it once, AFTER emitting all redefs, and
+    //    passes it in. Point at it; leave the self-frozen copy empty. This lets a
+    //    caller emitting several redefs of one vreg share ONE snapshot without
+    //    resetSession() churn between calls.
+    //  - SELF: no oracle -> freeze here (default, standalone callers). Reset the
+    //    old copy BEFORE its allocator, else the subranges (owned by FrozenAlloc)
+    //    are double-freed.
     FrozenOrigLI.reset();
     FrozenAlloc.Reset();
-    FrozenOrigLI = std::make_unique<LiveInterval>(OrigVReg, 0.0f);
-    if (LIS.hasInterval(OrigVReg)) {
-      LiveInterval &Src = LIS.getInterval(OrigVReg);
-      FrozenOrigLI->assign(Src, FrozenAlloc);
-      for (const LiveInterval::SubRange &S : Src.subranges())
-        FrozenOrigLI->createSubRangeFrom(FrozenAlloc, S.LaneMask, S);
+    if (Oracle && Oracle->valid()) {
+      ExternalFrozen = Oracle->LI.get();
+    } else {
+      ExternalFrozen = nullptr;
+      FrozenOrigLI = std::make_unique<LiveInterval>(OrigVReg, 0.0f);
+      if (LIS.hasInterval(OrigVReg)) {
+        LiveInterval &Src = LIS.getInterval(OrigVReg);
+        FrozenOrigLI->assign(Src, FrozenAlloc);
+        for (const LiveInterval::SubRange &S : Src.subranges())
+          FrozenOrigLI->createSubRangeFrom(FrozenAlloc, S.LaneMask, S);
+      }
     }
   }
 
@@ -315,13 +338,13 @@ MachineLaneSSAUpdater::insertLaneAwarePHI(Register OrigVReg,
         AllCreatedPHIs.push_back({PHIResult, Lane});
     }
   };
-  if (FrozenOrigLI) {
-    if (FrozenOrigLI->hasSubRanges()) {
-      for (const LiveInterval::SubRange &S : FrozenOrigLI->subranges())
+  if (LiveInterval *Frozen = frozenLI()) {
+    if (Frozen->hasSubRanges()) {
+      for (const LiveInterval::SubRange &S : Frozen->subranges())
         if ((S.LaneMask & DefMask).any())
           PlacePHIsFor(S, S.LaneMask);
     } else {
-      PlacePHIsFor(*FrozenOrigLI, DefMask);
+      PlacePHIsFor(*Frozen, DefMask);
     }
   }
   LLVM_DEBUG(dbgs() << "  PHI insertion complete. Created "
@@ -364,7 +387,7 @@ MachineOperand *MachineLaneSSAUpdater::createPHIInBlockReaching(
 
   for (MachineBasicBlock *Pred : JoinMBB.predecessors()) {
     SlotIndex EndP = LIS.getMBBEndIdx(Pred);
-    VNInfo *V = reachingVNIForLaneGroup(*FrozenOrigLI, Lane, EndP);
+    VNInfo *V = reachingVNIForLaneGroup(*frozenLI(), Lane, EndP);
 
     if (const RenamedDef *RD = renamedForReachingVNI(V)) {
       // Extract Lane from the renamed vreg: rebase Lane into its namespace.
@@ -443,7 +466,7 @@ void MachineLaneSSAUpdater::rewriteUseReaching(
     DefSlot = LIS.getInstructionIndex(*DefMI).getRegSlot(EC);
   }
   SmallVector<std::pair<LaneBitmask, VNInfo *>, 4> Pieces;
-  collectReachingVNIs(*FrozenOrigLI, OpMask & MaskToRewrite, UsePt, Pieces);
+  collectReachingVNIs(*frozenLI(), OpMask & MaskToRewrite, UsePt, Pieces);
   LaneBitmask Owned = LaneBitmask::getNone();
   for (auto &[L, V] : Pieces) {
     if (!V)
@@ -867,16 +890,17 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
           return true;
       return false;
     };
-    if (FrozenOrigLI->hasSubRanges()) {
-      for (const LiveInterval::SubRange &S : FrozenOrigLI->subranges())
+    LiveInterval *Frozen = frozenLI();
+    if (Frozen->hasSubRanges()) {
+      for (const LiveInterval::SubRange &S : Frozen->subranges())
         if (HasRealDef(S))
           RealDef |= S.LaneMask;
-    } else if (HasRealDef(*FrozenOrigLI))
+    } else if (HasRealDef(*Frozen))
       RealDef = MRI.getMaxLaneMaskForVReg(OldVR);
   }
 
   SmallVector<std::pair<LaneBitmask, VNInfo *>, 4> OldPieces;
-  collectReachingVNIs(*FrozenOrigLI, LanesFromOld & RealDef, QueryIdx, OldPieces);
+  collectReachingVNIs(*frozenLI(), LanesFromOld & RealDef, QueryIdx, OldPieces);
   // collectReachingVNIs only covers lanes that have a subrange; any remaining
   // old lanes have no establishing def and are undef here.
   LaneBitmask Covered = LaneBitmask::getNone();

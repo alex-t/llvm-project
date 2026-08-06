@@ -139,120 +139,20 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
   emitReloadsAndRepairSSA(Info);
 }
 
-bool SSASpillEmitter::spillPhiWeb(
-    Register PhiResult, unsigned RPLimit, SlotIndex RegS, SlotIndex RegE,
+void SSASpillEmitter::spillPhiWeb(
+    const PhiWeb &Web, unsigned RPLimit,
     llvm::function_ref<void(Register)> ColorFreshVReg) {
   CurRPLimit = RPLimit;
   LastWebErased.clear();
   LastWebGround.clear();
-  LastWebPeakRelief = 0;
-  // getUniqueVRegDef throughout (NOT getVRegDef, which asserts on multi-def): a
-  // reload-created value has several redefs; treat it as a non-PHI ground/leaf.
-  MachineInstr *RootDef = MRI->getUniqueVRegDef(PhiResult);
-  if (!RootDef || !RootDef->isPHI())
-    return false;
-
-  // --- 1. Close the equivalence class (analysis only; slot stays virtual). ---
-  SmallSetVector<Register, 32> PhiMembers; // PHIs in the web (candidates to erase)
-  SmallSetVector<Register, 32> GroundOps;  // non-PHI operands (store on their edge)
-  // Each ground operand appears on a specific PHI incoming EDGE (pred block). The
-  // store + color-pinning COPY belongs at THAT predecessor's end (the classic
-  // PHI-elimination edge), NOT at the ground def: the def may sit in a hot,
-  // scattered block, whereas the pred end is adjacent to the join we are relieving,
-  // so the shared color is free there. A PHI operand may name a SUB-REGISTER of a
-  // wider vreg (a 32-bit PHI reading %wide.subN); record the subreg so we store
-  // only that lane (the slot is sized by the narrow PHI result, not the wide reg).
-  struct GroundEdge {
-    Register Reg;
-    unsigned SubReg;
-    MachineBasicBlock *Pred;
-    MachineInstr *Phi;   // the PHI whose operand reads Reg on this edge
-    unsigned OpIdx;      // operand index of Reg in Phi (block operand is OpIdx+1)
-  };
-  SmallVector<GroundEdge, 32> GroundEdges;
-  SmallVector<Register, 32> Work;
-  PhiMembers.insert(PhiResult);
-  Work.push_back(PhiResult);
-  // The web equivalence result<->operand is BIDIRECTIONAL. Close it BOTH ways:
-  //  - DOWN: a member PHI's operands (a PHI operand joins the web; a ground def is
-  //    a store site).
-  //  - UP: any PHI that USES the member as an operand (that consuming PHI is in the
-  //    same class). Without the up-edge, a bb.N-Flow PHI reached as an operand of a
-  //    bb.M-end PHI would be its OWN single-PHI web, and the edge to the end PHI
-  //    would look EXTERNAL -> reloaded per-predecessor back into the join wall (the
-  //    exact defect: web=1 everywhere, 128 reloads into RP=129 bb.1). Closing up
-  //    makes that edge internal so it vanishes with the erased PHIs.
-  while (!Work.empty()) {
-    Register R = Work.pop_back_val();
-    MachineInstr *D = MRI->getUniqueVRegDef(R);
-    if (D && D->isPHI()) {
-      // DOWN: operands of this member PHI.
-      for (unsigned I = 1, E = D->getNumOperands(); I + 1 < E; I += 2) {
-        MachineOperand &Op = D->getOperand(I);
-        if (!Op.isReg() || !Op.getReg().isVirtual())
-          continue;
-        // An UNDEF PHI operand (`undef %r.subN, %bb`) carries no live value on that
-        // edge — %r is not live-out there. Storing it would emit a COPY reading an
-        // undefined register (verifier: "reading vreg without a def"). Skip it: the
-        // reload on that path reads whatever the slot holds, which is sound because
-        // the incoming value was undef anyway.
-        if (Op.isUndef())
-          continue;
-        Register OpReg = Op.getReg();
-        MachineInstr *OpDef = MRI->getUniqueVRegDef(OpReg);
-        if (OpDef && OpDef->isPHI()) {
-          if (PhiMembers.insert(OpReg))
-            Work.push_back(OpReg);
-        } else {
-          // Ground operand on this PHI edge. The block operand is I+1. Record
-          // EVERY edge (no dedup): only one edge executes at runtime, so each edge
-          // carrying a web value must write the slot, even if the same vreg flows
-          // on two edges. GroundOps stays unique for the interference gate/relief.
-          MachineBasicBlock *PredBB = D->getOperand(I + 1).getMBB();
-          GroundOps.insert(OpReg);
-          GroundEdges.push_back({OpReg, Op.getSubReg(), PredBB, D, I});
-        }
-      }
-    }
-    // UP: any PHI consuming R as an operand joins the class.
-    for (MachineInstr &U : MRI->use_nodbg_instructions(R)) {
-      if (!U.isPHI())
-        continue;
-      Register UResult = U.getOperand(0).getReg();
-      if (PhiMembers.insert(UResult))
-        Work.push_back(UResult);
-    }
-  }
-  if (GroundOps.empty())
-    return false; // all-undef web -> caller falls back
-
-  // SOUNDNESS GATE (option 2): all ground ops of the web share ONE stack slot. That
-  // is only correct if no two of them are ever SIMULTANEOUSLY LIVE — i.e. the PHIs
-  // are copy-less control-flow merges where exactly one incoming value reaches the
-  // join on any path. If two operands interfere, the shared slot would clobber one
-  // (the second store overwrites the first while the first is still needed) — a
-  // MISCOMPILE. In-memory coalescing is register-coalescing with a slot as the
-  // color, so it needs the SAME non-interference precondition. Prove it here; if any
-  // pair interferes, DECLINE the web (return false) and let the caller fall back to
-  // a plain per-value spill. (This is why 1024's divergent-select bitcast is safe:
-  // its two operands come from mutually-exclusive cmp.true/cmp.false predecessors.)
-  {
-    SmallVector<Register, 16> GV(GroundOps.begin(), GroundOps.end());
-    auto HasLive = [&](Register R) {
-      return LIS->hasInterval(R) && !LIS->getInterval(R).empty();
-    };
-    for (unsigned A = 0; A < GV.size(); ++A)
-      for (unsigned B = A + 1; B < GV.size(); ++B)
-        if (HasLive(GV[A]) && HasLive(GV[B]) &&
-            LIS->getInterval(GV[A]).overlaps(LIS->getInterval(GV[B]))) {
-          LLVM_DEBUG(dbgs()
-                     << "spillPhiWeb(): DECLINE root " << printReg(PhiResult, TRI)
-                     << " — operands " << printReg(GV[A], TRI) << " and "
-                     << printReg(GV[B], TRI)
-                     << " interfere (shared slot would clobber)\n");
-          return false;
-        }
-  }
+  // Detection, the shared-slot soundness gate, AND the reload-feasibility gate all
+  // ran in the RA (closePhiWeb + webReloadFeasible); this is pure mechanics over an
+  // already-closed, sound, feasible web — it cannot fail.
+  assert(Web.valid() && "spillPhiWeb requires a closed, sound web");
+  Register PhiResult = Web.Root;
+  const auto &PhiMembers = Web.PhiMembers;
+  const auto &GroundOps = Web.GroundOps;
+  const auto &GroundEdges = Web.GroundEdges;
 
   // Report the ground ops so the driver marks them Spilled (a web stores each once;
   // without this the driver re-selects a stored ground op as a plain victim and
@@ -263,26 +163,6 @@ bool SSASpillEmitter::spillPhiWeb(
   LLVM_DEBUG(dbgs() << "\nspillPhiWeb(): root " << printReg(PhiResult, TRI)
                     << " web=" << PhiMembers.size() << " PHIs, "
                     << GroundOps.size() << " ground ops\n");
-
-  // True RP relief the web delivers in the region [RegS,RegE) = number of web
-  // values (PHI results AND ground operands) whose live range OVERLAPS the region.
-  // Every such value leaves the region's registers: PHI results are erased and
-  // reloaded at their far uses; ground operands are stored (their register frees
-  // across the region — they are only re-present at their def and at reloads).
-  // Count via LiveInterval::overlaps(Start,End) directly (not liveAt(PeakSlot): a
-  // peak is often a plateau the members do not cover at the single recorded slot,
-  // which counted 0 -> credit fell back to 1 -> under-credit -> over-spill).
-  auto overlapsRegion = [&](Register V) {
-    return LIS->hasInterval(V) && LIS->getInterval(V).overlaps(RegS, RegE);
-  };
-  if (RegS.isValid() && RegE.isValid()) {
-    for (Register M : PhiMembers)
-      if (overlapsRegion(M))
-        ++LastWebPeakRelief;
-    for (Register G : GroundOps)
-      if (overlapsRegion(G))
-        ++LastWebPeakRelief;
-  }
 
   // --- 2. Collect EXTERNAL uses (non-web-edge). Internal edges (a member feeding
   // another web PHI) vanish when the PHIs are erased. ---
@@ -311,10 +191,7 @@ bool SSASpillEmitter::spillPhiWeb(
   // THAT pred end (where the main op is not live). The color is chosen FIRST, from
   // the operands as they are — inserting copies before choosing would make each
   // copy compete for R at the saturated pred ends (the 49-decline bug).
-  if (GroundEdges.empty()) {
-    LastWebGround.clear();
-    return false;
-  }
+  // (A valid() web has >=1 ground op, hence >=1 ground edge — no empty guard.)
 
   // Store each web ground operand AT ITS DEF into the shared slot. Storing at the
   // def (not the predecessor end) is what DRAINS the predecessor tail: these
@@ -393,7 +270,6 @@ bool SSASpillEmitter::spillPhiWeb(
   LLVM_DEBUG(dbgs() << "  phi-web: coalesced, erased " << LastWebErased.size()
                     << "/" << PhiMembers.size() << " PHIs, " << GroundOps.size()
                     << " ground stores -> FI" << FI << "\n");
-  return true;
 }
 
 bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
@@ -1118,15 +994,16 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
   for (MachineInstr &D : MRI->def_instructions(SpilledReg))
     if (isReloadInstr(&D))
       ReloadDefs.push_back(&D);
-  // This spillAndReload added new reload redefs of SpilledReg. Force a fresh
-  // reaching-oracle freeze so repair sees them; the updater otherwise caches
-  // the frozen interval per OrigVReg across our incremental spills, which would
-  // make reaching resolution miss these redefs (leaving dead reloads).
-  SSAUpdater->resetSession();
+  // Freeze the reaching oracle ONCE, here: the interval was just recomputed (line
+  // above) and already contains every reload redef, and nothing renames it until
+  // the repair loop below. All repairSSAForNewDef calls share this one snapshot,
+  // so no per-call re-freeze (resetSession) is needed -- the emitter no longer
+  // disturbs the interval between repair calls.
+  FrozenInterval Oracle = SSAUpdater->freezeInterval(SpilledReg);
   bool InsertedPHI = false;
   for (MachineInstr *RMI : ReloadDefs) {
     SmallVector<MachineOperand *> PHIDefs;
-    SSAUpdater->repairSSAForNewDef(*RMI, SpilledReg, PHIDefs);
+    SSAUpdater->repairSSAForNewDef(*RMI, SpilledReg, PHIDefs, &Oracle);
     if (!PHIDefs.empty())
       InsertedPHI = true;
     // Track the reloaded value -- now a renamed fresh vreg -- so the forward
@@ -1188,34 +1065,9 @@ unsigned SSASpillEmitter::getMaxRPForBlock(MachineBasicBlock *MBB) {
   return MaxRP;
 }
 
-unsigned SSASpillEmitter::reloadRPBeforeUse(const MachineInstr *UseMI) const {
-  // [region-rp-reduction Stage 2] Post-spill RP just BEFORE UseMI, where a
-  // per-use reload lands. reset(*MI) seeds just AFTER the use; recede steps to
-  // just-before (same pattern as maxRPBetween). Post-spill accounting: the value
-  // leaves its long range but is re-present at the reload (-W+W cancel), so RP
-  // before the use is the post-spill pressure there. 2-way file (POC; AGPR folded
-  // into VGPR like the rest of the emitter).
-  GCNUpwardRPTracker Tracker(*LIS);
-  Tracker.reset(*UseMI);
-  Tracker.recede(*UseMI);
-  GCNRegPressure P = Tracker.getPressure();
-  return IsVGPRPass
-             ? P.getVGPRNum(MF.getSubtarget<GCNSubtarget>().hasGFX90AInsts())
-             : P.getSGPRNum();
-}
-
-unsigned SSASpillEmitter::reloadRPAtBlockEnd(const MachineBasicBlock *NCD) const {
-  // [Stage 2] RP at NCD's end, where a shared hoisted reload sits. reset(MBB)
-  // seeds at the block's last slot (valid for an empty NCD); no recede needed.
-  // canHoistReloadTo(InsertPoint==null) SKIPS this NCD-block RP check, so the
-  // reload's own block is covered here.
-  GCNUpwardRPTracker Tracker(*LIS);
-  Tracker.reset(*NCD);
-  GCNRegPressure P = Tracker.getPressure();
-  return IsVGPRPass
-             ? P.getVGPRNum(MF.getSubtarget<GCNSubtarget>().hasGFX90AInsts())
-             : P.getSGPRNum();
-}
+// reloadRPBeforeUse / reloadRPAtBlockEnd moved to the RA (feasibility POLICY;
+// the Emitter is pure spill/reload/SSA-repair mechanics). See
+// AMDGPUSSARegisterAllocator::reloadRPBeforeUse / reloadRPAtBlockEnd.
 
 unsigned SSASpillEmitter::maxRPBetween(MachineInstr *DefMI,
                                        MachineInstr *UseMI) {

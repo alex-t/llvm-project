@@ -204,14 +204,55 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// (should not happen for a width-1 reload — point pressure ≤ limit < file).
   bool colorOneInPlace(Register R);
 
-  /// Coloring-time live-range split (experiment, gated by
-  /// -amdgpu-ssa-split-live-ranges). \p Failed is a width-1 value with no
-  /// through-lane. Find a colored liver B whose physreg P is occupied across
-  /// Failed's whole (short) range ONLY by B and B is LIVE-THROUGH there (no use
-  /// inside), spill B across so P frees over Failed's range with no interior
-  /// reload, color Failed into P, and keep B's reload in P. Returns true if
-  /// Failed was colored this way; false to fall back to spilling Failed itself.
-  bool trySplitColorViaBlocker(Register Failed, unsigned RPLimit);
+  /// What a recovery handler achieved (driver -> FSM stream). nextRecoveryState
+  /// maps it to the next state; Resolved -> OK terminal, Infeasible -> terminal.
+  enum class RecoveryResult {
+    Resolved,  // value fully placed — done (FSM -> OK)
+    Reduced,   // progress: shorter remnant (SelfSplit) or a blocker spilled
+               // (SpillBlockers) — re-dispatch
+    NoOp,      // precondition did not hold; nothing changed — next strategy
+    Infeasible // genuine point-over-pressure — honest terminal
+  };
+
+  /// Recovery FSM states (FSM -> driver stream: which handler to run). Start
+  /// classifies to a handler state; each handler's RecoveryResult drives
+  /// nextRecoveryState; OK/Infeasible are terminals. The driver loops to a
+  /// terminal with a monotone-progress detector (candidate length decreasing OR a
+  /// blocker spilled) that breaks the SelfSplit<->CrossLiver cycle.
+  enum class RecoveryState {
+    Start, Web, CrossLiver, SelfSplit, Floor, OK, Infeasible
+  };
+
+  /// Spill a colored blocker B (occupying a physreg P legal for \p Failed) to
+  /// free P over \p Failed's range. Two candidate classes, both requiring B live
+  /// at F's end with NO use strictly inside (FS,FE) (so B's reload lands past FE
+  /// -> no round-trip):
+  ///  - LIVE-THROUGH (B.def <= FS): frees P over ALL of F -> Failed colors whole
+  ///    -> Resolved.
+  ///  - BORN-IN-F (B.def in (FS,FE)): frees P over F's TAIL [B.def,FE); F is
+  ///    split at B.def, the tail colors into P, the HEAD [FS,B.def) is handed
+  ///    back in \p Remnant -> Reduced.
+  /// Multi-candidate pick = COVERAGE: live-through (frees all of F) beats
+  /// born-in-F; among born-in-F the earliest def frees the longest tail. Returns
+  /// NoOp if no clean candidate exists.
+  RecoveryResult spillBlocker(Register Failed, unsigned RPLimit,
+                              Register &Remnant);
+
+  /// Close the PHI web seeded by \p Seed (a PHI result, or a PHI operand feeding
+  /// one). Bidirectional closure over PHI operand/result edges, then the
+  /// shared-slot soundness gate (declines if two ground operands interfere).
+  /// Detection POLICY — RA-owned (moved out of the emitter's spillPhiWeb, now
+  /// pure mechanics). Returns an INVALID PhiWeb (see PhiWeb::valid) if \p Seed is
+  /// not part of a spillable web, so the caller falls back to a plain spill.
+  PhiWeb closePhiWeb(Register Seed) const;
+
+  /// RA-side feasibility gate for spilling \p Web: a web spill is a monotone
+  /// wall-dissolution, so the ONLY failure is a reload landing where post-spill RP
+  /// still exceeds \p Limit. Probe exactly that at each web member's EXTERNAL
+  /// (non-PHI-edge) use via the shared reloadRPBeforeUse helper. \p IsVGPR selects
+  /// the file. Enforces web-spill ATOMICITY: the RA proves feasibility BEFORE
+  /// dispatch; spillPhiWeb is then pure spill/reload mechanics that cannot fail.
+  bool webReloadFeasible(const PhiWeb &Web, bool IsVGPR, unsigned Limit) const;
 
   /// [Design: region-rp-reduction, Stage 1] Register file for region
   /// enumeration. AGPR is a DISTINCT file on non-unified targets (gfx908):
@@ -244,6 +285,18 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// on gfx90a+ (arch+agpr+avgpr share one budget) and arch-VGPR alone otherwise;
   /// AGPR is the separate AGPR count (only meaningful on non-unified targets).
   unsigned pressureOf(const GCNRegPressure &P, RegFile File) const;
+
+  /// Post-spill RP just BEFORE \p UseMI (per-use reload site): reset(*MI) seeds
+  /// just after the use, recede steps to just-before; -W+W cancel => post-spill RP
+  /// there. Feasibility POLICY — RA-owned (moved from the Emitter, which is pure
+  /// spill/reload/SSA-repair mechanics). \p IsVGPR selects the file. NOTE: uses
+  /// getVGPRNum(hasGFX90A) — NOT pressureOf's getArchVGPRNum — to stay bit-identical
+  /// to the pre-move behavior (they differ by the AGPR term on non-unified targets).
+  unsigned reloadRPBeforeUse(const MachineInstr *UseMI, bool IsVGPR) const;
+
+  /// Post-spill RP at the END of \p NCD (shared hoisted-reload site). Valid for an
+  /// empty NCD. Same file/accounting notes as reloadRPBeforeUse.
+  unsigned reloadRPAtBlockEnd(const MachineBasicBlock *NCD, bool IsVGPR) const;
 
   /// [Stage 1] Enumerate tight regions for \p File: per block, maximal contiguous
   /// slot spans where all-live RP (GCNUpwardRPTracker) > allocatablePool(File).
@@ -305,6 +358,36 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// reads LIS / MRI / ColorMap; mutates no allocator state.
   RecoveryWindow collectRecoveryWindow(Register Uncolored) const;
 
+
+  /// Cross-liver PRECONDITION: true iff \p Failed has a cleanly-spillable
+  /// live-through blocker — colored, same-file (getCommonSubClass), live across
+  /// Failed's whole range with no use strictly inside (so its reload lands after
+  /// FE), AND that reload's post-spill RP stays within \p RPLimit
+  /// (reloadRPBeforeUse). The classifier calls this so CrossLiver is chosen ONLY
+  /// when spillCrossLiver will find a feasible candidate (no spill-then-fail).
+  bool hasCleanCrossLiver(Register Failed, unsigned RPLimit) const;
+
+  /// A memory spill of \p R relieves it only if some non-PHI use has post-spill RP
+  /// <= \p RPLimit (the reload lands below saturation). Else the reload re-enters
+  /// the same pressure (a spill-reload thrash). No non-PHI use -> trivially viable.
+  /// The Floor-vs-Infeasible discriminator.
+  bool floorViable(Register R, bool IsVGPR, unsigned RPLimit) const;
+
+  /// FSM transition: given the current handler \p S and its \p R result, return
+  /// the next state per the recovery transition table.
+  RecoveryState nextRecoveryState(RecoveryState S, RecoveryResult R) const;
+
+  /// [Recovery FSM] Classify \p RW into the FIRST handler STATE (web > cross-liver
+  /// > self-split), or a terminal (Floor if a memory reload fits, else Infeasible)
+  /// when no structural pattern applies. The driver runs the state's handler and
+  /// advances via nextRecoveryState. Reads \p RW + feasibility helpers.
+  RecoveryState classifyRecovery(const RecoveryWindow &RW) const;
+
+  /// Emit the forensic recoveryWindow event for \p Failed / \p RW (analyst
+  /// signal). Called by the recovery driver when the reporter is enabled; no
+  /// effect on dispatch.
+  void emitRecoveryWindow(Register Failed, const RecoveryWindow &RW) const;
+
   /// [Stage 2] Cost of spilling candidate \p B to relieve region \p R.
   ///   Feasible : no use is strictly inside R (case 2) nor in R's loop (case 3),
   ///              and every reload's post-spill RP <= R.Limit (Test 2). Else B
@@ -331,28 +414,27 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// was performed (caller then re-colors from clean). Bounded by a round cap.
   bool reduceRegionPressure(MachineFunction &MF);
 
-  /// Self-split (experiment, gated by -amdgpu-ssa-split-live-ranges): \p Failed is
+  /// Self-split (self-split branch of the recovery classifier): \p Failed is
   /// a long liver with no through-lane AND no live-through blocker to spill around
-  /// (trySplitColorViaBlocker found nothing). Chop Failed into segments, each
+  /// (spillCrossLiver found nothing). Chop Failed into segments, each
   /// short enough that one physreg is free across it, coloring each into that reg.
   /// Only valid when Failed is POINT-FEASIBLE (some PR free at every slot); aborts
   /// (returns false -> caller memory-spills) if any slot has zero free PRs.
-  bool trySelfSplitColor(Register Failed);
+  RecoveryResult trySelfSplitColor(Register Failed, Register &Remnant);
 
   /// Coloring-time recovery for one value \p Failed that color() could not place.
-  /// Runs the dispatch chain (blocker-split -> self-split -> [PHI-web] ->
-  /// spill-homeless floor) and returns true if Failed was resolved (colored, or
-  /// spilled with its reload redefs placed). Behavior-identical to the old inline
-  /// dispatch when -amdgpu-ssa-recursive-recovery is OFF. When ON (see
-  /// Recursive_Recovery_Fix.md): blocker/self-split run unconditionally as tier-1,
-  /// and a reload redef that cannot color re-enters this method recursively
-  /// (well-founded on strictly-shrinking live-range length), bottoming out at an
-  /// honest point-over-pressure terminal. \p Depth is the recursion depth (0 at
-  /// the top-level call); a defensive cap guards a runaway.
-  bool recoverUncolorable(Register Failed, unsigned Depth = 0);
+  /// Classifier-driven (see Recursive_Recovery_Fix.md): collectRecoveryWindow
+  /// classifies the failure, then dispatch goes to the ONE branch whose
+  /// precondition holds (web / cross-liver / self-split), falling through to the
+  /// spill-self floor when no pattern matches. A fresh redef that cannot color is
+  /// NOT recursed on — it is re-queued to UncolorableVRegs and retried by the
+  /// caller's worklist fixpoint (no-progress terminal is the honest bottom).
+  /// Returns true if Failed was resolved (colored, or spilled with its reload
+  /// redefs placed).
+  bool recoverUncolorable(Register Failed);
 
-  /// Honest terminal for the recursive recovery (only reachable with
-  /// -amdgpu-ssa-recursive-recovery ON). Counts the values of \p R's register
+  /// Honest terminal for the classifier's no-pattern floor. Counts the values of
+  /// \p R's register
   /// file live at \p R's def point and compares the total dword count to \p
   /// RPLimit, then report_fatal_error()s with the REAL NUMBERS: either genuine
   /// point-over-pressure (more live dwords than registers -> no coloring-time
@@ -379,11 +461,11 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// whose interval overlaps VI into \p OccupiedUnits. \p Overlappers is optional:
   /// when non-null it also collects (occupant vreg, its physreg) for each. The gap
   /// pick (findNonInterferingGap) passes nullptr (needs only occupancy); the
-  /// splitter (trySplitColorViaBlocker) passes a vector. NOT cacheable across the
+  /// splitter (spillCrossLiver) passes a vector. NOT cacheable across the
   /// two — they run in different phases with ColorMap mutated between.
   void scanOverlappersForVI(
       const LiveInterval &VI, BitVector &OccupiedUnits,
-      SmallVectorImpl<std::pair<Register, MCRegister>> *Overlappers = nullptr);
+      SmallVectorImpl<std::pair<Register, MCRegister>> *Overlappers = nullptr) const;
   void seedOccupiedAtBBEntry(MachineBasicBlock *MBB);
   // True if the parallel PHI edge-copies for Pred->MBB cannot be safely placed
   // at Pred's terminator (they would clobber a value live into a sibling

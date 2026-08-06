@@ -32,6 +32,7 @@
 #include "VRegMaskPair.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineLaneSSAUpdater.h"
@@ -83,6 +84,33 @@ public:
     Head = NewHead;
   }
   size_t size() const { return 1 + DominatedUses.size(); }
+};
+
+/// One ground (non-PHI) operand of a PHI web, on a specific PHI incoming edge.
+/// The store + color-pinning COPY belongs at THAT predecessor's end (the classic
+/// PHI-elimination edge), not at the ground def. A PHI operand may name a
+/// SUB-REGISTER of a wider vreg (a 32-bit PHI reading %wide.subN); SubReg records
+/// which lane to store (the slot is sized by the narrow PHI result).
+struct GroundEdge {
+  Register Reg;
+  unsigned SubReg;
+  MachineBasicBlock *Pred;
+  MachineInstr *Phi; // the PHI whose operand reads Reg on this edge
+  unsigned OpIdx;    // operand index of Reg in Phi (block operand is OpIdx+1)
+};
+
+/// A closed PHI web: the transitive PHI operand/result equivalence class, its
+/// ground operands, and per-edge store sites. Detection POLICY is the RA's
+/// (closePhiWeb builds this, runs the shared-slot soundness gate); the emitter's
+/// spillPhiWeb consumes it as pure mechanics. An INVALID web (no root, no ground
+/// operand, or interfering ground operands) means "not a spillable web" — the
+/// caller falls back to a plain per-value spill.
+struct PhiWeb {
+  Register Root;                           // PHI result the web is keyed on
+  SmallSetVector<Register, 32> PhiMembers; // PHIs in the web (candidates to erase)
+  SmallSetVector<Register, 32> GroundOps;  // non-PHI operands (unique)
+  SmallVector<GroundEdge, 32> GroundEdges; // every edge (no dedup)
+  bool valid() const { return Root.isValid() && !GroundOps.empty(); }
 };
 
 /// SpillInfo: one value's spill decision with pre-built dom-groups.
@@ -154,8 +182,6 @@ class SSASpillEmitter {
   // Ground operands the last spillPhiWeb() stored (the driver marks them Spilled
   // so they are not re-selected and double-spilled as plain victims).
   SmallVector<Register, 32> LastWebGround;
-  // RP relief at the region peak delivered by the last spillPhiWeb().
-  unsigned LastWebPeakRelief = 0;
 
   // --- internal mechanism helpers (moved verbatim from the spiller) ---
   // Store \p VMP right after its def (EXEC full ⇒ captures all lanes). The store
@@ -215,19 +241,15 @@ public:
   /// and repair SSA inline. \p RPLimit bounds reload-hoist decisions.
   void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx, unsigned RPLimit);
 
-  /// In-memory PHI-web coalescing. \p PhiResult must be defined by a PHI. Closes
-  /// the transitive operand/result equivalence class (union-find over PHI edges),
-  /// assigns ONE shared stack slot, stores every non-PHI operand at its def (in
-  /// its predecessor — SSA-legal), reloads every EXTERNAL use of any web member
-  /// from that slot (rolling window: one reg, dies after its use), and erases the
-  /// now-dead PHIs. This is a MONOTONE wall-dissolution: it only REMOVES register
-  /// pressure at the join, so reloads are NOT RP-gated (gating on pre-spill RP is
-  /// a false-positive — it measures the very wall we are removing). Returns true
-  /// if the web was coalesced; false (no-op) if PhiResult is not a PHI or the web
-  /// has no ground operand. \p PeakSlot is the region's peak-RP slot: the number
-  /// of erased web members live there (the true RP relief the caller should credit
-  /// so it does not over-spill) is recorded in lastWebPeakRelief().
-  /// Ground operands are stored into the shared slot on their PHI edges.
+  /// In-memory PHI-web coalescing of an ALREADY-CLOSED, feasible web \p Web
+  /// (detection, the shared-slot soundness gate, AND the reload-feasibility gate
+  /// are the RA's job — see closePhiWeb / webReloadFeasible). Pure MECHANICS:
+  /// assign ONE shared stack slot, store every non-PHI operand at its def (in its
+  /// predecessor — SSA-legal), reload every EXTERNAL use of any web member from
+  /// that slot (rolling window: one reg, dies after its use), and erase the
+  /// now-dead PHIs. A MONOTONE wall-dissolution: it only REMOVES register pressure
+  /// at the join. \p Web must be valid() and proven feasible; this call cannot
+  /// fail. Ground operands are stored into the shared slot on their PHI edges.
   /// Differently-colored SGPRs MAY share the slot: the SILowerSGPRSpills lane
   /// assert is a per-store WIDTH check (reg-width <= slot lanes), NOT a color/count
   /// check, and the web's non-interference gate already proves the operands are
@@ -235,8 +257,7 @@ public:
   /// correct. No shared color is forced. A sub-register PHI operand is
   /// COPY-extracted to slot width first; that fresh short-lived vreg is colored via
   /// \p ColorFreshVReg (it lives only [copy, store], so a free reg always exists).
-  bool spillPhiWeb(Register PhiResult, unsigned RPLimit, SlotIndex RegS,
-                   SlotIndex RegE,
+  void spillPhiWeb(const PhiWeb &Web, unsigned RPLimit,
                    llvm::function_ref<void(Register)> ColorFreshVReg);
 
   /// Members erased by the last spillPhiWeb() (for the caller to prune ColorMap).
@@ -245,18 +266,7 @@ public:
   /// Ground operands stored by the last spillPhiWeb() (driver marks them Spilled).
   ArrayRef<Register> lastWebGround() const { return LastWebGround; }
 
-  /// RP relief at the peak slot delivered by the last spillPhiWeb(): count of
-  /// erased PHI members whose live range covered the peak (ground-operand stores
-  /// are isKill=false and stay in registers, so they do NOT relieve the peak).
-  unsigned lastWebPeakRelief() const { return LastWebPeakRelief; }
-
-  /// [region-rp-reduction Stage 2] Post-spill RP just BEFORE \p UseMI (per-use
-  /// reload site). File via beginPass() (2-way, POC). See .cpp for accounting.
-  unsigned reloadRPBeforeUse(const MachineInstr *UseMI) const;
-
-  /// [Stage 2] Post-spill RP at the END of \p NCD (shared hoisted-reload site).
-  /// Valid for an empty NCD. Covers the NCD-block RP that canHoistReloadTo skips.
-  unsigned reloadRPAtBlockEnd(const MachineBasicBlock *NCD) const;
+  // reloadRPBeforeUse / reloadRPAtBlockEnd moved to the RA (feasibility policy).
 
   /// [Stage 2] Public forwarder to canHoistReloadTo: can \p B's shared reload
   /// hoist to \p NCD (reload at NCD end) within \p RPLimit on every NCD->use path?
