@@ -312,6 +312,17 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// anything was spilled. Flag-gated (-amdgpu-ssa-pre-spill).
   bool preSpillToLimit(MachineFunction &MF);
 
+  /// Width-aware up-front pre-spiller (-amdgpu-ssa-pre-spill-wa). Same tight-region
+  /// / kill-at-def+reload-at-use machinery as preSpillToLimit, but the frozen victim
+  /// universe spans ALL widths and victims are chosen WIDEST-FIRST, decrementing the
+  /// region peak by each victim's real dword width. This relieves regions dominated
+  /// by wide tuples (SGPR/VGPR vreg_64/128/...) that the width-1-only naive version
+  /// cannot touch. Models per-width availability honestly (pool/W aligned tuples per
+  /// class) but does NOT claim to resolve aligned-tuple fragmentation (chi>omega):
+  /// pool-fit is necessary, not always sufficient; placement residuals still flow to
+  /// color()'s recovery. Returns true if anything was spilled.
+  bool preSpillToLimitWidthAware(MachineFunction &MF);
+
   /// [Recovery classifier, Stage 1] Register file of a class for the recovery
   /// window. AGPR folds into VGPR so the file matches pressureOf(VGPR)'s unified
   /// count (SGPR classes -> SGPR, everything else -> VGPR).

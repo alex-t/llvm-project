@@ -71,6 +71,15 @@ static cl::opt<bool> EnablePreSpill(
              "pool, so the Hack fast-path succeeds by construction and reactive "
              "recovery never fires. Off = current (color-then-recover)."));
 
+static cl::opt<bool> EnablePreSpillWA(
+    "amdgpu-ssa-pre-spill-wa", cl::Hidden, cl::init(false),
+    cl::desc("Width-aware up-front spiller: like -amdgpu-ssa-pre-spill but the "
+             "victim universe spans ALL widths and spills are WIDEST-FIRST, "
+             "decrementing region peak by the victim's real dword width. Models "
+             "per-width availability (pool/W tuples per class) so wide-tuple "
+             "regions (e.g. SGPR-wide) the width-1-only naive version cannot "
+             "relieve are handled. Off = current (color-then-recover)."));
+
 static cl::opt<bool> EnableVerifyValueFlow(
     "amdgpu-ssa-verify-value-flow", cl::Hidden, cl::init(false),
     cl::desc("Certify every physreg use holds the SSA value its vreg named "
@@ -1895,6 +1904,146 @@ bool AMDGPUSSARegisterAllocator::preSpillToLimit(MachineFunction &MF) {
               LIS->getInterval(V).beginIndex(), R.Limit);
           Spilled.insert(V);
           NSpills -= 1; // width-1 by construction
+          Any = Changed = true;
+        }
+      }
+    }
+    if (!Changed)
+      break; // fixpoint: every point <= Limit (or nothing left to spill)
+  }
+  return Any;
+}
+
+bool AMDGPUSSARegisterAllocator::preSpillToLimitWidthAware(MachineFunction &MF) {
+  // WIDTH-AWARE up-front spiller (-amdgpu-ssa-pre-spill-wa). Same tight-region /
+  // kill-at-def+reload-at-use machinery as preSpillToLimit, but two things change
+  // vs. the naive version:
+  //   (1) the frozen victim UNIVERSE spans ALL widths (naive: width-1 only), and
+  //   (2) victims are chosen WIDEST-FIRST and the region peak is decremented by the
+  //       victim's REAL dword width (naive: always -1).
+  // (1)+(2) let it relieve regions dominated by wide tuples (vreg_64/128/... in
+  // either file) that the width-1-only naive version can never touch — nothing of
+  // width 1 is live at such a peak, so naive spins to its CAP doing nothing. The
+  // SGPR-wide bookkeeping bug and the 128xfloat emergency-slot cases are exactly
+  // these: the pressure is carried by wide SGPR/VGPR tuples.
+  //
+  // PER-WIDTH availability model (the "more precise" part): at the peak we also
+  // compute, per width class W, how many aligned W-tuples the pool can hold
+  // (floor(Limit/W)) and how many are live. A class whose live count exceeds its
+  // cap is OVER-SUBSCRIBED — it is the one causing aligned-slot contention, so we
+  // spill from over-subscribed classes FIRST (widest within). This is honestly
+  // necessary-not-sufficient: it does NOT model aligned-tuple fragmentation
+  // (chi>omega); the SOUND aggregate gate stays total-dword RP <= pool (R.Peak vs
+  // R.Limit from findTightRegions). Placement residuals still flow to color().
+  bool Any = false;
+  SmallDenseSet<Register, 64> Spilled; // never re-pick a spilled value
+  // FROZEN UNIVERSE (termination): every vreg that exists BEFORE any spilling, of
+  // ANY width. Reload redefs spillOneVMP creates are fresh vregs NOT in the set,
+  // so they can never become victims -> no rolling-wave regeneration. The
+  // spillable set strictly shrinks; the loop is bounded by |Universe|.
+  SmallDenseSet<Register, 128> Universe;
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+    Register V = Register::index2VirtReg(I);
+    if (MRI->reg_nodbg_empty(V) || !LIS->hasInterval(V))
+      continue;
+    Universe.insert(V);
+  }
+  const unsigned CAP = 40; // mirror region-rp MaxRounds backstop
+  long PrevWorst = -1;     // global worst (Peak-Limit) at the START of last round
+  for (unsigned G = 0; G < CAP; ++G) {
+    bool Changed = false;
+    // NO-PROGRESS / ROLLING-WAVE GUARD. A memory spill re-materializes the value
+    // at each reload-at-use; in a densely-used hot region those reloads can push
+    // the peak right back up. Because reloads are fresh vregs OUTSIDE the frozen
+    // universe, we cannot spill them, so re-measuring the peak (which now counts
+    // them) makes us chase pressure we created — draining the universe until it is
+    // empty and handing color() a spilled-everything mess that its recovery loop
+    // then spins on. Snapshot the global worst excess at the top of each round; if
+    // a full round did not strictly reduce it, we are in the rolling wave (or
+    // stuck) — STOP and leave the honest residual to the colorer (do no harm).
+    long WorstThisRound = 0;
+    for (RegFile PF : {RegFile::SGPR, RegFile::VGPR}) {
+      SmallVector<TightRegion, 8> PR;
+      findTightRegions(MF, PF, PR);
+      for (const TightRegion &R : PR)
+        WorstThisRound = std::max(WorstThisRound, long(R.Peak) - long(R.Limit));
+    }
+    if (WorstThisRound == 0)
+      break; // every point fits — done
+    if (PrevWorst >= 0 && WorstThisRound >= PrevWorst) {
+      LLVM_DEBUG(dbgs() << "    [WA] no progress (worst excess " << PrevWorst
+                        << " -> " << WorstThisRound
+                        << "): rolling wave, hand residual to colorer\n");
+      break;
+    }
+    PrevWorst = WorstThisRound;
+    for (RegFile File : {RegFile::SGPR, RegFile::VGPR}) {
+      SmallVector<TightRegion, 8> Regions;
+      findTightRegions(MF, File, Regions);
+      if (Regions.empty())
+        continue;
+      Emitter->beginPass(File == RegFile::VGPR);
+      for (const TightRegion &R : Regions) {
+        long Excess = long(R.Peak) - long(R.Limit); // total-dword excess (sound)
+        if (Excess <= 0)
+          continue;
+        // Candidates: frozen-universe values of THIS file, live at the peak slot,
+        // not already spilled. Nothing is colored yet, so read liveness from LIS.
+        struct Cand {
+          Register V;
+          unsigned W;
+        };
+        SmallVector<Cand, 32> Cands;
+        SmallDenseMap<unsigned, unsigned, 8> LiveByWidth; // width -> #live
+        for (Register V : Universe) {
+          if (Spilled.count(V) || MRI->reg_nodbg_empty(V) ||
+              !LIS->hasInterval(V))
+            continue;
+          const TargetRegisterClass *RC = MRI->getRegClass(V);
+          if (fileOf(RC) != File)
+            continue;
+          if (!LIS->getInterval(V).liveAt(R.PeakSlot))
+            continue;
+          unsigned W = TRI->getRegSizeInBits(*RC) / 32;
+          Cands.push_back({V, W ? W : 1});
+          LiveByWidth[W ? W : 1] += 1;
+        }
+        // Per-width over-subscription: live(W) > floor(Limit / W). Diagnostic + a
+        // selection key (over-subscribed classes are the aligned-slot pressure).
+        auto overSubscribed = [&](unsigned W) {
+          unsigned Cap = R.Limit / (W ? W : 1);
+          auto It = LiveByWidth.find(W);
+          return It != LiveByWidth.end() && It->second > Cap;
+        };
+        LLVM_DEBUG({
+          for (auto &KV : LiveByWidth)
+            if (overSubscribed(KV.first))
+              dbgs() << "    [WA] " << (File == RegFile::SGPR ? "SGPR" : "VGPR")
+                     << " width-" << KV.first << " OVER: live=" << KV.second
+                     << " cap=" << (R.Limit / KV.first) << "\n";
+        });
+        // Order: over-subscribed classes first, then WIDEST-first (max dword
+        // relief per spill and frees a full aligned region), then vreg id for
+        // determinism.
+        llvm::sort(Cands, [&](const Cand &A, const Cand &B) {
+          bool OA = overSubscribed(A.W), OB = overSubscribed(B.W);
+          if (OA != OB)
+            return OA;
+          if (A.W != B.W)
+            return A.W > B.W;
+          return A.V.id() < B.V.id();
+        });
+        for (const Cand &C : Cands) {
+          if (Excess <= 0)
+            break; // DO NO HARM: stop as soon as the region fits again
+          LLVM_DEBUG(dbgs() << "    [WA] spill " << printReg(C.V, TRI) << " w="
+                            << C.W << " -> excess " << Excess << "->"
+                            << (Excess - long(C.W)) << "\n");
+          Emitter->spillOneVMP(
+              VRegMaskPair(C.V, MRI->getMaxLaneMaskForVReg(C.V)),
+              LIS->getInterval(C.V).beginIndex(), R.Limit);
+          Spilled.insert(C.V);
+          Excess -= long(C.W); // width-aware decrement: frees W dwords at once
           Any = Changed = true;
         }
       }
@@ -4775,7 +4924,9 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // re-anchors it per block. No-op / not built unless the flag AND a forensic
   // sink are on.
   setupShadowTree();
-  if (EnablePreSpill)
+  if (EnablePreSpillWA)
+    preSpillToLimitWidthAware(MF);
+  else if (EnablePreSpill)
     preSpillToLimit(MF);
   color();
 
