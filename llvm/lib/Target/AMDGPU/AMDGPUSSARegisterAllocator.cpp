@@ -64,6 +64,13 @@ static cl::opt<bool> EnableExperimentBail(
              "later NoVRegs pass will abort) — for measurement only. Off = the "
              "real width-1 spill path runs and the function completes."));
 
+static cl::opt<bool> EnablePreSpill(
+    "amdgpu-ssa-pre-spill", cl::Hidden, cl::init(false),
+    cl::desc("Naive up-front spiller: before coloring, spill widest-first live "
+             "values at each tight region's peak until point-RP <= allocatable "
+             "pool, so the Hack fast-path succeeds by construction and reactive "
+             "recovery never fires. Off = current (color-then-recover)."));
+
 static cl::opt<bool> EnableVerifyValueFlow(
     "amdgpu-ssa-verify-value-flow", cl::Hidden, cl::init(false),
     cl::desc("Certify every physreg use holds the SSA value its vreg named "
@@ -1826,6 +1833,76 @@ AMDGPUSSARegisterAllocator::costOfSpilling(Register B, const TightRegion &R) {
                     << Cost << " width=" << Width
                     << " weightedReloads=" << WeightedReloads << "\n");
   return {true, Cost, Width};
+}
+
+bool AMDGPUSSARegisterAllocator::preSpillToLimit(MachineFunction &MF) {
+  // Naive up-front spiller (experiment, -amdgpu-ssa-pre-spill). Runs BEFORE the
+  // first color(). At each tight region's peak, spill widest-first live values
+  // (kill-at-def) until point-RP <= the allocatable pool, iterating (re-measure)
+  // until no region remains. Then the Hack fast-path colors by construction.
+  // Only the PRESSURE precondition is guaranteed — width>1 aligned-tuple gaps
+  // (chi>omega) still flow to color()'s recovery.
+  bool Any = false;
+  SmallDenseSet<Register, 64> Spilled; // never re-pick a spilled value
+  // FROZEN WIDTH-1 UNIVERSE (termination guarantee): the set of width-1 vregs that
+  // exist BEFORE any spilling. A victim is eligible only if it is in this set, so
+  // the reload redefs spillOneVMP creates (fresh vregs with new indices, NOT in
+  // the universe) can NEVER become victims -> no rolling-wave regeneration (the
+  // %4731->%4747 climbing-number churn observed without this). The spillable set
+  // strictly shrinks; the loop is bounded by |Universe|.
+  SmallDenseSet<Register, 128> Universe;
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+    Register V = Register::index2VirtReg(I);
+    if (MRI->reg_nodbg_empty(V) || !LIS->hasInterval(V))
+      continue;
+    if (TRI->getRegSizeInBits(*MRI->getRegClass(V)) / 32 == 1)
+      Universe.insert(V);
+  }
+  const unsigned CAP = 40;             // mirror region-rp MaxRounds backstop
+  for (unsigned G = 0; G < CAP; ++G) {
+    bool Changed = false;
+    for (RegFile File : {RegFile::SGPR, RegFile::VGPR}) {
+      SmallVector<TightRegion, 8> Regions;
+      findTightRegions(MF, File, Regions);
+      if (Regions.empty())
+        continue;
+      Emitter->beginPass(File == RegFile::VGPR);
+      for (const TightRegion &R : Regions) {
+        long NSpills = long(R.Peak) - long(R.Limit);
+        if (NSpills <= 0)
+          continue;
+        // Victims: width-1 values from the FROZEN universe, of this file, live at
+        // the peak, not already spilled. Nothing is colored yet, so read liveness
+        // from LIS (not ColorMap). Width-1 only = sound in mixed regions (no
+        // alignment interaction; never spills a tuple to paper over a chi>omega
+        // gap). Universe membership = termination (reloads excluded).
+        SmallVector<Register, 32> Cand;
+        for (Register V : Universe) {
+          if (Spilled.count(V) || MRI->reg_nodbg_empty(V) ||
+              !LIS->hasInterval(V))
+            continue;
+          if (fileOf(MRI->getRegClass(V)) != File)
+            continue;
+          if (!LIS->getInterval(V).liveAt(R.PeakSlot))
+            continue;
+          Cand.push_back(V);
+        }
+        for (Register V : Cand) {
+          if (NSpills <= 0)
+            break;
+          Emitter->spillOneVMP(
+              VRegMaskPair(V, MRI->getMaxLaneMaskForVReg(V)),
+              LIS->getInterval(V).beginIndex(), R.Limit);
+          Spilled.insert(V);
+          NSpills -= 1; // width-1 by construction
+          Any = Changed = true;
+        }
+      }
+    }
+    if (!Changed)
+      break; // fixpoint: every point <= Limit (or nothing left to spill)
+  }
+  return Any;
 }
 
 bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
@@ -4698,6 +4775,8 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // re-anchors it per block. No-op / not built unless the flag AND a forensic
   // sink are on.
   setupShadowTree();
+  if (EnablePreSpill)
+    preSpillToLimit(MF);
   color();
 
   // [Stage 3] Region RP-reduction: do our BEST-EFFORT spill-across to drop the

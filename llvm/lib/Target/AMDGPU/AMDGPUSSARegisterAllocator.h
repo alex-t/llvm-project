@@ -303,6 +303,15 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void findTightRegions(MachineFunction &MF, RegFile File,
                         SmallVectorImpl<TightRegion> &Out) const;
 
+  /// Naive up-front pre-spiller. At each tight region's peak slot, spill
+  /// widest-first live values (kill-at-def memory spill) until point-RP <= the
+  /// allocatable pool, iterating (re-measure) until no tight region remains. Runs
+  /// BEFORE color() so the Hack fast-path colors by construction. Only guarantees
+  /// the PRESSURE precondition — width>1 aligned-tuple colorability (chi>omega) is
+  /// NOT ensured; such residuals still flow to color()'s recovery. Returns true if
+  /// anything was spilled. Flag-gated (-amdgpu-ssa-pre-spill).
+  bool preSpillToLimit(MachineFunction &MF);
+
   /// [Recovery classifier, Stage 1] Register file of a class for the recovery
   /// window. AGPR folds into VGPR so the file matches pressureOf(VGPR)'s unified
   /// count (SGPR classes -> SGPR, everything else -> VGPR).
