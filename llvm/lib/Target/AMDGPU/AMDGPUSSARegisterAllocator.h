@@ -613,6 +613,11 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void emitSwap(MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
                 MCRegister RegA, MCRegister RegB);
   void rewriteOperands(MachineFunction &MF);
+  /// Before rewriteOperands: for each REG_SEQUENCE with an `undef` source, mark
+  /// the result's uses that read an undef lane `undef`, so the flag survives onto
+  /// the physical read (else the dead tuple lane is read-but-never-defined -> the
+  /// post-RA LIS verifier fatals "missing from live-in list").
+  void markRegSequenceUndefLaneUses(MachineFunction &MF);
   void eliminateRegSequences(MachineFunction &MF);
   void addPhysRegLiveIns(MachineFunction &MF);
   void finalizeProperties(MachineFunction &MF);

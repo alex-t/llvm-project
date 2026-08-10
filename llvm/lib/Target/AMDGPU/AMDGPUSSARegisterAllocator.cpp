@@ -4538,6 +4538,43 @@ void AMDGPUSSARegisterAllocator::finalizeProperties(MachineFunction &MF) {
 // sub_i). Trivial ones are deleted. Non-trivial ones are lowered to COPY
 // instructions placed immediately before the REG_SEQUENCE, then the
 // REG_SEQUENCE is deleted.
+void AMDGPUSSARegisterAllocator::markRegSequenceUndefLaneUses(
+    MachineFunction &MF) {
+  // A REG_SEQUENCE with an `undef` source leaves the destination lanes it feeds
+  // undefined. That is legal on the vreg (per-subrange liveness), but once the
+  // result is rewritten to a physical tuple the dead lane looks read-but-never-
+  // defined -> the post-RA LiveIntervals verifier fatals "register $vgprN_vgprN+1
+  // needs to be live in ... missing from the live-in list" (the "Invalid global
+  // physical register" cluster). While the REG_SEQUENCE still exists — its result
+  // is a virtual register, so its uses are findable via MRI — mark each use of the
+  // result that READS an undef lane `undef`, so rewriteOperands carries the flag
+  // onto the physical read. Only the lanes fed by undef sources are considered, so
+  // a subreg use of a live lane is left untouched.
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB) {
+      if (!MI.isRegSequence())
+        continue;
+      Register Dst = MI.getOperand(0).getReg();
+      if (!Dst.isVirtual())
+        continue;
+      LaneBitmask UndefLanes;
+      for (unsigned I = 1, E = MI.getNumOperands(); I + 1 < E; I += 2)
+        if (MI.getOperand(I).isUndef())
+          UndefLanes |= TRI->getSubRegIndexLaneMask(MI.getOperand(I + 1).getImm());
+      if (UndefLanes.none())
+        continue;
+      for (MachineOperand &UseMO : MRI->use_operands(Dst)) {
+        if (UseMO.isUndef())
+          continue;
+        LaneBitmask ReadMask =
+            UseMO.getSubReg() ? TRI->getSubRegIndexLaneMask(UseMO.getSubReg())
+                              : MRI->getMaxLaneMaskForVReg(Dst);
+        if ((ReadMask & UndefLanes).any())
+          UseMO.setIsUndef(true);
+      }
+    }
+}
+
 void AMDGPUSSARegisterAllocator::eliminateRegSequences(MachineFunction &MF) {
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
@@ -4894,6 +4931,7 @@ void AMDGPUSSARegisterAllocator::destroySSAAndRewrite(MachineFunction &MF) {
   if (EnableVerifyValueFlow)
     snapshotValueFlow(MF); // BEFORE lowerPHIs: values still SSA vregs
   lowerPHIs(MF);
+  markRegSequenceUndefLaneUses(MF);
   rewriteOperands(MF);
   eliminateRegSequences(MF);
   addPhysRegLiveIns(MF);
