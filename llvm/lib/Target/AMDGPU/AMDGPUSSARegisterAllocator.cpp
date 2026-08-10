@@ -4451,11 +4451,37 @@ void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF) {
           PhysReg = Order.front();
         }
 
-        unsigned SubIdx = MO.getSubReg();
-        if (SubIdx) {
-          PhysReg = TRI->getSubReg(PhysReg, SubIdx);
+        unsigned OrigSubIdx = MO.getSubReg();
+        if (OrigSubIdx) {
+          PhysReg = TRI->getSubReg(PhysReg, OrigSubIdx);
           assert(PhysReg && "Invalid subreg index");
           MO.setSubReg(0);
+        }
+
+        // DEAD-LANE UNDEF PROPAGATION (reaching-VNI). Check the lanes THIS operand
+        // actually reads — the full reg mask, or the subreg's lane mask for a
+        // sub-tuple read (e.g. %x.sub0_sub1 of a 128b value). If ANY read lane has
+        // no reaching value at the use, the read is partial-undef; in virtual MIR
+        // the vreg's per-subrange liveness makes that legal, but once rewritten to
+        // the physical tuple the dead lane's physreg looks read-but-never-defined
+        // and LIS/verifier reject it ("needs to be live in ... missing from
+        // live-in list"). LLVM's VirtRegRewriter marks such a read `undef`; match
+        // it. Query each subrange for the VNInfo reaching the use (getVNInfoBefore
+        // — the same reaching-VNI idiom splitLiveRangeAt / the emitter use).
+        if (MO.isUse() && !MO.isUndef() && LIS->hasInterval(VReg)) {
+          const LiveInterval &LI = LIS->getInterval(VReg);
+          if (LI.hasSubRanges()) {
+            SlotIndex UseIdx = LIS->getInstructionIndex(MI).getRegSlot();
+            LaneBitmask ReadMask =
+                OrigSubIdx ? TRI->getSubRegIndexLaneMask(OrigSubIdx)
+                           : MRI->getMaxLaneMaskForVReg(VReg);
+            LaneBitmask Reached;
+            for (const LiveInterval::SubRange &S : LI.subranges())
+              if (S.getVNInfoBefore(UseIdx))
+                Reached |= S.LaneMask;
+            if ((ReadMask & ~Reached).any()) // a READ lane has no reaching def
+              MO.setIsUndef(true);
+          }
         }
         MO.setReg(PhysReg);
       }
