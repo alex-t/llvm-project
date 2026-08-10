@@ -142,6 +142,16 @@ public:
   void rewriteDominatedUses(Register OrigVReg, Register NewSSA,
                             LaneBitmask MaskToRewrite);
 
+  /// After all repairSSAForNewDef calls for \p OrigVReg, restore intra-
+  /// instruction register coupling. SSA repair resolves each operand by its own
+  /// reaching value, so two operands of one non-PHI instruction that read
+  /// OrigVReg (one a lane-subset of the other) can land on different base regs.
+  /// Targets like AMDGPU V_MOVRELS require the narrow src to stay a subregister
+  /// of the wide (implicit-vector) use. Re-point each subset operand onto the
+  /// full-read sibling's resolved reg, sub-indexed to its lanes. No-op unless a
+  /// use instruction read OrigVReg in >=2 operands.
+  void finalizeCoupledUses(Register OrigVReg);
+
   /// Reaching-VNI path: rewrite a single use operand \p MO. Owns exactly the
   /// \p OpMask lanes whose reaching value at the use is this def (\p DefMI /
   /// \p NewSSA covering \p MaskToRewrite). Owned==OpMask -> direct NewSSA
@@ -238,6 +248,14 @@ private:
   // src0==src1-constrained instruction. Keyed by (use instr, operand lane
   // mask); reset per session.
   DenseMap<std::pair<MachineInstr *, LaneBitmask>, Register> SuperUseRSCache;
+
+  // Captured at session start (before any rewrite): per non-PHI instruction
+  // that reads OrigVReg in >=2 operands, the (operand index, original
+  // OrigVReg-namespace lane mask) of each such operand. Consumed by
+  // finalizeCoupledUses to keep a narrow operand a subreg of its full-read
+  // sibling. Reset per session, like the caches above.
+  DenseMap<MachineInstr *, SmallVector<std::pair<unsigned, LaneBitmask>, 4>>
+      CoupledUseGroups;
 
   // Reaching-def oracle (sound successor to dominance+order for lane
   // decisions). collectReachingVNIs: decompose \p Mask by OrigVReg's (old,

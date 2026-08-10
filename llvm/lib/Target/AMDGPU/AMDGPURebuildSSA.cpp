@@ -213,6 +213,11 @@ bool AMDGPURebuildSSALegacy::runOnMachineFunction(MachineFunction &MF) {
           PHIDefs.clear();
           Updater.repairSSAForNewDef(*DefMI, VReg, PHIDefs);
         }
+
+        // Restore intra-instruction register coupling that lane-by-lane repair
+        // may have severed (e.g. V_MOVRELS src0 must stay a subreg of the
+        // implicit vector use).
+        Updater.finalizeCoupledUses(VReg);
       }
     }
   }

@@ -82,6 +82,29 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
     LanePHIs.clear();
     SuperUseRSCache.clear();
 
+    // Capture intra-instruction coupling groups BEFORE any rewrite. SSA repair
+    // resolves each operand by its own reaching value, so two operands of ONE
+    // non-PHI instruction that read OrigVReg (one a lane-subset of the other)
+    // can land on different base registers. Some targets require the narrow
+    // operand to stay a subregister of the wide one (e.g. AMDGPU V_MOVRELS src0
+    // must be a subreg of the implicit vector use). For each use instruction,
+    // scan ITS operands for others reading the same reg; a group of >=2 is
+    // coupling to restore in finalizeCoupledUses.
+    CoupledUseGroups.clear();
+    for (MachineOperand &MO : MRI.use_operands(OrigVReg)) {
+      MachineInstr *UMI = MO.getParent();
+      if (UMI->isPHI())
+        continue;
+      SmallVector<std::pair<unsigned, LaneBitmask>, 4> Group;
+      for (unsigned I = 0, E = UMI->getNumOperands(); I < E; ++I) {
+        MachineOperand &Op = UMI->getOperand(I);
+        if (Op.isReg() && Op.isUse() && Op.getReg() == OrigVReg)
+          Group.push_back({I, operandLaneMask(Op)});
+      }
+      if (Group.size() >= 2)
+        CoupledUseGroups[UMI] = std::move(Group); // idempotent on repeat visits
+    }
+
     // Reaching-def oracle for this session: a frozen deep copy of OrigVReg's
     // interval whose VNInfos (def SlotIndex + isPHIDef) survive the in-place
     // renames done during repair (renaming strips a def's VNInfo from the live
@@ -594,6 +617,55 @@ void MachineLaneSSAUpdater::rewriteDominatedUses(Register OrigVReg,
   }
 
   LLVM_DEBUG(dbgs() << "  Completed rewriting dominated uses\n");
+}
+
+void MachineLaneSSAUpdater::finalizeCoupledUses(Register OrigVReg) {
+  // Only act on the session that captured these groups.
+  if (RenameSessionOrig != OrigVReg || CoupledUseGroups.empty())
+    return;
+
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  LaneBitmask FullOrig = MRI.getMaxLaneMaskForVReg(OrigVReg);
+
+  for (auto &[UMI, Ops] : CoupledUseGroups) {
+    // Coupling base = the operand that read the WHOLE OrigVReg. Whatever reg it
+    // resolved to holds every lane in OrigVReg's layout, so any sibling subset
+    // maps to a subreg of it with the same lane mask.
+    int BaseI = -1;
+    for (unsigned I = 0; I < Ops.size(); ++I)
+      if (Ops[I].second == FullOrig) {
+        BaseI = (int)I;
+        break;
+      }
+    if (BaseI < 0)
+      continue; // no whole-register read -> no anchor
+
+    MachineOperand &BaseMO = UMI->getOperand(Ops[BaseI].first);
+    if (BaseMO.getSubReg())
+      continue; // base no longer names a whole reg -> can't sub-index cleanly
+    Register BaseReg = BaseMO.getReg();
+    LaneBitmask BaseRegFull = MRI.getMaxLaneMaskForVReg(BaseReg);
+
+    for (unsigned I = 0; I < Ops.size(); ++I) {
+      if ((int)I == BaseI)
+        continue;
+      MachineOperand &MO = UMI->getOperand(Ops[I].first);
+      if (MO.getReg() == BaseReg)
+        continue; // already coupled (repair or SuperUseRSCache landed it here)
+
+      // SubMask is in OrigVReg's layout, which equals BaseReg's (BaseReg is the
+      // full-vector reconstruction), so it selects the right subreg of BaseReg.
+      LaneBitmask SubMask = Ops[I].second;
+      unsigned Sub = (SubMask == BaseRegFull)
+                         ? 0
+                         : getSubRegIndexForLaneMask(SubMask, &TRI);
+      if (!Sub && SubMask != BaseRegFull)
+        continue; // no aligned subreg for these lanes -> leave as-is (valid)
+
+      MO.setReg(BaseReg);
+      MO.setSubReg(Sub);
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
