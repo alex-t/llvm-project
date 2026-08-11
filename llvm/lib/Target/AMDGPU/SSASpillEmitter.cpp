@@ -164,18 +164,16 @@ void SSASpillEmitter::spillPhiWeb(
                     << " web=" << PhiMembers.size() << " PHIs, "
                     << GroundOps.size() << " ground ops\n");
 
-  // --- 2. Collect EXTERNAL uses (non-web-edge). Internal edges (a member feeding
-  // another web PHI) vanish when the PHIs are erased. ---
+  // --- 2. Collect the members that have an EXTERNAL use (non-web-edge). Internal
+  // edges (a member feeding another web PHI) vanish when the PHIs are erased. ---
   auto isInternalEdge = [&](MachineInstr &U) {
     return U.isPHI() && PhiMembers.count(U.getOperand(0).getReg());
   };
-  SmallVector<std::pair<MachineInstr *, Register>, 64> ExternalUses;
+  SmallSetVector<Register, 32> MembersWithExtUse;
   for (Register M : PhiMembers)
-    for (MachineInstr &U : MRI->reg_nodbg_instructions(M)) {
-      if (!U.readsVirtualRegister(M) || isInternalEdge(U))
-        continue;
-      ExternalUses.push_back({&U, M});
-    }
+    for (MachineInstr &U : MRI->reg_nodbg_instructions(M))
+      if (U.readsVirtualRegister(M) && !isInternalEdge(U))
+        MembersWithExtUse.insert(M);
 
   VRegMaskPair RootVMP(PhiResult, MRI->getMaxLaneMaskForVReg(PhiResult));
   int FI = assignVirt2StackSlot(RootVMP);
@@ -232,9 +230,6 @@ void SSASpillEmitter::spillPhiWeb(
   // (ColorFreshVReg via reloadedRegs()); the value delivery is memory on whichever
   // edge ran. This is the join-dissolution: the spilled web is FINAL (no register
   // coalescing remains — the coalescer's job on it is done by the spill).
-  SmallSetVector<Register, 32> MembersWithExtUse;
-  for (auto &[U, M] : ExternalUses)
-    MembersWithExtUse.insert(M);
   for (Register M : MembersWithExtUse) {
     MachineInstr *MDef = MRI->getUniqueVRegDef(M);
     if (!MDef)
@@ -250,6 +245,19 @@ void SSASpillEmitter::spillPhiWeb(
   }
 
   for (Register M : PhiMembers) {
+    // A member already spilled up-front (by the pre-spiller) owns a store-at-def
+    // to its OWN slot. The web supersedes that spill: the ground ops write the
+    // shared web slot FI, and any external uses of M were reloaded from FI by the
+    // loop above (it repointed M via Virt2StackSlotMap[VMP] = FI). So M's old
+    // store-at-def is now dead — nothing reads its slot — and erasing M's PHI def
+    // below would leave it reading a defless, uncolored vreg (asserts in
+    // rewriteOperands). Remove the stale store and its memo.
+    VRegMaskPair MVMP(M, MRI->getMaxLaneMaskForVReg(M));
+    if (MachineInstr *MStore = StoredAtDefinition.lookup(MVMP)) {
+      LIS->RemoveMachineInstrFromMaps(*MStore);
+      MStore->eraseFromParent();
+      StoredAtDefinition.erase(MVMP);
+    }
     if (MachineInstr *D = MRI->getUniqueVRegDef(M)) {
       LIS->RemoveMachineInstrFromMaps(*D);
       D->eraseFromParent();
