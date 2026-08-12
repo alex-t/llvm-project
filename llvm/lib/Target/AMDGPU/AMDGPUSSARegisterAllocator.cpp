@@ -14,12 +14,14 @@
 #include "SIInstrInfo.h"
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
 
@@ -660,6 +662,18 @@ void AMDGPUSSARegisterAllocator::buildVirginTierOrder(bool IsVector,
     for (MCRegUnit U : TRI->regunits(PhysReg))
       UsedByWider.set(U);
 
+  // WWM reserve: mark the reg units of the withheld VGPRs (the tail dropped by
+  // availableOrder) so a wide tuple overlapping any of them is excluded — it
+  // would consume a reserved VGPR. availableOrder handles the reserve for the
+  // 32-bit pool; here we propagate it to the wide-tuple virgin order.
+  if (IsVector) {
+    ArrayRef<MCPhysReg> Avail = availableOrder(&AMDGPU::VGPR_32RegClass);
+    for (MCRegister PR : RegClassInfo.getOrder(&AMDGPU::VGPR_32RegClass))
+      if (!llvm::is_contained(Avail, PR))
+        for (MCRegUnit U : TRI->regunits(PR))
+          UsedByWider.set(U);
+  }
+
   const TargetRegisterClass *PoolRC =
       IsVector ? TRI->getVectorSuperClassForBitWidth(WidthBits)
                : SIRegisterInfo::getSGPRClassForBitWidth(WidthBits);
@@ -800,6 +814,16 @@ AMDGPUSSARegisterAllocator::findNonInterferingGap(const TargetRegisterClass *RC,
   // enforced, matching pickFreePhysReg's IsFree.
   BitVector OccupiedUnits;
   scanOverlappersForVI(VI, OccupiedUnits, /*Overlappers=*/nullptr);
+
+  // WWM reserve: treat the withheld VGPRs (availableOrder's dropped tail) as
+  // occupied, so a gap-pick never lands a value on a reserved VGPR.
+  if (VGPRReserve && !TRI->isSGPRClass(RC)) {
+    ArrayRef<MCPhysReg> Avail = availableOrder(&AMDGPU::VGPR_32RegClass);
+    for (MCRegister PR : RegClassInfo.getOrder(&AMDGPU::VGPR_32RegClass))
+      if (!llvm::is_contained(Avail, PR))
+        for (MCRegUnit U : TRI->regunits(PR))
+          OccupiedUnits.set(U);
+  }
 
   for (MCRegister PR : RegClassInfo.getOrder(RC)) {
     // Call-clobber legality: VI cannot occupy a reg any call it crosses clobbers.
@@ -1074,7 +1098,7 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
   };
 
   uint64_t Ordinal = 0;
-  for (MCRegister PR : RegClassInfo.getOrder(RC)) {
+  for (MCRegister PR : availableOrder(RC)) {
     if (Report)
       Reporter->candidateConsidered(AttemptID, PR.id(), TRI->getName(PR),
                                     Ordinal, "first-fit-order");
@@ -1358,18 +1382,41 @@ bool AMDGPUSSARegisterAllocator::edgeCopiesNeedSplit(
 
 // [Design: region-rp-reduction, Stage 1] ---------------------------------------
 
+// THE SINGLE SOURCE OF TRUTH for "which physregs of RC may this allocation use".
+// Everything else — the colorer's candidate scan, the pressure budget
+// (allocatablePool), and the recovery/floor limits — derives from this ONE
+// function, so a register is available in exactly one, consistent sense.
+//
+// It is the target's allocation order (RegClassInfo::getOrder, the same list the
+// colorer scans) MINUS the WWM reserve: the SGPR stage runs first and may spill
+// SGPRs that lower to VGPR lanes, and the downstream WWM pass needs VGPRReserve
+// VGPRs of scratch. We drop them from the TAIL of the order (lowest-priority =
+// numeric-highest VGPRs, which is exactly where WWM's high-register reservation
+// takes its scratch). VGPRReserve is 0 during the SGPR stage and for SGPR
+// classes, so those are unaffected.
+ArrayRef<MCPhysReg>
+AMDGPUSSARegisterAllocator::availableOrder(const TargetRegisterClass *RC) const {
+  ArrayRef<MCPhysReg> Order = RegClassInfo.getOrder(RC);
+  // Reserve only from the vector file (VGPR/AGPR share the vector budget).
+  if (VGPRReserve && !TRI->isSGPRClass(RC)) {
+    unsigned Drop = std::min<unsigned>(VGPRReserve, Order.size());
+    Order = Order.drop_back(Drop);
+  }
+  return Order;
+}
+
 unsigned AMDGPUSSARegisterAllocator::allocatablePool(MachineFunction &MF,
                                                      RegFile File) const {
-  // SGPR pool is SReg_32 (94 SGPRs + VCC_LO/VCC_HI = 96), NOT SGPR_32 (94). VCC is
-  // an allocatable SReg_32 register the colorer's order includes; it is only
-  // unavailable where a VCC use is live, which per-value occupancy already handles.
-  // Counting the pool as SGPR_32 undercounted by 2 and (with the getMaxNumSGPRs
-  // limit) left region-rp gating 6 too high vs. the colorer's real 96 capacity.
+  // The colorer's real capacity is exactly the number of registers it may use =
+  // availableOrder().size(). (SReg_32 gives 96 = 94 SGPRs + VCC_LO/VCC_HI, which
+  // VCC-liveness handles per value; the vector pool has VGPRReserve withheld for
+  // WWM.) Deriving the budget from the SAME list the colorer scans keeps the
+  // pressure gate and the coloring capacity in lockstep.
   const TargetRegisterClass *RC =
       File == RegFile::SGPR   ? &AMDGPU::SReg_32RegClass
       : File == RegFile::AGPR ? &AMDGPU::AGPR_32RegClass
                               : &AMDGPU::VGPR_32RegClass;
-  return TRI->getAllocatableSet(MF, RC).count();
+  return availableOrder(RC).size();
 }
 
 unsigned AMDGPUSSARegisterAllocator::pressureOf(const GCNRegPressure &P,
@@ -1962,7 +2009,7 @@ bool AMDGPUSSARegisterAllocator::preSpillToLimitWidthAware(MachineFunction &MF) 
     // a full round did not strictly reduce it, we are in the rolling wave (or
     // stuck) — STOP and leave the honest residual to the colorer (do no harm).
     long WorstThisRound = 0;
-    for (RegFile PF : {RegFile::SGPR, RegFile::VGPR}) {
+    for (RegFile PF : {StageFile}) {
       SmallVector<TightRegion, 8> PR;
       findTightRegions(MF, PF, PR);
       for (const TightRegion &R : PR)
@@ -1977,7 +2024,7 @@ bool AMDGPUSSARegisterAllocator::preSpillToLimitWidthAware(MachineFunction &MF) 
       break;
     }
     PrevWorst = WorstThisRound;
-    for (RegFile File : {RegFile::SGPR, RegFile::VGPR}) {
+    for (RegFile File : {StageFile}) {
       SmallVector<TightRegion, 8> Regions;
       findTightRegions(MF, File, Regions);
       if (Regions.empty())
@@ -2066,7 +2113,8 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
   bool AnySpill = false;
   SmallDenseSet<Register, 32> Spilled; // never re-pick within this pass
 
-  for (bool WantVGPR : {false, true}) {
+  // Only the current allocation stage's file (SGPR stage, then VGPR stage).
+  for (bool WantVGPR : {StageFile != RegFile::SGPR}) {
     // Gate on the ALLOCATABLE POOL the colorer actually draws from, NOT the raw
     // getMaxNum* budget. getMaxNumSGPRs (102) counts SGPRs beyond the SReg_32 order
     // (96), so RP in [97,102] read "fits" while the colorer, capped at 96, left
@@ -2590,11 +2638,18 @@ AMDGPUSSARegisterAllocator::spillBlocker(Register Failed, unsigned RPLimit,
     // born-in-F: B.end>FE => liveAt(FE.prev)).
     if (!BI.liveAt(FE.getPrevSlot()))
       continue;
-    // No use of B strictly inside (FS,FE): guarantees B's reload lands past FE.
+    // B's reload must land PAST Failed's range, else it re-occupies the freed reg
+    // inside [FS,FE) and Failed still cannot be placed. A use at slot U reloads
+    // at R just BEFORE U (R < U), so a use at U == FE reloads at R with
+    // FS < R < FE — INSIDE Failed's range. Therefore a use anywhere in (FS,FE]
+    // (note the closed upper bound) disqualifies B, not just strictly inside.
+    // (This is exactly the %206-vs-%208 case: %206 and Failed share their only
+    // use at FE, so spilling %206 puts its reload where Failed is still live —
+    // useless; %208's use is strictly past FE, so freeing it genuinely helps.)
     bool UsedInside = false;
     for (const MachineOperand &MO : MRI->use_operands(B)) {
       SlotIndex U = LIS->getInstructionIndex(*MO.getParent()).getRegSlot();
-      if (FS < U && U < FE) {
+      if (FS < U && U <= FE) {
         UsedInside = true;
         break;
       }
@@ -2612,22 +2667,45 @@ AMDGPUSSARegisterAllocator::spillBlocker(Register Failed, unsigned RPLimit,
   if (Cands.empty())
     return RecoveryResult::NoOp;
 
-  // COVERAGE pick: a live-through blocker frees ALL of F (take the first one).
-  // Otherwise the born-in-F blocker with the EARLIEST def frees the longest tail
-  // [B.def,FE). Blocker LI LENGTH is irrelevant (the reload lands at the use).
+  // COVERAGE pick: a live-through blocker frees ALL of F; otherwise the born-in-F
+  // blocker with the EARLIEST def frees the longest tail [B.def,FE). Blocker LI
+  // LENGTH is irrelevant (the reload lands at the use).
+  //
+  // DETERMINISM: Cands is built in ColorMap (DenseMap) iteration order, which is
+  // NOT stable — it depends on insertion history/rehashing. Picking the "first"
+  // live-through candidate therefore made the choice depend on hash-map layout,
+  // so an unrelated change to what/when ColorMap is populated (e.g. the SGPR
+  // stage of the two-stage split) silently reordered candidates and picked a
+  // different blocker — a spurious, input-order-dependent verdict. Choose by a
+  // MEANINGFUL, stable key instead: live-through beats born-in-F (whole-F relief);
+  // within born-in-F, earliest def; ties broken by vreg index. Result is
+  // independent of ColorMap iteration order.
   Register B;
   MCRegister P;
   bool LiveThrough = false;
   SlotIndex BestDef;
   for (const auto &[CB, CP, CLive] : Cands) {
-    if (CLive) {
+    if (LiveThrough && !CLive)
+      continue; // a live-through pick already dominates any born-in-F
+    if (CLive && !LiveThrough) {
+      // First live-through seen — take it, then only a lower-index live-through
+      // can replace it (deterministic tiebreak).
       B = CB;
       P = CP;
       LiveThrough = true;
-      break; // whole-F relief; nothing beats it
+      continue;
     }
+    if (CLive) { // both live-through: lowest vreg index wins
+      if (CB < B) {
+        B = CB;
+        P = CP;
+      }
+      continue;
+    }
+    // born-in-F (only reachable while no live-through found): earliest def, then
+    // lowest vreg index.
     SlotIndex D = LIS->getInterval(CB).beginIndex();
-    if (!B || D < BestDef) {
+    if (!B || D < BestDef || (D == BestDef && CB < B)) {
       B = CB;
       P = CP;
       BestDef = D;
@@ -2822,7 +2900,8 @@ AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed, Register &Remnant
   const TargetRegisterClass *RC = MRI->getRegClass(Failed);
   bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
   const MachineFunction &MF = MRI->getMF();
-  unsigned RPLimit = IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+  unsigned RPLimit = allocatablePool(
+      const_cast<MachineFunction &>(MF), IsVGPR ? RegFile::VGPR : RegFile::SGPR);
   (void)RPLimit;
 
   // A piece that cannot settle in a register is NOT memory-spilled here (the Floor
@@ -3021,7 +3100,8 @@ AMDGPUSSARegisterAllocator::classifyRecovery(const RecoveryWindow &RW) const {
   const TargetRegisterClass *RC = MRI->getRegClass(RW.Uncolored);
   bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
   const MachineFunction &MF = MRI->getMF();
-  unsigned RPLimit = IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+  unsigned RPLimit = allocatablePool(
+      const_cast<MachineFunction &>(MF), IsVGPR ? RegFile::VGPR : RegFile::SGPR);
 
   // 1. WEB — the value feeds a PHI (divergent-diamond / loop-carried value merge).
   if (EnablePhiWebSpill && RW.WebPhi)
@@ -3079,7 +3159,8 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
   const TargetRegisterClass *RC = MRI->getRegClass(Failed);
   bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
   const MachineFunction &MF = MRI->getMF();
-  unsigned RPLimit = IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+  unsigned RPLimit = allocatablePool(
+      const_cast<MachineFunction &>(MF), IsVGPR ? RegFile::VGPR : RegFile::SGPR);
 
   LLVM_DEBUG(dbgs() << "FALLBACK for " << printReg(Failed, TRI) << " ["
                     << LIS->getInterval(Failed).beginIndex() << ","
@@ -3514,6 +3595,19 @@ void AMDGPUSSARegisterAllocator::color() {
             continue;
           }
 
+          // Stage filter: allocation runs in two independent stages, SGPR then
+          // VGPR/AGPR (fileOf maps AGPR to VGPR), so the VGPR budget can reserve
+          // scratch for the SGPR spills the first stage made. A def for the other
+          // stage is skipped; if it was already colored in the earlier stage,
+          // mark its physreg occupied so this stage does not reuse it (same
+          // treatment as a wider already-colored def above). Disjoint files, so
+          // this only reorders coloring within each file, never across.
+          if (fileOf(MRI->getRegClass(Reg)) != StageFile) {
+            if (auto It = ColorMap.find(Reg); It != ColorMap.end())
+              markOccupied(It->second);
+            continue;
+          }
+
           // Phase filter: phase 0 colors only ACL vregs, phase 1 only the rest.
           // A def for the other phase is skipped; if already colored in phase 0
           // (an ACL def revisited in phase 1), mark its physreg occupied at its
@@ -3848,15 +3942,18 @@ void AMDGPUSSARegisterAllocator::emitSwap(MachineBasicBlock &MBB,
 
   // In-place XOR swap: A ^= B; B ^= A; A ^= B.
   auto EmitXorTriplet = [&](unsigned Opc) {
-    BuildMI(MBB, InsertPt, DebugLoc(), TII->get(Opc), RegA)
-        .addReg(RegA)
-        .addReg(RegB);
-    BuildMI(MBB, InsertPt, DebugLoc(), TII->get(Opc), RegB)
-        .addReg(RegA)
-        .addReg(RegB);
-    BuildMI(MBB, InsertPt, DebugLoc(), TII->get(Opc), RegA)
-        .addReg(RegA)
-        .addReg(RegB);
+    LIS->InsertMachineInstrInMaps(
+        *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(Opc), RegA)
+             .addReg(RegA)
+             .addReg(RegB));
+    LIS->InsertMachineInstrInMaps(
+        *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(Opc), RegB)
+             .addReg(RegA)
+             .addReg(RegB));
+    LIS->InsertMachineInstrInMaps(
+        *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(Opc), RegA)
+             .addReg(RegA)
+             .addReg(RegB));
   };
 
   auto SwapInChunks = [&](unsigned ElemBytes) {
@@ -3901,20 +3998,22 @@ void AMDGPUSSARegisterAllocator::emitSwap(MachineBasicBlock &MBB,
   // place 16-bit VGPR subregs are allocated), or a 16-bit XOR triplet fallback.
   if (RegWidth == 16) {
     if (ST->hasTrue16BitInsts())
-      BuildMI(MBB, InsertPt, DebugLoc(), TII->get(AMDGPU::V_SWAP_B16), RegA)
-          .addDef(RegB)
-          .addReg(RegB)
-          .addReg(RegA);
+      LIS->InsertMachineInstrInMaps(
+          *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(AMDGPU::V_SWAP_B16), RegA)
+               .addDef(RegB)
+               .addReg(RegB)
+               .addReg(RegA));
     else
       EmitXorTriplet(AMDGPU::V_XOR_B16_fake16_e64);
     return;
   }
   if (RegWidth <= 32) {
     if (ST->hasSwap())
-      BuildMI(MBB, InsertPt, DebugLoc(), TII->get(AMDGPU::V_SWAP_B32), RegA)
-          .addDef(RegB)
-          .addReg(RegB)
-          .addReg(RegA);
+      LIS->InsertMachineInstrInMaps(
+          *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(AMDGPU::V_SWAP_B32), RegA)
+               .addDef(RegB)
+               .addReg(RegB)
+               .addReg(RegA));
     else
       EmitXorTriplet(AMDGPU::V_XOR_B32_e64);
     return;
@@ -3974,10 +4073,11 @@ void AMDGPUSSARegisterAllocator::breakCycleViaMemory(
                     << TRI->getName(CycleStart) << ":\n");
 
   // Save CycleStart to the slot (its register is about to be overwritten).
-  // NB: like the rest of resolvePermutation (SSA destruction, post-coloring), we
-  // do NOT maintain SlotIndexes/LIS here — they are no longer needed downstream.
+  // Keep SlotIndexes consistent: a later allocation stage queries
+  // getInstructionIndex over the whole function.
   TII->storeRegToStackSlot(MBB, InsertPt, CycleStart, /*isKill=*/false, FI, RC,
                            TRI, /*VReg=*/Register());
+  LIS->InsertMachineInstrInMaps(*std::prev(InsertPt));
 
   // Walk the cycle: each Cur gets its Src via a register copy, except the final
   // member (whose Src is CycleStart, now on the stack) which is reloaded.
@@ -3989,12 +4089,14 @@ void AMDGPUSSARegisterAllocator::breakCycleViaMemory(
       assert(Src == CycleStart && "Cycle walk did not return to start");
       TII->loadRegFromStackSlot(MBB, InsertPt, Cur, FI, RC, TRI,
                                 /*VReg=*/Register());
+      LIS->InsertMachineInstrInMaps(*std::prev(InsertPt));
       LLVM_DEBUG(dbgs() << "      reload: fi=" << FI << " -> "
                         << TRI->getName(Cur) << "\n");
       break;
     }
-    BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY), Cur)
-        .addReg(Src);
+    LIS->InsertMachineInstrInMaps(
+        *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY), Cur)
+             .addReg(Src));
     LLVM_DEBUG(dbgs() << "      " << TRI->getName(Src) << " -> "
                       << TRI->getName(Cur) << "\n");
     Cur = Src;
@@ -4059,8 +4161,9 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
     MCRegister Dst = Ready.pop_back_val();
     MCRegister Src = DstToSrc[Dst];
     DstToSrc.erase(Dst);
-    BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY), Dst)
-        .addReg(Src);
+    LIS->InsertMachineInstrInMaps(
+        *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY), Dst)
+             .addReg(Src));
     LLVM_DEBUG(dbgs() << "    copy: " << TRI->getName(Src) << " -> "
                       << TRI->getName(Dst) << "\n");
     if (--SrcRefCount[Src] == 0 && DstToSrc.count(Src))
@@ -4190,8 +4293,10 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
 
       // Save CycleStart — it will be overwritten by the first copy.
       // The last register in the walk receives this saved value.
-      BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY), Scratch)
-          .addReg(CycleStart);
+      LIS->InsertMachineInstrInMaps(
+          *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY),
+                   Scratch)
+               .addReg(CycleStart));
       LLVM_DEBUG(dbgs() << "      save: " << TRI->getName(CycleStart) << " -> "
                         << TRI->getName(Scratch) << "\n");
 
@@ -4201,14 +4306,18 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
         DstToSrc.erase(Cur);
         if (!DstToSrc.count(Src)) {
           assert(Src == CycleStart && "Cycle walk did not return to start");
-          BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY), Cur)
-              .addReg(Scratch);
+          LIS->InsertMachineInstrInMaps(
+              *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY),
+                       Cur)
+                   .addReg(Scratch));
           LLVM_DEBUG(dbgs() << "      restore: " << TRI->getName(Scratch)
                             << " -> " << TRI->getName(Cur) << "\n");
           break;
         }
-        BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY), Cur)
-            .addReg(Src);
+        LIS->InsertMachineInstrInMaps(
+            *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(TargetOpcode::COPY),
+                     Cur)
+                 .addReg(Src));
         LLVM_DEBUG(dbgs() << "      " << TRI->getName(Src) << " -> "
                           << TRI->getName(Cur) << "\n");
         Cur = Src;
@@ -4247,7 +4356,7 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
   MaxSGPRIdx = std::max(MaxSGPRIdx, PeakSGPR);
 }
 
-void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
+void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
   LLVM_DEBUG(dbgs() << "\n=== SSA Destruction ===\n");
 
   SmallVector<MachineInstr *, 16> PHIsToErase;
@@ -4271,6 +4380,10 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
         break;
 
       Register DstVReg = MI.getOperand(0).getReg();
+      // Two-stage lowering: handle only this stage's file; the other file's PHIs
+      // are lowered (and erased) in its own stage.
+      if (fileOf(MRI->getRegClass(DstVReg)) != Only)
+        continue;
       MCRegister DstPhys = ColorMap.lookup(DstVReg);
       assert(DstPhys && "PHI result not colored");
 
@@ -4382,8 +4495,10 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
       // drop them; the remainder are real copies handed to resolvePermutation.
       for (auto *It = Copies.begin(); It != Copies.end();) {
         if (!It->first) {
-          BuildMI(*InsertMBB, InsertPt, DebugLoc(),
-                  TII->get(TargetOpcode::IMPLICIT_DEF), It->second);
+          MachineInstr *IDef =
+              BuildMI(*InsertMBB, InsertPt, DebugLoc(),
+                      TII->get(TargetOpcode::IMPLICIT_DEF), It->second);
+          LIS->InsertMachineInstrInMaps(*IDef);
           It = Copies.erase(It);
         } else {
           ++It;
@@ -4393,8 +4508,14 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
     }
   }
 
-  for (MachineInstr *PHI : PHIsToErase)
+  for (MachineInstr *PHI : PHIsToErase) {
+    // Keep SlotIndexes consistent: a later allocation stage queries
+    // getInstructionIndex over the whole function, so an erased instr must leave
+    // the maps.
+    if (Indexes->hasIndex(*PHI))
+      LIS->RemoveMachineInstrFromMaps(*PHI);
     PHI->eraseFromParent();
+  }
 
   LLVM_DEBUG(dbgs() << "  Erased " << PHIsToErase.size() << " PHIs\n");
 
@@ -4408,7 +4529,8 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF) {
                          << "\n");
 }
 
-void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF) {
+void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF,
+                                                 RegFile Only) {
   LLVM_DEBUG(dbgs() << "\n=== Operand Rewrite ===\n");
 
   for (MachineBasicBlock &MBB : MF) {
@@ -4422,6 +4544,10 @@ void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF) {
           continue;
 
         Register VReg = MO.getReg();
+        // Two-stage rewrite: the SGPR stage rewrites only SGPR vregs (leaving
+        // VGPR vregs virtual for the VGPR stage), and vice versa.
+        if (fileOf(MRI->getRegClass(VReg)) != Only)
+          continue;
         MCRegister PhysReg = ColorMap.lookup(VReg);
         if (!PhysReg) {
           // A vreg that only ever appears as an `undef` operand has no value to
@@ -4539,7 +4665,7 @@ void AMDGPUSSARegisterAllocator::finalizeProperties(MachineFunction &MF) {
 // instructions placed immediately before the REG_SEQUENCE, then the
 // REG_SEQUENCE is deleted.
 void AMDGPUSSARegisterAllocator::markRegSequenceUndefLaneUses(
-    MachineFunction &MF) {
+    MachineFunction &MF, RegFile Only) {
   // A REG_SEQUENCE with an `undef` source leaves the destination lanes it feeds
   // undefined. That is legal on the vreg (per-subrange liveness), but once the
   // result is rewritten to a physical tuple the dead lane looks read-but-never-
@@ -4557,6 +4683,8 @@ void AMDGPUSSARegisterAllocator::markRegSequenceUndefLaneUses(
       Register Dst = MI.getOperand(0).getReg();
       if (!Dst.isVirtual())
         continue;
+      if (fileOf(MRI->getRegClass(Dst)) != Only)
+        continue; // handled in the other file's stage
       LaneBitmask UndefLanes;
       for (unsigned I = 1, E = MI.getNumOperands(); I + 1 < E; I += 2)
         if (MI.getOperand(I).isUndef())
@@ -4581,6 +4709,12 @@ void AMDGPUSSARegisterAllocator::eliminateRegSequences(MachineFunction &MF) {
       if (!MI.isRegSequence())
         continue;
 
+      // Two-stage rewrite: a REG_SEQUENCE whose result is still VIRTUAL belongs
+      // to a file not yet rewritten (the other stage lowers it once its operands
+      // are physical). Only lower RS whose result was rewritten to a physreg by
+      // this stage's rewriteOperands.
+      if (MI.getOperand(0).getReg().isVirtual())
+        continue;
       MCRegister Dst = MI.getOperand(0).getReg().asMCReg();
       LLVM_DEBUG(dbgs() << "  [RegSeq] lowering " << MI);
 
@@ -4634,6 +4768,9 @@ void AMDGPUSSARegisterAllocator::eliminateRegSequences(MachineFunction &MF) {
         }
       }
       resolvePermutation(MBB, MI, Copies);
+      // Keep SlotIndexes consistent for a later allocation stage's queries.
+      if (Indexes->hasIndex(MI))
+        LIS->RemoveMachineInstrFromMaps(MI);
       MI.eraseFromParent();
     }
   }
@@ -4921,20 +5058,25 @@ bool AMDGPUSSARegisterAllocator::verifyValueFlow(MachineFunction &MF) {
   return false;
 }
 
-void AMDGPUSSARegisterAllocator::destroySSAAndRewrite(MachineFunction &MF) {
-  if (hasCFPseudos(MF)) {
-    LLVM_DEBUG(dbgs() << "SSA Destruction: skipped — "
-                         "SI control-flow pseudos present\n");
-    return;
-  }
-
-  if (EnableVerifyValueFlow)
-    snapshotValueFlow(MF); // BEFORE lowerPHIs: values still SSA vregs
-  lowerPHIs(MF);
-  markRegSequenceUndefLaneUses(MF);
-  rewriteOperands(MF);
+void AMDGPUSSARegisterAllocator::rewriteStage(MachineFunction &MF,
+                                              RegFile Only) {
+  // Rewrite ONE file's vregs to physregs and lower its PHIs / REG_SEQUENCEs.
+  // The other file stays virtual for its own stage; eliminateRegSequences skips
+  // a still-virtual (other-file) RS result. The driver calls this per stage,
+  // between that stage's coloring and the next stage's.
+  lowerPHIs(MF, Only);
+  markRegSequenceUndefLaneUses(MF, Only);
+  rewriteOperands(MF, Only);
   eliminateRegSequences(MF);
+  // Add THIS stage's cross-block physreg live-ins now, while its ColorMap is
+  // still intact (the next stage clears ColorMap). addPhysRegLiveIns reads
+  // ColorMap + LIS, so a single end-of-run call would miss the earlier stage's
+  // entries. It only ADDS (sortUniqueLiveIns), so running per stage is safe.
   addPhysRegLiveIns(MF);
+}
+
+void AMDGPUSSARegisterAllocator::finalizeAfterRewrite(MachineFunction &MF) {
+  // Run ONCE after both files are physical.
   finalizeProperties(MF);
   if (EnableVerifyValueFlow)
     verifyValueFlow(MF); // AFTER: everything physical
@@ -4954,6 +5096,14 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   RegClassInfo.runOnMachineFunction(MF);
   DynVGPRBlockSize =
       ST->isDynamicVGPREnabled() ? ST->getDynamicVGPRBlockSize() : 0;
+
+  // SI control-flow pseudos (SI_IF/ELSE/LOOP/END_CF/IF_BREAK) must be lowered
+  // before register allocation. If any survive, the pass pipeline is broken —
+  // there is nothing sound to do (SSA destruction cannot run with unlowered CF).
+  // Fail loudly rather than silently coloring and skipping the rewrite.
+  if (hasCFPseudos(MF))
+    report_fatal_error("AMDGPUSSARegisterAllocator: SI control-flow pseudos not "
+                       "lowered before register allocation (broken pipeline)");
 
   LLVM_DEBUG(dbgs() << "AMDGPUSSARegisterAllocator: Processing " << MF.getName()
                     << "\n");
@@ -4976,6 +5126,21 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   if (EnableAGPRRescue)
     widenToAVOnUnified(); // before classifyVRegs: widened widths feed the order
   classifyVRegs();
+
+  // TWO INDEPENDENT ALLOCATION STAGES: SGPR first, then VGPR/AGPR. The SGPR
+  // stage may spill SGPRs; those spills lower (downstream) to VGPR lanes needing
+  // WWM scratch. Between stages we reserve ceil(spilledSGPRlanes / wavesize)
+  // VGPRs (VGPRReserve, withheld by allocatablePool) so the VGPR stage does not
+  // consume the whole file. Each stage colors, recovers, and rewrites ONLY its
+  // file's vregs (StageFile filters color()/preSpill/region-rp/rewriteStage);
+  // the files are disjoint register sets, so this only reorders within a file.
+  Emitter->clearSGPRSpillLanes();
+  for (RegFile Stage : {RegFile::SGPR, RegFile::VGPR}) {
+    StageFile = Stage;
+    VGPRReserve = (Stage == RegFile::VGPR)
+                      ? divideCeil(Emitter->numSGPRSpillLanes(),
+                                   ST->isWave32() ? 32u : 64u)
+                      : 0;
   OccupiedRegUnits.clear();
   OccupiedRegUnits.resize(TRI->getNumRegUnits());
   ColorMap.clear();
@@ -5147,15 +5312,22 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       const TargetRegisterClass *RC = MRI->getRegClass(R);
       bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
       unsigned RPLimit =
-          IsVGPR ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+          allocatablePool(MF, IsVGPR ? RegFile::VGPR : RegFile::SGPR);
       reportPointOverPressure(R, IsVGPR, RPLimit, "worklist-drained");
     }
   }
 
+    // Rewrite THIS stage's vregs to physregs now, so the next stage starts with
+    // only the other file still virtual (and the SGPR spill count is final for
+    // the VGPR stage's VGPRReserve). The whole-function finalize runs once after
+    // the loop.
+    rewriteStage(MF, StageFile);
+  } // end of the two allocation stages
+
   // E17 RunCompleted: flush this function's record to the configured sinks.
   Reporter->endRun(UncolorableVRegs.size());
 
-  destroySSAAndRewrite(MF);
+  finalizeAfterRewrite(MF);
 
   return true;
 }

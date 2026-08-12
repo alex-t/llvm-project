@@ -103,6 +103,11 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   unsigned MaxVGPRIdx = 0;
   unsigned MaxSGPRIdx = 0;
   unsigned MaxAGPRIdx = 0;
+  // VGPRs withheld from the vector (VGPR/AGPR) allocatable budget for the WWM
+  // scratch that downstream SGPR-spill lowering needs. Set by the driver after
+  // the SGPR allocation stage from the emitter's spilled-SGPR-lane count; 0
+  // during the SGPR stage. Consumed by allocatablePool().
+  unsigned VGPRReserve = 0;
   // (call def-slot, call instruction) for every call; a vreg live across a call
   // must avoid every register the call clobbers (regmask + explicit defs).
   SmallVector<std::pair<SlotIndex, const MachineInstr *>, 8> CallSites;
@@ -260,6 +265,12 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// and AGPR share one budget — enumerate only SGPR + (unified) VGPR there.
   enum class RegFile { SGPR, VGPR, AGPR };
 
+  // The register file the current allocation stage owns. Allocation runs in two
+  // independent stages — SGPR first, then VGPR (fileOf maps AGPR to VGPR, so the
+  // vector stage handles VGPR+AGPR). color()/preSpill/region-rp process only
+  // values of StageFile; the driver sets it before each stage.
+  RegFile StageFile = RegFile::SGPR;
+
   /// [Stage 1] A tight region: a contiguous slot span within ONE block whose
   /// all-live RP in \p File exceeds the allocatable-pool limit. Half-open slot
   /// pair label; a value "crosses" it if its interval overlaps [Start,End).
@@ -280,6 +291,13 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// count) — the number the colorer draws from; the region target is RP <= this.
   /// NOT raw getMaxNum* (102/64), NOT the spiller's margined value.
   unsigned allocatablePool(MachineFunction &MF, RegFile File) const;
+
+  /// THE single source of truth for which physregs of \p RC this allocation may
+  /// use: RegClassInfo::getOrder(RC) minus the WWM reserve (VGPRReserve, dropped
+  /// from the tail for vector classes). The colorer scans this, and
+  /// allocatablePool() is its size — so coloring capacity and the pressure
+  /// budget never diverge.
+  ArrayRef<MCPhysReg> availableOrder(const TargetRegisterClass *RC) const;
 
   /// [Stage 1] Per-file pressure at a tracker point. VGPR uses the UNIFIED count
   /// on gfx90a+ (arch+agpr+avgpr share one budget) and arch-VGPR alone otherwise;
@@ -590,8 +608,12 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
 
   // === SSA Destruction + Operand Rewrite ===
   bool hasCFPseudos(MachineFunction &MF) const;
-  void destroySSAAndRewrite(MachineFunction &MF);
-  void lowerPHIs(MachineFunction &MF);
+  // Rewrite one file's vregs to physregs (lowerPHIs + rewriteOperands +
+  // eliminateRegSequences), scoped to \p Only. Called per allocation stage.
+  void rewriteStage(MachineFunction &MF, RegFile Only);
+  // Post-both-stages finalize: physreg live-ins, MF properties, value-flow check.
+  void finalizeAfterRewrite(MachineFunction &MF);
+  void lowerPHIs(MachineFunction &MF, RegFile Only);
   void resolvePermutation(
       MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
       SmallVectorImpl<std::pair<MCRegister, MCRegister>> &Copies);
@@ -612,12 +634,12 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
                               const DenseMap<MCRegister, MCRegister> &CycleRegs);
   void emitSwap(MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
                 MCRegister RegA, MCRegister RegB);
-  void rewriteOperands(MachineFunction &MF);
+  void rewriteOperands(MachineFunction &MF, RegFile Only);
   /// Before rewriteOperands: for each REG_SEQUENCE with an `undef` source, mark
   /// the result's uses that read an undef lane `undef`, so the flag survives onto
   /// the physical read (else the dead tuple lane is read-but-never-defined -> the
   /// post-RA LIS verifier fatals "missing from live-in list").
-  void markRegSequenceUndefLaneUses(MachineFunction &MF);
+  void markRegSequenceUndefLaneUses(MachineFunction &MF, RegFile Only);
   void eliminateRegSequences(MachineFunction &MF);
   void addPhysRegLiveIns(MachineFunction &MF);
   void finalizeProperties(MachineFunction &MF);

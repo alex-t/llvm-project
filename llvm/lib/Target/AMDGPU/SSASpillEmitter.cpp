@@ -88,6 +88,11 @@ int SSASpillEmitter::assignVirt2StackSlot(VRegMaskPair VMP) {
   const TargetRegisterClass *RC = VMP.getRegClass(MRI, TRI);
   int FI = createSpillSlot(RC);
   Virt2StackSlotMap[VMP] = FI;
+  // Count SGPR spill lanes once per spilled value (this is the miss path — a
+  // dedup hit above returns early). Only when SGPR spills consume VGPR lanes
+  // downstream; the RA reserves VGPRs against this count for WWM lowering.
+  if (TRI->spillSGPRToVGPR() && TRI->isSGPRClass(RC))
+    NumSGPRSpillLanes += TRI->getRegSizeInBits(*RC) / 32;
   return FI;
 }
 

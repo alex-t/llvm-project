@@ -177,6 +177,14 @@ class SSASpillEmitter {
   // record observable facts. NEVER mutated by this class beyond recording.
   SSAForensicReporter *Reporter = nullptr;
 
+  // Total SGPR lanes spilled this function (each spilled SGPR value's dword
+  // width), counted only when SGPR spills lower to VGPR lanes
+  // (TRI->spillSGPRToVGPR()). The RA reads this after the SGPR allocation stage
+  // to reserve ceil(lanes / wavesize) VGPRs for the downstream WWM SGPR-spill
+  // lowering, so the VGPR stage does not consume the whole file. Reset per
+  // function by the RA.
+  unsigned NumSGPRSpillLanes = 0;
+
   // PHI web members erased by the last spillPhiWeb() call (caller prunes ColorMap).
   SmallVector<Register, 32> LastWebErased;
   // Ground operands the last spillPhiWeb() stored (the driver marks them Spilled
@@ -299,6 +307,12 @@ public:
   /// immediately re-spilled.
   const VRegMaskPairSet &reloadedRegs() const { return ReloadedRegs; }
   void clearReloadedRegs() { ReloadedRegs.clear(); }
+
+  /// Total SGPR lanes spilled so far (see NumSGPRSpillLanes). The RA reads this
+  /// after the SGPR allocation stage to reserve VGPRs for WWM SGPR-spill
+  /// lowering, and clears it per function.
+  unsigned numSGPRSpillLanes() const { return NumSGPRSpillLanes; }
+  void clearSGPRSpillLanes() { NumSGPRSpillLanes = 0; }
 
   /// True if any reload path left SSA transiently broken and it was not repaired
   /// (defensive; normally false — inline repair clears it).
