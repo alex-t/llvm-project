@@ -37,8 +37,8 @@ namespace llvm {
 cl::opt<bool> EnableAMDGPUSSAACLColoring(
     "amdgpu-ssa-acl-coloring",
     cl::desc("Enable around-call-liver two-phase coloring and the spiller's "
-             "preserved-register-pressure gate (default off; work in progress)"),
-    cl::init(false), cl::Hidden);
+             "preserved-register-pressure gate (default on; corpus-validated)"),
+    cl::init(true), cl::Hidden);
 } // namespace llvm
 
 // Width-tiered coloring experiment: in a narrower width tier, prefer aligned
@@ -48,7 +48,7 @@ cl::opt<bool> EnableAMDGPUSSAACLColoring(
 // getOrder scan (hole-scan with interference check) for the rest. Off by default
 // so we can A/B against current behavior.
 static cl::opt<bool> EnableVirginOrder(
-    "amdgpu-ssa-virgin-order", cl::Hidden, cl::init(false),
+    "amdgpu-ssa-virgin-order", cl::Hidden, cl::init(true),
     cl::desc("Width-tiered coloring: scan whole-function-virgin aligned tuples "
              "first in pickFreePhysReg (SSARA experiment)"));
 
@@ -74,7 +74,7 @@ static cl::opt<bool> EnablePreSpill(
              "recovery never fires. Off = current (color-then-recover)."));
 
 static cl::opt<bool> EnablePreSpillWA(
-    "amdgpu-ssa-pre-spill-wa", cl::Hidden, cl::init(false),
+    "amdgpu-ssa-pre-spill-wa", cl::Hidden, cl::init(true),
     cl::desc("Width-aware up-front spiller: like -amdgpu-ssa-pre-spill but the "
              "victim universe spans ALL widths and spills are WIDEST-FIRST, "
              "decrementing region peak by the victim's real dword width. Models "
@@ -92,7 +92,7 @@ static cl::opt<bool> VerifyValueFlowFatal(
     cl::desc("Abort on a value-flow violation (default: warn to stderr)"));
 
 static cl::opt<bool> EnableAGPRRescue(
-    "amdgpu-ssa-agpr-rescue", cl::Hidden, cl::init(false),
+    "amdgpu-ssa-agpr-rescue", cl::Hidden, cl::init(true),
     cl::desc("On unified-file targets, widen VGPR-class vregs to the av_ vector "
              "super-class up front when every operand constraint admits AGPRs, "
              "so narrow values can draw the virgin AGPR tuples left free by "
@@ -103,7 +103,7 @@ static cl::opt<bool> EnableAGPRRescue(
 // crossers across tight regions to drop RP <= pool, then re-color from clean.
 // Default off; the reproducer/corpus gate flips it on.
 static cl::opt<bool> EnableRegionRP(
-    "amdgpu-ssa-region-rp", cl::Hidden, cl::init(false),
+    "amdgpu-ssa-region-rp", cl::Hidden, cl::init(true),
     cl::desc("Reduce register pressure region-by-region (spill cost-ranked "
              "live-through crossers across each tight region) before re-coloring, "
              "instead of the per-failed-value coloring-time recovery"));
@@ -113,7 +113,7 @@ static cl::opt<bool> EnableRegionRP(
 // erase the PHIs) instead of storing the PHI result at the saturated join (which
 // is useless — the store lands inside the wall it should dissolve). Default off.
 static cl::opt<bool> EnablePhiWebSpill(
-    "amdgpu-ssa-phi-web-spill", cl::Hidden, cl::init(false),
+    "amdgpu-ssa-phi-web-spill", cl::Hidden, cl::init(true),
     cl::desc("region-rp: spill a PHI victim as an in-memory-coalesced web"));
 
 // Shadow register-tree oracle (SSARegisterTree). When on AND the forensic sink
