@@ -692,6 +692,16 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
       const TargetRegisterClass *Cand =
           Idx ? TRI->getSubRegisterClass(FullRC, Idx) : nullptr;
       if (Cand) {
+        // getSubRegisterClass(av_*, subN) returns a VGPR-only slice class, so a
+        // slice of an AGPR-eligible (vector-super) spill loses AGPR-eligibility ->
+        // its reload can only land in an arch-VGPR. Under the AGPR-first experiment
+        // promote the slice to the av super-class of the same width so the reload
+        // may re-home to a free AGPR (Greedy's v_accvgpr scratch). Gated: the
+        // default keeps the VGPR-only slice class (byte-identical to before).
+        if (AGPRFirst && TRI->isVectorSuperClass(FullRC))
+          if (const TargetRegisterClass *AV =
+                  TRI->getVectorSuperClassForBitWidth(W * 32))
+            Cand = AV;
         SubRC = Cand;
         SubIdx = Idx;
         Start = S;

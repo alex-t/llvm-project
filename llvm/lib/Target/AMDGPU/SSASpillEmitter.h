@@ -172,6 +172,12 @@ class SSASpillEmitter {
   // Set transiently if a reload redef leaves SSA broken; inline repair clears it.
   bool SSAInvalidated = false;
 
+  // Experiment gate (mirrors the RA's -amdgpu-ssa-agpr-first). When true, a
+  // sub-register reload slice of a vector-super (av_) value keeps the av class so
+  // it may re-home to AGPR; default false = old VGPR-only slice class. Set by the
+  // RA via setAGPRFirst().
+  bool AGPRFirst = false;
+
   // Forensic reporter (observer, borrowed, may be null). When non-null and
   // enabled, spillAtDefinition / phi-web stores (E14) and reload emission (E15)
   // record observable facts. NEVER mutated by this class beyond recording.
@@ -234,6 +240,7 @@ public:
   /// Attach the forensic reporter (observer; may be null). Records spill/reload
   /// facts (E14/E15) when set and enabled. Does not take ownership.
   void setReporter(SSAForensicReporter *R) { Reporter = R; }
+  void setAGPRFirst(bool V) { AGPRFirst = V; }
 
   /// Provide the effective kill block for \p SpillBB after hoisting out of all
   /// enclosing loops (outermost preheader), or \p SpillBB unchanged. The spiller

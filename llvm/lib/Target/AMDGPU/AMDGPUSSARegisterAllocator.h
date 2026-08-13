@@ -225,7 +225,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// terminal with a monotone-progress detector (candidate length decreasing OR a
   /// blocker spilled) that breaks the SelfSplit<->CrossLiver cycle.
   enum class RecoveryState {
-    Start, Web, CrossLiver, SelfSplit, Floor, OK, Infeasible
+    Start, Web, CrossLiver, SelfSplit, AGPRRelief, Floor, OK, Infeasible
   };
 
   /// Spill a colored blocker B (occupying a physreg P legal for \p Failed) to
@@ -321,6 +321,30 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void findTightRegions(MachineFunction &MF, RegFile File,
                         SmallVectorImpl<TightRegion> &Out) const;
 
+  /// Within tight region \p R, find the peak-RP slot at which \p V is LIVE (not
+  /// R's global peak, which may fall outside V's range). Returns {slot, RP}; RP is
+  /// 0 if V is live at no in-region slot. Same GCNUpwardRPTracker + pressureOf
+  /// machinery as findTightRegions, so the RP is bit-identical.
+  std::pair<SlotIndex, unsigned>
+  peakSlotForValueInRegion(const TightRegion &R, Register V) const;
+
+  /// Spill victims from ONE tight region until its total-dword excess (Peak-Limit)
+  /// is gone. Candidates are frozen-\p Universe values of \p R's file, live at
+  /// R.PeakSlot, not already in \p Spilled, and admitted by \p Eligible; chosen
+  /// over-subscribed-then-widest-first, each decrementing the excess by its real
+  /// width. Spilled victims are added to \p Spilled. Returns true if it spilled.
+  /// Shared by the width-aware pre-spiller (Eligible = always) and AGPR-relief
+  /// (Eligible = avReloadLegal, so reloads re-home to a free AGPR).
+  /// If \p NumRecolored is non-null, it is incremented by the number of victims
+  /// relieved by AGPR RECOLOR (not memory spill) — a MONOTONE action (AGPR budget
+  /// and the frozen universe both strictly shrink), so a round that recolored is
+  /// always real progress and the caller must NOT apply its rolling-wave guard.
+  bool relieveTightRegion(const TightRegion &R,
+                          const SmallDenseSet<Register, 128> &Universe,
+                          SmallDenseSet<Register, 64> &Spilled,
+                          llvm::function_ref<bool(Register)> Eligible,
+                          unsigned *NumRecolored = nullptr);
+
   /// Naive up-front pre-spiller. At each tight region's peak slot, spill
   /// widest-first live values (kill-at-def memory spill) until point-RP <= the
   /// allocatable pool, iterating (re-measure) until no tight region remains. Runs
@@ -410,6 +434,28 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// the same pressure (a spill-reload thrash). No non-PHI use -> trivially viable.
   /// The Floor-vs-Infeasible discriminator.
   bool floorViable(Register R, bool IsVGPR, unsigned RPLimit) const;
+
+  /// Unified-file (gfx90a+) VGPR-saturation relief: spill an av-LEGAL colored
+  /// crosser of \p Failed so its reload re-homes to a free AGPR (availableOrder
+  /// lists VGPRs then AGPRs; when VGPRs are saturated the reload falls through to
+  /// an AGPR), freeing a VGPR across Failed's range. Resolved if Failed then
+  /// colors; NoOp otherwise (freed nothing usable -> Floor).
+  RecoveryResult agprRelief(Register Failed, unsigned RPLimit);
+
+  /// True iff \p B's reload may legally be colored to an AGPR: every operand
+  /// admits an AGPR (av_ is a subclass of each operand's required class) and no
+  /// operand is a sub-register slice. Same legality test as widenToAVOnUnified.
+  bool avReloadLegal(Register B) const;
+
+  /// LAST-DITCH rescue fired right before reportPointOverPressure would abort. On
+  /// a unified target, when \p R cannot be placed in the VGPR file (its whole
+  /// range is VGPR-clobbered / over-pressure) but the AGPR file has a free tuple
+  /// of R's width, HOME R in an AGPR and insert a short AGPR->VGPR copy before each
+  /// VGPR-only-constrained use (the copy lives only [copy,use] -> trivially
+  /// colorable). This is Greedy's v_accvgpr_read pattern for an asm-pinned block.
+  /// Returns true if R was rescued (colored); false if the conditions do not hold
+  /// (caller then screams). Flag-gated on EnableAGPRFirst.
+  bool tryAGPRHomeRescue(Register R);
 
   /// FSM transition: given the current handler \p S and its \p R result, return
   /// the next state per the recovery transition table.

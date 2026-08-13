@@ -48,9 +48,15 @@ cl::opt<bool> EnableAMDGPUSSAACLColoring(
 // getOrder scan (hole-scan with interference check) for the rest. Off by default
 // so we can A/B against current behavior.
 static cl::opt<bool> EnableVirginOrder(
-    "amdgpu-ssa-virgin-order", cl::Hidden, cl::init(true),
+    "amdgpu-ssa-virgin-order", cl::Hidden, cl::init(false),
     cl::desc("Width-tiered coloring: scan whole-function-virgin aligned tuples "
              "first in pickFreePhysReg (SSARA experiment)"));
+
+static cl::opt<bool> EnableAGPRFirst(
+    "amdgpu-ssa-agpr-first", cl::Hidden, cl::init(false),
+    cl::desc("On unified targets, order av_ classes AGPR-first so av-legal values "
+             "drain AGPRs before arch-VGPRs (SSARA experiment; can starve "
+             "frame-lowering's VGPR-spill-to-AGPR scratch)"));
 
 static cl::opt<bool> EnableSlotDelta(
     "amdgpu-ssa-slot-delta", cl::Hidden, cl::init(false),
@@ -241,6 +247,80 @@ void AMDGPUSSARegisterAllocator::widenToAVOnUnified() {
                         << TRI->getRegClassName(AV) << "\n");
     }
   }
+}
+
+bool AMDGPUSSARegisterAllocator::avReloadLegal(Register B) const {
+  if (!ST->hasGFX90AInsts())
+    return false;
+  const TargetRegisterClass *RC = MRI->getRegClass(B);
+  unsigned Bits = TRI->getRegSizeInBits(*RC);
+  const TargetRegisterClass *AV = TRI->getVectorSuperClassForBitWidth(Bits);
+  if (!AV)
+    return false;
+  for (MachineOperand &MO : MRI->reg_nodbg_operands(B)) {
+    if (MO.getSubReg())
+      return false;
+    MachineInstr *MI = MO.getParent();
+    const TargetRegisterClass *OpRC =
+        TII->getRegClass(MI->getDesc(), MO.getOperandNo(), TRI);
+    if (!OpRC)
+      continue; // COPY/PHI/REG_SEQUENCE: no encoding constraint
+    if (TRI->getCommonSubClass(AV, OpRC) != AV)
+      return false;
+  }
+  return true;
+}
+
+AMDGPUSSARegisterAllocator::RecoveryResult
+AMDGPUSSARegisterAllocator::agprRelief(Register Failed, unsigned RPLimit) {
+  if (!EnableAGPRFirst || !ST->hasGFX90AInsts() ||
+      fileOf(MRI->getRegClass(Failed)) != RegFile::VGPR)
+    return RecoveryResult::NoOp;
+  const LiveInterval &FI = LIS->getInterval(Failed);
+
+  // TRIGGER on ARCH-VGPR-file saturation at Failed's own point, NOT on
+  // findTightRegions (which uses UNIFIED VGPR+AGPR pressure and reads "fits"
+  // whenever AGPRs are free, so it cannot see arch-VGPR exhaustion). Spill the
+  // widest VGPR-resident crosser: its SI_SPILL_V reload re-homes to a free AGPR
+  // via frame lowering's allocateVGPRSpillToAGPR (== Greedy's v_accvgpr scratch),
+  // freeing an arch-VGPR for the VGPR-only Failed.
+  Register BestB;
+  unsigned BestW = 0;
+  for (const auto &[B, PR] : ColorMap) {
+    if (B == Failed || !LIS->hasInterval(B) || LIS->getInterval(B).empty())
+      continue;
+    if (!TRI->isVGPRClass(TRI->getPhysRegBaseClass(PR)))
+      continue; // freeing an AGPR does not relieve the arch-VGPR file
+    if (!LIS->getInterval(B).overlaps(FI))
+      continue;
+    unsigned W = TRI->getRegSizeInBits(*MRI->getRegClass(B)) / 32;
+    if (W > BestW) {
+      BestW = W;
+      BestB = B;
+    }
+  }
+  if (!BestB)
+    return RecoveryResult::NoOp;
+
+  LLVM_DEBUG(dbgs() << "  AGPR-relief: spill VGPR crosser "
+                    << printReg(BestB, TRI) << " (w=" << BestW
+                    << ") -> reload AGPR-backed, free VGPR for "
+                    << printReg(Failed, TRI) << "\n");
+  Emitter->beginPass(/*IsVGPR=*/true);
+  Emitter->spillOneVMP(VRegMaskPair(BestB, MRI->getMaxLaneMaskForVReg(BestB)),
+                       LIS->getInterval(BestB).beginIndex(), RPLimit);
+  ColorMap.erase(BestB);
+  for (const VRegMaskPair &VMP : Emitter->reloadedRegs()) {
+    Register RD = VMP.getVReg();
+    if (RD.isVirtual() && LIS->hasInterval(RD) && !ColorMap.count(RD) &&
+        !MRI->reg_nodbg_empty(RD) && !colorOneInPlace(RD))
+      UncolorableVRegs.push_back(RD);
+  }
+  if (SSAForensicReporter::enabled())
+    Reporter->transformation("agpr-relief", Failed.virtRegIndex());
+  if (colorOneInPlace(Failed))
+    return RecoveryResult::Resolved;
+  return RecoveryResult::NoOp; // freed a VGPR but Failed still stuck -> Floor
 }
 
 void AMDGPUSSARegisterAllocator::markOccupied(MCRegister PhysReg) {
@@ -1026,11 +1106,62 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     return true;
   };
 
+  // PRESSURE-TARGETED AGPR PREFERENCE (unified targets). An av_ value can live in
+  // either arch-VGPR or AGPR. When the PEAK arch-VGPR pressure OVER THIS VALUE'S
+  // RANGE exceeds the pool, this av value should drain an AGPR so arch-VGPRs stay
+  // free for VGPR-only values (Greedy-style). Peak-over-range (not def-point
+  // occupancy) is required: width-descending colors wide av values FIRST when the
+  // file is still empty, so def-point occupancy is 0 and misses the pressure the
+  // value's own long range creates across a hot region (e.g. a block pinned live
+  // across an atomic loop). Computed BEFORE the phi-affinity hint so a physreg-copy
+  // hint to an arch-VGPR (e.g. %v = COPY $vgpr0..31) does NOT pin this value into
+  // the VGPR file under pressure — we accept a cheap v<->a copy at the fixed-reg
+  // boundary instead (exactly Greedy's v_accvgpr scratch). Only under pressure ->
+  // low-pressure functions are untouched.
+  bool PreferAGPR = false;
+  if (EnableAGPRFirst && ST->hasGFX90AInsts() && TRI->isVectorSuperClass(RC)) {
+    unsigned VGPRPool = allocatablePool(
+        const_cast<MachineFunction &>(MRI->getMF()), RegFile::VGPR);
+    unsigned Peak = 0;
+    MachineFunction &MF = const_cast<MachineFunction &>(MRI->getMF());
+    for (MachineBasicBlock &MBB : MF) {
+      if (MBB.empty())
+        continue;
+      GCNUpwardRPTracker Tracker(*LIS);
+      Tracker.reset(MBB);
+      for (MachineInstr &MI : llvm::reverse(MBB)) {
+        if (MI.isDebugInstr())
+          continue;
+        Tracker.recede(MI);
+        if (MI.isPHI())
+          continue;
+        SlotIndex SI = LIS->getInstructionIndex(MI).getRegSlot();
+        if (SI < VI.beginIndex() || VI.endIndex() <= SI)
+          continue;
+        Peak = std::max(Peak, pressureOf(Tracker.getPressure(), RegFile::VGPR));
+      }
+    }
+    PreferAGPR = Peak > VGPRPool;
+  }
+  // Under pressure, take a free AGPR now (before the VGPR-affinity hint).
+  if (PreferAGPR) {
+    for (MCRegister PR : availableOrder(RC))
+      if (TRI->isAGPRClass(TRI->getPhysRegBaseClass(PR)) && IsFree(PR)) {
+        LLVM_DEBUG(dbgs() << "    AGPR-preferred pick: " << TRI->getName(PR)
+                          << "\n");
+        return PR;
+      }
+  }
+
   // Option B: prefer a phi-partner's color if it is a legal member of RC and
   // free. Hints are pre-ordered hottest-first by collectPhiHints; take the first
   // that fits. RC->contains guards against a partner whose class differs from RC.
+  // Skipped under PreferAGPR: a VGPR-affinity hint would re-pin this value into
+  // the saturated VGPR file (the AGPR scan above already tried the good target).
   uint64_t HintOrdinal = 0;
   for (MCRegister Hint : Hints) {
+    if (PreferAGPR)
+      break;
     if (!Hint || !RC->contains(Hint))
       continue;
     if (Report)
@@ -1425,12 +1556,22 @@ unsigned AMDGPUSSARegisterAllocator::pressureOf(const GCNRegPressure &P,
   case RegFile::SGPR:
     return P.getSGPRNum();
   case RegFile::AGPR:
-    // Separate AGPR file (non-unified targets only; see findTightRegions caller).
     return P.getAGPRNum();
   case RegFile::VGPR:
-    // On a UNIFIED target (gfx90a+) arch-VGPR and AGPR share one budget, so the
-    // VGPR file's pressure is the unified count (arch+agpr+avgpr). On a
-    // non-unified target it is arch-VGPR alone; AGPR is a separate RegFile pass.
+    // TWO-FILE MODEL (flag-gated, EXPERIMENT): the VGPR file's demand is arch-VGPR
+    // (arch + avgpr); AGPR is its OWN file (case above), so a value colored to AGPR
+    // relieves the VGPR file — which the old unified sum cannot express.
+    //
+    // NOT neutral by default: the earlier "identical when Value[AGPR]==0" argument
+    // is FALSE in practice because agpr-rescue (default ON) already places values
+    // in AGPRs, so AGPR!=0 on much AGPR-using code (e.g. buffer-fat-pointer-*),
+    // where getArchVGPRNum() != getVGPRNum(true). Using arch-VGPR there shifted
+    // spill decisions and produced "undefined physical register" crashes. So the
+    // two-file metric is gated on EnableAGPRFirst; the default path keeps the
+    // unified count exactly as before. PERMANENT FIX (make the two-file model
+    // uniformly correct on AGPR-using code so it can be default) is a follow-up.
+    if (EnableAGPRFirst)
+      return P.getArchVGPRNum();
     return ST->hasGFX90AInsts() ? P.getVGPRNum(/*UnifiedVGPRFile=*/true)
                                 : P.getArchVGPRNum();
   }
@@ -1438,16 +1579,17 @@ unsigned AMDGPUSSARegisterAllocator::pressureOf(const GCNRegPressure &P,
 }
 
 // Feasibility policy moved from the Emitter (which is pure spill/reload mechanics).
-// Bit-identical to the former SSASpillEmitter bodies: getVGPRNum(hasGFX90A), NOT
-// pressureOf's getArchVGPRNum (they differ by the AGPR term on non-unified targets;
-// see reloadRPBeforeUse header note).
+// Same VGPR metric as pressureOf: two-file arch-VGPR under EnableAGPRFirst, else
+// the unified count (kept default so AGPR-using code is byte-identical to before).
 unsigned AMDGPUSSARegisterAllocator::reloadRPBeforeUse(const MachineInstr *UseMI,
                                                        bool IsVGPR) const {
   GCNUpwardRPTracker Tracker(*LIS);
   Tracker.reset(*UseMI);
   Tracker.recede(*UseMI);
   GCNRegPressure P = Tracker.getPressure();
-  return IsVGPR ? P.getVGPRNum(ST->hasGFX90AInsts()) : P.getSGPRNum();
+  if (!IsVGPR)
+    return P.getSGPRNum();
+  return EnableAGPRFirst ? P.getArchVGPRNum() : P.getVGPRNum(ST->hasGFX90AInsts());
 }
 
 unsigned AMDGPUSSARegisterAllocator::reloadRPAtBlockEnd(const MachineBasicBlock *NCD,
@@ -1455,7 +1597,9 @@ unsigned AMDGPUSSARegisterAllocator::reloadRPAtBlockEnd(const MachineBasicBlock 
   GCNUpwardRPTracker Tracker(*LIS);
   Tracker.reset(*NCD);
   GCNRegPressure P = Tracker.getPressure();
-  return IsVGPR ? P.getVGPRNum(ST->hasGFX90AInsts()) : P.getSGPRNum();
+  if (!IsVGPR)
+    return P.getSGPRNum();
+  return EnableAGPRFirst ? P.getArchVGPRNum() : P.getVGPRNum(ST->hasGFX90AInsts());
 }
 
 void AMDGPUSSARegisterAllocator::findTightRegions(
@@ -1914,8 +2058,11 @@ bool AMDGPUSSARegisterAllocator::preSpillToLimit(MachineFunction &MF) {
     if (TRI->getRegSizeInBits(*MRI->getRegClass(V)) / 32 == 1)
       Universe.insert(V);
   }
-  const unsigned CAP = 40;             // mirror region-rp MaxRounds backstop
-  for (unsigned G = 0; G < CAP; ++G) {
+  // TERMINATION: NO cap. The victim UNIVERSE is frozen (no reload redef ever
+  // enters it) and Spilled grows by >=1 on every acting round, so Universe\Spilled
+  // strictly shrinks and is bounded below by 0. A round that spills nothing sets
+  // !Changed and breaks. Hence at most |Universe| acting rounds.
+  while (true) {
     bool Changed = false;
     for (RegFile File : {RegFile::SGPR, RegFile::VGPR}) {
       SmallVector<TightRegion, 8> Regions;
@@ -1961,6 +2108,140 @@ bool AMDGPUSSARegisterAllocator::preSpillToLimit(MachineFunction &MF) {
   return Any;
 }
 
+std::pair<SlotIndex, unsigned>
+AMDGPUSSARegisterAllocator::peakSlotForValueInRegion(const TightRegion &R,
+                                                     Register V) const {
+  // Walk R's block bottom-to-top (same tracker as findTightRegions) and record
+  // the max-RP slot at which V is live. This is the slot recovery must relieve:
+  // spilling victims at R's GLOBAL peak is useless if V is dead there (a plateau
+  // region where V occupies only a sub-span).
+  const LiveInterval &VI = LIS->getInterval(V);
+  SlotIndex BestSlot;
+  unsigned BestRP = 0;
+  GCNUpwardRPTracker Tracker(*LIS);
+  Tracker.reset(*R.MBB);
+  for (MachineInstr &MI : llvm::reverse(*R.MBB)) {
+    if (MI.isDebugInstr())
+      continue;
+    Tracker.recede(MI);
+    if (MI.isPHI())
+      continue; // PHIs carry no real pressure (see findTightRegions)
+    SlotIndex SI = LIS->getInstructionIndex(MI).getRegSlot();
+    if (SI < R.Start || R.End <= SI)
+      continue; // outside the region span
+    if (!VI.liveAt(SI))
+      continue; // V not live here -> spilling here cannot relieve V
+    unsigned RP = pressureOf(Tracker.getPressure(), R.File);
+    if (RP > BestRP) {
+      BestRP = RP;
+      BestSlot = SI;
+    }
+  }
+  return {BestSlot, BestRP};
+}
+
+bool AMDGPUSSARegisterAllocator::relieveTightRegion(
+    const TightRegion &R, const SmallDenseSet<Register, 128> &Universe,
+    SmallDenseSet<Register, 64> &Spilled,
+    llvm::function_ref<bool(Register)> Eligible, unsigned *NumRecolored) {
+  long Excess = long(R.Peak) - long(R.Limit); // total-dword excess (sound)
+  if (Excess <= 0)
+    return false;
+  // Candidates: frozen-universe values of THIS file, live at the peak slot,
+  // not already spilled, admitted by Eligible. Nothing is colored yet in the
+  // pre-spill path; in recovery the caller reads liveness from LIS all the same.
+  struct Cand {
+    Register V;
+    unsigned W;
+  };
+  SmallVector<Cand, 32> Cands;
+  SmallDenseMap<unsigned, unsigned, 8> LiveByWidth; // width -> #live
+  for (Register V : Universe) {
+    if (Spilled.count(V) || MRI->reg_nodbg_empty(V) || !LIS->hasInterval(V))
+      continue;
+    const TargetRegisterClass *RC = MRI->getRegClass(V);
+    if (fileOf(RC) != R.File)
+      continue;
+    if (!LIS->getInterval(V).liveAt(R.PeakSlot))
+      continue;
+    if (!Eligible(V))
+      continue;
+    unsigned W = TRI->getRegSizeInBits(*RC) / 32;
+    Cands.push_back({V, W ? W : 1});
+    LiveByWidth[W ? W : 1] += 1;
+  }
+  // Per-width over-subscription: live(W) > floor(Limit / W). Diagnostic + a
+  // selection key (over-subscribed classes are the aligned-slot pressure).
+  auto overSubscribed = [&](unsigned W) {
+    unsigned Cap = R.Limit / (W ? W : 1);
+    auto It = LiveByWidth.find(W);
+    return It != LiveByWidth.end() && It->second > Cap;
+  };
+  LLVM_DEBUG({
+    for (auto &KV : LiveByWidth)
+      if (overSubscribed(KV.first))
+        dbgs() << "    [WA] " << (R.File == RegFile::SGPR ? "SGPR" : "VGPR")
+               << " width-" << KV.first << " OVER: live=" << KV.second
+               << " cap=" << (R.Limit / KV.first) << "\n";
+  });
+  // Order: over-subscribed classes first, then WIDEST-first (max dword relief
+  // per spill and frees a full aligned region), then vreg id for determinism.
+  llvm::sort(Cands, [&](const Cand &A, const Cand &B) {
+    bool OA = overSubscribed(A.W), OB = overSubscribed(B.W);
+    if (OA != OB)
+      return OA;
+    if (A.W != B.W)
+      return A.W > B.W;
+    return A.V.id() < B.V.id();
+  });
+  // AGPR budget for unified-target relief-by-recolor (see below). The pre-spiller
+  // runs BEFORE color(), so nothing is colored yet; model the free AGPR file by
+  // its pool size and debit each recolored victim's width. Conservative: assumes
+  // the AGPR file starts empty (true for these SSARA-target functions, which do
+  // not use AGPRs for compute).
+  long AGPRBudget = 0;
+  if (EnableAGPRFirst && ST->hasGFX90AInsts() && R.File == RegFile::VGPR)
+    AGPRBudget = allocatablePool(
+        const_cast<MachineFunction &>(MRI->getMF()), RegFile::AGPR);
+
+  bool Any = false;
+  for (const Cand &C : Cands) {
+    if (Excess <= 0)
+      break; // DO NO HARM: stop as soon as the region fits again
+    // RELIEF BY AGPR RECOLOR (unified targets, av-legal victim, AGPR file has
+    // room): move the value's HOME to the AGPR file instead of a memory round-trip.
+    // The value stays one live value; its fixed-VGPR def/use COPYs lower to
+    // v_accvgpr_write/read via copyPhysReg (exactly Greedy's AGPR scratch). This
+    // removes C.V from VGPR demand with NO store/reload (no reload re-pressure).
+    if (AGPRBudget >= long(C.W) && TRI->isVectorSuperClass(MRI->getRegClass(C.V))) {
+      const TargetRegisterClass *AGPR =
+          TRI->getEquivalentAGPRClass(MRI->getRegClass(C.V));
+      if (AGPR) {
+        LLVM_DEBUG(dbgs() << "    [WA] AGPR-recolor " << printReg(C.V, TRI)
+                          << " w=" << C.W << " -> " << TRI->getRegClassName(AGPR)
+                          << " (excess " << Excess << "->" << (Excess - long(C.W))
+                          << ", agprBudget " << AGPRBudget << "->"
+                          << (AGPRBudget - long(C.W)) << ")\n");
+        MRI->setRegClass(C.V, AGPR);
+        Spilled.insert(C.V); // never re-pick this victim
+        Excess -= long(C.W);
+        AGPRBudget -= long(C.W);
+        Any = true;
+        continue;
+      }
+    }
+    LLVM_DEBUG(dbgs() << "    [WA] spill " << printReg(C.V, TRI) << " w=" << C.W
+                      << " -> excess " << Excess << "->" << (Excess - long(C.W))
+                      << "\n");
+    Emitter->spillOneVMP(VRegMaskPair(C.V, MRI->getMaxLaneMaskForVReg(C.V)),
+                         LIS->getInterval(C.V).beginIndex(), R.Limit);
+    Spilled.insert(C.V);
+    Excess -= long(C.W); // width-aware decrement: frees W dwords at once
+    Any = true;
+  }
+  return Any;
+}
+
 bool AMDGPUSSARegisterAllocator::preSpillToLimitWidthAware(MachineFunction &MF) {
   // WIDTH-AWARE up-front spiller (-amdgpu-ssa-pre-spill-wa). Same tight-region /
   // kill-at-def+reload-at-use machinery as preSpillToLimit, but two things change
@@ -1995,35 +2276,37 @@ bool AMDGPUSSARegisterAllocator::preSpillToLimitWidthAware(MachineFunction &MF) 
       continue;
     Universe.insert(V);
   }
-  const unsigned CAP = 40; // mirror region-rp MaxRounds backstop
-  long PrevWorst = -1;     // global worst (Peak-Limit) at the START of last round
-  for (unsigned G = 0; G < CAP; ++G) {
+  // TERMINATION + DO-NO-HARM, one progress metric, NO cap. The measure is the
+  // TOTAL excess = sum over tight regions of max(0, Peak-Limit). A kept round must
+  // STRICTLY reduce it:
+  //  - relief (spill or AGPR-recolor) of any region lowers that region's excess,
+  //    reducing the sum — even when a DIFFERENT region still holds the max (the
+  //    reason a per-region-MAX metric wrongly stalled: it ignored progress made on
+  //    a non-max region);
+  //  - a memory spill whose reloads re-materialize pressure elsewhere (fresh vregs
+  //    outside the frozen universe, unspillable) fails to reduce the sum — the
+  //    rolling wave — and bails, leaving the residual to the colorer (do no harm).
+  // The sum is a non-negative integer strictly decreasing on every kept round, so
+  // the loop terminates in at most its initial value of rounds without a backstop.
+  long PrevTotal = -1; // total excess at the START of the last round
+  while (true) {
     bool Changed = false;
-    // NO-PROGRESS / ROLLING-WAVE GUARD. A memory spill re-materializes the value
-    // at each reload-at-use; in a densely-used hot region those reloads can push
-    // the peak right back up. Because reloads are fresh vregs OUTSIDE the frozen
-    // universe, we cannot spill them, so re-measuring the peak (which now counts
-    // them) makes us chase pressure we created — draining the universe until it is
-    // empty and handing color() a spilled-everything mess that its recovery loop
-    // then spins on. Snapshot the global worst excess at the top of each round; if
-    // a full round did not strictly reduce it, we are in the rolling wave (or
-    // stuck) — STOP and leave the honest residual to the colorer (do no harm).
-    long WorstThisRound = 0;
+    long TotalThisRound = 0;
     for (RegFile PF : {StageFile}) {
       SmallVector<TightRegion, 8> PR;
       findTightRegions(MF, PF, PR);
       for (const TightRegion &R : PR)
-        WorstThisRound = std::max(WorstThisRound, long(R.Peak) - long(R.Limit));
+        TotalThisRound += std::max(0L, long(R.Peak) - long(R.Limit));
     }
-    if (WorstThisRound == 0)
+    if (TotalThisRound == 0)
       break; // every point fits — done
-    if (PrevWorst >= 0 && WorstThisRound >= PrevWorst) {
-      LLVM_DEBUG(dbgs() << "    [WA] no progress (worst excess " << PrevWorst
-                        << " -> " << WorstThisRound
+    if (PrevTotal >= 0 && TotalThisRound >= PrevTotal) {
+      LLVM_DEBUG(dbgs() << "    [WA] no progress (total excess " << PrevTotal
+                        << " -> " << TotalThisRound
                         << "): rolling wave, hand residual to colorer\n");
       break;
     }
-    PrevWorst = WorstThisRound;
+    PrevTotal = TotalThisRound;
     for (RegFile File : {StageFile}) {
       SmallVector<TightRegion, 8> Regions;
       findTightRegions(MF, File, Regions);
@@ -2031,68 +2314,9 @@ bool AMDGPUSSARegisterAllocator::preSpillToLimitWidthAware(MachineFunction &MF) 
         continue;
       Emitter->beginPass(File == RegFile::VGPR);
       for (const TightRegion &R : Regions) {
-        long Excess = long(R.Peak) - long(R.Limit); // total-dword excess (sound)
-        if (Excess <= 0)
-          continue;
-        // Candidates: frozen-universe values of THIS file, live at the peak slot,
-        // not already spilled. Nothing is colored yet, so read liveness from LIS.
-        struct Cand {
-          Register V;
-          unsigned W;
-        };
-        SmallVector<Cand, 32> Cands;
-        SmallDenseMap<unsigned, unsigned, 8> LiveByWidth; // width -> #live
-        for (Register V : Universe) {
-          if (Spilled.count(V) || MRI->reg_nodbg_empty(V) ||
-              !LIS->hasInterval(V))
-            continue;
-          const TargetRegisterClass *RC = MRI->getRegClass(V);
-          if (fileOf(RC) != File)
-            continue;
-          if (!LIS->getInterval(V).liveAt(R.PeakSlot))
-            continue;
-          unsigned W = TRI->getRegSizeInBits(*RC) / 32;
-          Cands.push_back({V, W ? W : 1});
-          LiveByWidth[W ? W : 1] += 1;
-        }
-        // Per-width over-subscription: live(W) > floor(Limit / W). Diagnostic + a
-        // selection key (over-subscribed classes are the aligned-slot pressure).
-        auto overSubscribed = [&](unsigned W) {
-          unsigned Cap = R.Limit / (W ? W : 1);
-          auto It = LiveByWidth.find(W);
-          return It != LiveByWidth.end() && It->second > Cap;
-        };
-        LLVM_DEBUG({
-          for (auto &KV : LiveByWidth)
-            if (overSubscribed(KV.first))
-              dbgs() << "    [WA] " << (File == RegFile::SGPR ? "SGPR" : "VGPR")
-                     << " width-" << KV.first << " OVER: live=" << KV.second
-                     << " cap=" << (R.Limit / KV.first) << "\n";
-        });
-        // Order: over-subscribed classes first, then WIDEST-first (max dword
-        // relief per spill and frees a full aligned region), then vreg id for
-        // determinism.
-        llvm::sort(Cands, [&](const Cand &A, const Cand &B) {
-          bool OA = overSubscribed(A.W), OB = overSubscribed(B.W);
-          if (OA != OB)
-            return OA;
-          if (A.W != B.W)
-            return A.W > B.W;
-          return A.V.id() < B.V.id();
-        });
-        for (const Cand &C : Cands) {
-          if (Excess <= 0)
-            break; // DO NO HARM: stop as soon as the region fits again
-          LLVM_DEBUG(dbgs() << "    [WA] spill " << printReg(C.V, TRI) << " w="
-                            << C.W << " -> excess " << Excess << "->"
-                            << (Excess - long(C.W)) << "\n");
-          Emitter->spillOneVMP(
-              VRegMaskPair(C.V, MRI->getMaxLaneMaskForVReg(C.V)),
-              LIS->getInterval(C.V).beginIndex(), R.Limit);
-          Spilled.insert(C.V);
-          Excess -= long(C.W); // width-aware decrement: frees W dwords at once
+        if (relieveTightRegion(R, Universe, Spilled,
+                               [](Register) { return true; }))
           Any = Changed = true;
-        }
       }
     }
     if (!Changed)
@@ -3010,6 +3234,90 @@ AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed, Register &Remnant
   return handBack(Cur, Pieces);
 }
 
+bool AMDGPUSSARegisterAllocator::tryAGPRHomeRescue(Register R) {
+  // Fired right before reportPointOverPressure would abort. Greedy's pattern for a
+  // value whose whole VGPR live range is clobbered (e.g. an inline-asm ;def that
+  // implicit-defs all 64 VGPRs) but that has VGPR-only-constrained uses: HOME the
+  // value in an AGPR (survives the VGPR clobber), then copy AGPR->VGPR into a fresh
+  // short-lived vreg right before each VGPR-only use.
+  if (!EnableAGPRFirst || !ST->hasGFX90AInsts())
+    return false;
+  const TargetRegisterClass *RC = MRI->getRegClass(R);
+  if (fileOf(RC) != RegFile::VGPR || TRI->isAGPRClass(RC))
+    return false;
+  if (!LIS->hasInterval(R) || ColorMap.count(R))
+    return false;
+
+  // PRECONDITION: R must be genuinely un-placeable in the VGPR file (no VGPR is
+  // free across its whole range — the clobbered-range case). If a VGPR IS free,
+  // R is not stuck and the normal floor/spill is correct; do NOT hijack it. This
+  // also keeps the rescue from firing on ordinary over-pressure (where a memory
+  // spill is the right relief). colorOneInPlace probes the current ColorMap and
+  // does not commit on failure.
+  if (colorOneInPlace(R)) {
+    ColorMap.erase(R); // undo the probe commit — leave R uncolored for the caller
+    return false;
+  }
+
+  // Home R in the AGPR file: switch its class to the equivalent AGPR class and
+  // color it there. colorOneInPlace's IsFree honors the VGPR-only clobber sites
+  // (they do not touch AGPRs), so a free AGPR of R's width exists iff the AGPR
+  // file is not itself saturated across R's range.
+  const TargetRegisterClass *AGPR = TRI->getEquivalentAGPRClass(RC);
+  if (!AGPR)
+    return false;
+  const TargetRegisterClass *SavedRC = RC;
+  MRI->setRegClass(R, AGPR);
+  if (!colorOneInPlace(R)) {
+    MRI->setRegClass(R, SavedRC); // AGPR file also full -> genuinely stuck
+    return false;
+  }
+
+  // R is now AGPR-homed. Every use in a VGPR-only-constrained operand must read a
+  // VGPR: insert `%tmp:VGPR = COPY R` before the using instruction and repoint the
+  // operand. %tmp lives only [copy, use] (the clobber is elsewhere) so it colors
+  // trivially. Collect first (mutating operands while iterating use_operands is
+  // unsafe).
+  SmallVector<MachineOperand *, 8> NeedsCopy;
+  for (MachineOperand &MO : MRI->use_operands(R)) {
+    if (MO.getSubReg())
+      return false; // sub-register use: not handled (conservative)
+    MachineInstr *MI = MO.getParent();
+    if (MI->isPHI())
+      continue; // PHI operand: a physical AGPR is fine at the edge
+    const TargetRegisterClass *OpRC =
+        TII->getRegClass(MI->getDesc(), MO.getOperandNo(), TRI);
+    if (!OpRC)
+      continue; // COPY/REG_SEQUENCE: no encoding constraint (AGPR ok)
+    if (TRI->getCommonSubClass(AGPR, OpRC))
+      continue; // this use already accepts an AGPR -> no copy needed
+    NeedsCopy.push_back(&MO);
+  }
+  for (MachineOperand *MO : NeedsCopy) {
+    MachineInstr *MI = MO->getParent();
+    Register Tmp = MRI->createVirtualRegister(SavedRC); // VGPR_32 of R's width
+    MachineInstr *Copy =
+        BuildMI(*MI->getParent(), MI, MI->getDebugLoc(),
+                TII->get(TargetOpcode::COPY), Tmp)
+            .addReg(R);
+    LIS->InsertMachineInstrInMaps(*Copy);
+    MO->setReg(Tmp);
+    LIS->createAndComputeVirtRegInterval(Tmp);
+    if (!colorOneInPlace(Tmp))
+      UncolorableVRegs.push_back(Tmp); // should not happen: [copy,use] is tiny
+  }
+  // R's interval changed (uses repointed to copies); recompute so downstream
+  // rewrite sees the truncated AGPR range.
+  LIS->removeInterval(R);
+  LIS->createAndComputeVirtRegInterval(R);
+  LLVM_DEBUG(dbgs() << "  [AGPR-home-rescue] " << printReg(R, TRI) << " -> "
+                    << TRI->getName(ColorMap.lookup(R)) << ", " << NeedsCopy.size()
+                    << " a->v copies\n");
+  if (SSAForensicReporter::enabled())
+    Reporter->transformation("agpr-home-rescue", R.virtRegIndex());
+  return true;
+}
+
 void AMDGPUSSARegisterAllocator::reportPointOverPressure(Register R,
                                                          bool IsVGPR,
                                                          unsigned RPLimit,
@@ -3118,7 +3426,14 @@ AMDGPUSSARegisterAllocator::classifyRecovery(const RecoveryWindow &RW) const {
   //    are crossers to peel around; else go straight to the terminal fork.
   if (!RW.Crossers.empty())
     return RecoveryState::SelfSplit;
-  // 4. TERMINAL — nothing structural applies. Memory-spill Failed iff a reload
+  // 4. AGPR-RELIEF — no clean crosser to spill-around, but on a unified vector
+  //    file a colored av-legal crosser can be spilled so its reload re-homes to
+  //    a free AGPR, freeing a VGPR for Failed. Try before the memory floor.
+  //    Flag-gated (experiment; can leave reload redefs uncolored -> rewrite bug).
+  if (EnableAGPRFirst && ST->hasGFX90AInsts() &&
+      (TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC)))
+    return RecoveryState::AGPRRelief;
+  // 5. TERMINAL — nothing structural applies. Memory-spill Failed iff a reload
   //    fits (Floor); else genuine point-over-pressure (Infeasible).
   return floorViable(RW.Uncolored, IsVGPR, RPLimit) ? RecoveryState::Floor
                                                     : RecoveryState::Infeasible;
@@ -3141,6 +3456,8 @@ AMDGPUSSARegisterAllocator::nextRecoveryState(RecoveryState S,
   case RecoveryState::CrossLiver:
     return RecoveryState::SelfSplit;
   case RecoveryState::SelfSplit:
+    return RecoveryState::AGPRRelief;
+  case RecoveryState::AGPRRelief:
     return RecoveryState::Floor;
   default:
     return RecoveryState::Floor;
@@ -3274,11 +3591,31 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
         State = reclassify(Rem, LenBefore);
         continue;
       }
-      State = nextRecoveryState(State, R); // NoOp -> Floor
+      State = nextRecoveryState(State, R); // NoOp -> AGPRRelief
+      continue;
+    }
+
+    case RecoveryState::AGPRRelief: {
+      // AGPR-home rescue: if Cur cannot live in any VGPR (its VGPR range is fully
+      // clobbered), home it in an AGPR + a->v copies at VGPR-only uses. Preferred
+      // over the spill-based relief because it does not spill a crosser (which
+      // could leave that crosser's reload uncolored). Falls through to Floor if
+      // Cur is not clobber-stuck (tryAGPRHomeRescue's VGPR-probe precondition).
+      if (tryAGPRHomeRescue(Cur))
+        return true; // OK
+      State = nextRecoveryState(State, RecoveryResult::NoOp); // -> Floor
       continue;
     }
 
     case RecoveryState::Floor: {
+      // AGPR-HOME first (unified target): if Cur cannot live in ANY VGPR across
+      // its range (its whole VGPR range is clobbered — e.g. an inline-asm ;def
+      // that implicit-defs all 64 VGPRs), a memory spill is useless (the reload
+      // lands in the same clobbered file). Home it in an AGPR + a->v copies at
+      // VGPR-only uses (Greedy's v_accvgpr_read). Strictly better than memory when
+      // it applies; no-op returns false and falls through to the normal floor.
+      if (tryAGPRHomeRescue(Cur))
+        return true;
       // Terminal decision on the CURRENT candidate: memory-spill iff a reload
       // fits, else genuine over-pressure.
       if (!floorViable(Cur, IsVGPR, RPLimit))
@@ -3302,6 +3639,8 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
     }
 
     case RecoveryState::Infeasible:
+      if (tryAGPRHomeRescue(Cur))
+        return true; // rescued: AGPR-homed with a->v copies at VGPR-only uses
       reportPointOverPressure(Cur, IsVGPR, RPLimit, "classified-infeasible"); // noreturn
 
     case RecoveryState::Start:
@@ -5122,6 +5461,28 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
   Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT, MLI);
   Emitter->setReporter(Reporter.get());
+  Emitter->setAGPRFirst(EnableAGPRFirst);
+
+  // Erase fully-DEAD IMPLICIT_DEFs (def-only vreg, zero uses) before coloring.
+  // Such an instruction produces no value, but if left in it is still colored to a
+  // physreg and lowered to `dead $vgprN.. = IMPLICIT_DEF`, whose physical write
+  // CLOBBERS any value live across that point (the colorer does not mark a dead
+  // def occupied, so a later-colored overlapping value picks the same register ->
+  // "Using an undefined physical register" at the clobbered value's next use).
+  // Removing it is semantics-preserving (no uses) and eliminates the phantom
+  // clobber at the source.
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+      if (!MI.isImplicitDef())
+        continue;
+      Register D = MI.getOperand(0).getReg();
+      if (!D.isVirtual() || !MRI->use_nodbg_empty(D))
+        continue; // has a use (real undef source) -> keep
+      LIS->RemoveMachineInstrFromMaps(MI);
+      if (LIS->hasInterval(D))
+        LIS->removeInterval(D);
+      MI.eraseFromParent();
+    }
 
   if (EnableAGPRRescue)
     widenToAVOnUnified(); // before classifyVRegs: widened widths feed the order
@@ -5177,10 +5538,16 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // no uncolorables remain, or a pass performs no spill (genuine residual for the
   // split path), guarded by a hard cap.
   if (EnableRegionRP && !UncolorableVRegs.empty()) {
-    const unsigned MaxRounds = 40;
-    SmallDenseSet<Register, 128> PrevUncolorable;
-    for (unsigned Round = 0; Round < MaxRounds && !UncolorableVRegs.empty();
-         ++Round) {
+    // TERMINATION by a strictly-decreasing measure — NO iteration cap. The
+    // uncolorable COUNT is a non-negative integer; a round is kept only if it
+    // STRICTLY reduces that count (see the break below). A strictly-decreasing
+    // non-negative integer reaches its bound (0, or a no-progress round) in at
+    // most its initial value of steps, so the loop terminates without a backstop.
+    // A crawling set (673->595->591) is strict progress and continues; a stuck
+    // set (591->591, or the diamond-in-every-region case) does not decrease and
+    // bails to the per-value split path.
+    unsigned PrevCount = UncolorableVRegs.size();
+    for (unsigned Round = 0; !UncolorableVRegs.empty(); ++Round) {
       LLVM_DEBUG(dbgs() << "=== region-rp round " << Round << ": "
                         << UncolorableVRegs.size()
                         << " uncolorable -> spill-across pass ===\n");
@@ -5206,28 +5573,20 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       // E3 RoundCompleted (a spill happened this round).
       Reporter->roundCompleted(Round, UncolorableVRegs.size(),
                                /*Spilled=*/true, RoundID);
-      // NO-PROGRESS BREAK (WIP — under investigation): if a round spilled yet left
-      // the IDENTICAL uncolorable set, region-rp's spill-across cannot relieve them
-      // (diamond values used inside every crossing region). Break to the per-value
-      // fallback rather than spin to MaxRounds (the 1024 compile-time blowup).
-      // NOTE: too strict — a crawling set (e.g. 673->595->591) never trips this;
-      // tomorrow: loosen to a peak-based / weak-progress signal.
-      SmallDenseSet<Register, 128> Cur(UncolorableVRegs.begin(),
-                                       UncolorableVRegs.end());
-      if (Round > 0 && Cur.size() == PrevUncolorable.size()) {
-        bool Same = true;
-        for (Register R : Cur)
-          if (!PrevUncolorable.count(R)) {
-            Same = false;
-            break;
-          }
-        if (Same) {
-          LLVM_DEBUG(dbgs() << "=== region-rp: no progress (identical "
-                            << Cur.size() << " uncolorable) -> stop ===\n");
-          break;
-        }
+      // PROGRESS = strict decrease of the uncolorable count. This round spilled
+      // (reduceRegionPressure returned true) and recolored from clean; if that did
+      // not reduce how many values remain uncolorable, spill-across cannot relieve
+      // the residual (e.g. diamond values used inside every crossing region), so
+      // further rounds would only churn. Bail to the per-value split path. This is
+      // the sole termination condition — the measure strictly decreases every kept
+      // round and is bounded below by 0.
+      unsigned CurCount = UncolorableVRegs.size();
+      if (CurCount >= PrevCount) {
+        LLVM_DEBUG(dbgs() << "=== region-rp: no progress (" << PrevCount << " -> "
+                          << CurCount << " uncolorable) -> stop ===\n");
+        break;
       }
-      PrevUncolorable = std::move(Cur);
+      PrevCount = CurCount;
     }
     LLVM_DEBUG(dbgs() << "=== region-rp: converged with "
                       << UncolorableVRegs.size()
@@ -5309,6 +5668,8 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       Register R = UncolorableVRegs[I];
       if (colored(R) || skip(R))
         continue;
+      if (tryAGPRHomeRescue(R))
+        continue; // rescued: AGPR-homed with a->v copies at VGPR-only uses
       const TargetRegisterClass *RC = MRI->getRegClass(R);
       bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
       unsigned RPLimit =
