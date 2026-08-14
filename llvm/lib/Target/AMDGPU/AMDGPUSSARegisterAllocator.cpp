@@ -5538,15 +5538,22 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // no uncolorables remain, or a pass performs no spill (genuine residual for the
   // split path), guarded by a hard cap.
   if (EnableRegionRP && !UncolorableVRegs.empty()) {
-    // TERMINATION by a strictly-decreasing measure — NO iteration cap. The
-    // uncolorable COUNT is a non-negative integer; a round is kept only if it
-    // STRICTLY reduces that count (see the break below). A strictly-decreasing
-    // non-negative integer reaches its bound (0, or a no-progress round) in at
-    // most its initial value of steps, so the loop terminates without a backstop.
-    // A crawling set (673->595->591) is strict progress and continues; a stuck
-    // set (591->591, or the diamond-in-every-region case) does not decrease and
-    // bails to the per-value split path.
-    unsigned PrevCount = UncolorableVRegs.size();
+    // TEMPORARY / KNOWN-FLAWED termination (stopgap — see task #47 for the real
+    // fix, an atomic region-relief transaction). The measure is the post-recolor
+    // uncolorable COUNT: keep a round only if it strictly beats the previous
+    // round's count. PrevCount starts at ~0u so round 0 is always kept.
+    //
+    // WHY IT'S FLAWED: the count is NOT a sound monotone measure. A round can
+    // spill the failing value (count -1) while its reload remnant [reload,use] is
+    // itself uncolorable (count +1) -> net equal -> this bails on a round that
+    // actually made structural progress. And reload redefs are re-admitted as
+    // candidates next round (unlike the pre-spiller's frozen universe), so without
+    // this coarse break the loop can rolling-wave. The count break only bounds it;
+    // it does not cleanly separate progress from churn. The real solution collects
+    // the whole feasible spill+split+self-spill set for the region and commits it
+    // atomically (task #47), making per-round convergence bookkeeping unnecessary.
+    // Kept as-is only to unblock corpus measurement of the AGPR/dead-def work.
+    unsigned PrevCount = ~0u;
     for (unsigned Round = 0; !UncolorableVRegs.empty(); ++Round) {
       LLVM_DEBUG(dbgs() << "=== region-rp round " << Round << ": "
                         << UncolorableVRegs.size()
@@ -5581,7 +5588,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       // the sole termination condition — the measure strictly decreases every kept
       // round and is bounded below by 0.
       unsigned CurCount = UncolorableVRegs.size();
-      if (CurCount >= PrevCount) {
+      if (CurCount >= PrevCount) { // PrevCount==~0u on the first round -> kept
         LLVM_DEBUG(dbgs() << "=== region-rp: no progress (" << PrevCount << " -> "
                           << CurCount << " uncolorable) -> stop ===\n");
         break;

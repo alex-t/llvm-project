@@ -1372,7 +1372,13 @@ MachineBasicBlock *MachineBasicBlock::SplitCriticalEdge(
       } else if (!isLiveOut && !isLastMBB) {
         LI.removeSegment(StartIndex, EndIndex);
         for (auto &SR : LI.subranges())
-          SR.removeSegment(StartIndex, EndIndex);
+          // Only remove the segment from subranges that are actually live across
+          // the split point. A subrange with no value at PrevIndex has no segment
+          // over [StartIndex, EndIndex), so removeSegment would trip its
+          // "Segment is not entirely in range!" assert. Mirrors the guarded
+          // subrange update in the isLiveOut branch above.
+          if (SR.getVNInfoAt(PrevIndex))
+            SR.removeSegment(StartIndex, EndIndex);
       }
     }
 
