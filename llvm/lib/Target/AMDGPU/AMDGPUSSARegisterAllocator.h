@@ -209,6 +209,33 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// (should not happen for a width-1 reload — point pressure ≤ limit < file).
   bool colorOneInPlace(Register R);
 
+  /// CSR(CS): the registers this allocation may use for \p RC that \p CallMI
+  /// preserves. A call's regmask IS its preserved set, and ISel builds that mask
+  /// from the CALLEE's calling convention, so this is a property of the call site
+  /// -- two calls in one function can preserve different sets. A regmask can only
+  /// be tested, never enumerated, so the candidates come from \p RC's allocation
+  /// order (which for a vector class already spans VGPRs then AGPRs, and already
+  /// holds the tuple registers of each width) and the mask decides which survive.
+  SmallVector<MCRegister, 32> getCSRSet(const MachineInstr &CallMI,
+                                        const TargetRegisterClass *RC) const;
+
+  /// True if \p PR survives every clobber site the value described by \p VI is
+  /// live at. A site is a call (its regmask clobbers the caller-saved partition,
+  /// and an explicit def such as the return-address $sgpr30_sgpr31 clobbers that
+  /// too) or an implicit def of an allocatable physreg -- an inline-asm register
+  /// clobber, an implicit-def $vcc. A value colored onto a register that any
+  /// site in its range writes is destroyed there, so this is the legality rule
+  /// for every register handed to a value, wherever the decision is made.
+  bool survivesClobberSites(const LiveInterval &VI, MCRegister PR) const;
+
+  /// Assign registers to the values live across calls, BEFORE any coloring, so
+  /// they get first pick of the registers calls preserve -- a value crossing a
+  /// call can occupy nothing else, while the values the main walk places are free
+  /// to sit anywhere. Call sites are walked in dominance order; at each, a value
+  /// live across it keeps the register it already holds when this call preserves
+  /// it, else takes one from CSR(CS), else is spilled across the call.
+  void preassignValuesLiveAcrossCalls();
+
   /// What a recovery handler achieved (driver -> FSM stream). nextRecoveryState
   /// maps it to the next state; Resolved -> OK terminal, Infeasible -> terminal.
   enum class RecoveryResult {

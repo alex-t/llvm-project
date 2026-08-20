@@ -1086,24 +1086,14 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
   }
 
   // Shared legality test: a candidate PR is usable iff none of its reg units are
-  // occupied at this def AND it is not clobbered by any call VI is live across.
-  // A value live across a call cannot occupy a register the call clobbers
-  // (regmask-clobbered caller-saved regs, or an explicit def such as the
-  // return-address $sgpr30_sgpr31) - it would be undefined after the call.
+  // occupied at this def AND no clobber site VI is live at writes it (a call's
+  // regmask or explicit def, an inline-asm clobber, an implicit-def $vcc) - the
+  // value would be undefined past that site.
   auto IsFree = [&](MCRegister PR) -> bool {
     for (MCRegUnit Unit : TRI->regunits(PR))
       if (OccupiedAtDef.test(Unit))
         return false;
-    for (const auto &[CallIdx, CallMI] : CallSites) {
-      if (!VI.liveAt(CallIdx))
-        continue;
-      if (CallMI->modifiesRegister(PR, TRI))
-        return false;
-      for (const MachineOperand &MO : CallMI->operands())
-        if (MO.isRegMask() && MO.clobbersPhysReg(PR))
-          return false;
-    }
-    return true;
+    return survivesClobberSites(VI, PR);
   };
 
   // PRESSURE-TARGETED AGPR PREFERENCE (unified targets). An av_ value can live in
@@ -3650,7 +3640,214 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
   }
 }
 
+// A call destroys a register unless its regmask preserves it and the call does
+// not define it (the return-address pair rides on the call as an explicit def,
+// outside the mask). MachineInstr has no regmask accessor -- it is an operand,
+// and a call carries exactly one.
+static bool preservedByCall(const MachineInstr *CallMI, MCRegister PR,
+                            const TargetRegisterInfo *TRI) {
+  if (CallMI->modifiesRegister(PR, TRI))
+    return false;
+  for (const MachineOperand &MO : CallMI->operands())
+    if (MO.isRegMask())
+      return !MO.clobbersPhysReg(PR);
+  return true;
+}
+
+bool AMDGPUSSARegisterAllocator::survivesClobberSites(const LiveInterval &VI,
+                                                      MCRegister PR) const {
+  for (const auto &[Idx, MI] : CallSites)
+    if (VI.liveAt(Idx) && !preservedByCall(MI, PR, TRI))
+      return false;
+  return true;
+}
+
+SmallVector<MCRegister, 32>
+AMDGPUSSARegisterAllocator::getCSRSet(const MachineInstr &CallMI,
+                                      const TargetRegisterClass *RC) const {
+  SmallVector<MCRegister, 32> CSRs;
+  for (MCPhysReg Reg : availableOrder(RC))
+    if (preservedByCall(&CallMI, MCRegister(Reg), TRI))
+      CSRs.push_back(MCRegister(Reg));
+  return CSRs;
+}
+
+void AMDGPUSSARegisterAllocator::preassignValuesLiveAcrossCalls() {
+  if (!EnableAMDGPUSSAACLColoring)
+    return;
+
+  // Real calls only: a regmask call is what confines a crossing value to the
+  // preserved set, while a site that merely carries an implicit def (V_ADD_CO
+  // defining VCC) constrains that one register and is left to the walk's own
+  // legality test.
+  //
+  // DOMINANCE order, not slot order. Two things rest on it: a spill below
+  // recomputes liveness, so a dominated call must not be handled before its
+  // dominator; and a register handed out at a dominating call is still that
+  // value's at every call it dominates, which is what lets this pass judge
+  // occupancy from the call in hand alone. Slot indexes only order within a
+  // block, so they do not give this.
+  struct Site {
+    SlotIndex CS;
+    MachineInstr *CallMI;
+    SmallVector<Register, 16> Live;
+  };
+  SmallVector<Site, 8> Sites;
+  for (auto *N : depth_first(MDT->getRootNode()))
+    for (MachineInstr &MI : *N->getBlock())
+      if (MI.isCall())
+        Sites.push_back({LIS->getInstructionIndex(MI).getRegSlot(), &MI, {}});
+  if (Sites.empty())
+    return;
+
+  const MachineFunction &MF = MRI->getMF();
+  const unsigned RPLimit =
+      allocatablePool(const_cast<MachineFunction &>(MF), StageFile);
+  const bool IsVGPR = StageFile != RegFile::SGPR;
+
+  // Spilling a value across a call retires ITS crossing, but the reload left
+  // behind serves every later use of the value, so when one of those uses sits
+  // beyond a further call the crossing migrates to the reload rather than
+  // disappearing. A reload that crosses a call is the same problem this pass
+  // exists to solve, so the sweep below repeats until it spills nothing.
+  //
+  // This terminates. A reload is placed after the call it was spilled across, so
+  // a value's crossing can only ever move FORWARD in program order, and there
+  // are finitely many calls. The (call, value) pairs already spilled are
+  // recorded as well, so a spill that fails to retire a crossing is never
+  // retried -- such a value stays uncolored here and is left to the walk, which
+  // is an honest terminal rather than a loop.
+  DenseSet<uint64_t> Spilled;
+
+  bool Changed = true;
+  while (Changed) {
+  Changed = false;
+
+  // One live set per call, this stage's file only, rebuilt per sweep because the
+  // previous sweep's spills introduced new values. Within a sweep a liveAt
+  // re-check covers what the sweep's own spills retire. Sorted because the live
+  // set is a hash map and its iteration order must not reach the result.
+  //
+  // The widths come from the same walk. Ordinary values never compete for the
+  // registers a call preserves: the crossing values are placed here, before the
+  // walk starts, and the walk only ever sees those registers as occupied. So the
+  // width-descending order that keeps a narrow value from fragmenting the slot a
+  // wide tuple needs is required only among the values placed here, and is kept
+  // local rather than shared with the walk's tiers.
+  std::set<unsigned, std::greater<unsigned>> Tiers;
+  for (Site &S : Sites) {
+    S.Live.clear();
+    for (const auto &[Reg, LaneMask] : getLiveRegs(S.CS, *LIS, *MRI)) {
+      Register V(Reg);
+      const TargetRegisterClass *RC = MRI->getRegClassOrNull(V);
+      if (!RC || fileOf(RC) != StageFile)
+        continue;
+      S.Live.push_back(V);
+      Tiers.insert(TRI->getRegSizeInBits(*RC));
+    }
+    llvm::sort(S.Live, [](Register A, Register B) {
+      return A.virtRegIndex() < B.virtRegIndex();
+    });
+  }
+
+  for (unsigned Width : Tiers)
+    for (unsigned SiteIdx = 0; SiteIdx != Sites.size(); ++SiteIdx) {
+      Site &S = Sites[SiteIdx];
+      // A value spilled at a call this one is dominated by may have stopped
+      // crossing here as well -- its reload was placed at that earlier call.
+      auto stillCrossing = [&](Register V) {
+        return LIS->hasInterval(V) && LIS->getInterval(V).liveAt(S.CS);
+      };
+
+      // CSR(CS) is per class as well as per call, so it is built on first use
+      // for each class that turns up in this call's live set.
+      DenseMap<const TargetRegisterClass *, SmallVector<MCRegister, 32>> CSRSets;
+      auto csrSet = [&](const TargetRegisterClass *RC)
+          -> const SmallVector<MCRegister, 32> & {
+        auto It = CSRSets.find(RC);
+        if (It == CSRSets.end())
+          It = CSRSets.try_emplace(RC, getCSRSet(*S.CallMI, RC)).first;
+        return It->second;
+      };
+
+      LLVM_DEBUG(dbgs() << "\nacross-call assign at " << S.CS << ", " << Width
+                        << "-bit\n");
+
+      // One walk over what crosses this call: reserve the register held by every
+      // value this call preserves (any width -- a wide value placed in an
+      // earlier tier still holds its register here), and collect this tier's
+      // values that still need one. The reservation must be complete before the
+      // first pick, or a pick could take a register that a value further down
+      // the list already carries in from a dominating call.
+      SmallVector<MCRegister, 32> Taken;
+      SmallVector<Register, 16> Pending;
+      for (Register V : S.Live) {
+        if (!stillCrossing(V))
+          continue;
+        MCRegister Held = ColorMap.lookup(V);
+        bool Keeps = Held && survivesClobberSites(LIS->getInterval(V), Held);
+        if (Keeps)
+          Taken.push_back(Held);
+        if (TRI->getRegSizeInBits(*MRI->getRegClass(V)) != Width)
+          continue; // other tier: it counted for occupancy, nothing more here
+        if (Keeps) {
+          LLVM_DEBUG(dbgs() << "  " << printReg(V, TRI) << " keeps "
+                            << TRI->getName(Held) << "\n");
+          continue;
+        }
+        Pending.push_back(V);
+      }
+      auto isFree = [&](MCRegister PR) {
+        return llvm::none_of(
+            Taken, [&](MCRegister T) { return TRI->regsOverlap(PR, T); });
+      };
+
+      // Holds nothing, or holds one this call does not preserve: take one from
+      // CSR(CS), and spill across the call when it has nothing free. CSR(CS) is
+      // only a prefilter -- it answers for this call alone, while the register
+      // has to survive every clobber site the value is live at, so each
+      // candidate is checked against all of them before it is handed out.
+      for (Register V : Pending) {
+        const LiveInterval &VI = LIS->getInterval(V);
+        MCRegister Pick;
+        for (MCRegister C : csrSet(MRI->getRegClass(V)))
+          if (isFree(C) && survivesClobberSites(VI, C)) {
+            Pick = C;
+            break;
+          }
+        if (Pick) {
+          LLVM_DEBUG(dbgs() << "  " << printReg(V, TRI) << " -> "
+                            << TRI->getName(Pick) << "\n");
+          commitColor(V, Pick);
+          Taken.push_back(Pick);
+          continue;
+        }
+        // Nothing this call preserves is free -- spill V across it, unless that
+        // was already tried here and left V crossing, in which case there is
+        // nothing further this pass can do for it.
+        if (!Spilled.insert((uint64_t(SiteIdx) << 32) | V.virtRegIndex()).second) {
+          LLVM_DEBUG(dbgs() << "  " << printReg(V, TRI)
+                            << " -> still crossing after spill, left to walk\n");
+          continue;
+        }
+        LLVM_DEBUG(dbgs() << "  " << printReg(V, TRI) << " -> spill across\n");
+        Emitter->beginPass(IsVGPR);
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("across-call-spill", V.virtRegIndex());
+        Emitter->spillOneVMP(VRegMaskPair(V, MRI->getMaxLaneMaskForVReg(V)),
+                             S.CS, RPLimit);
+        Changed = true;
+      }
+    }
+  }
+}
+
 void AMDGPUSSARegisterAllocator::color() {
+  // The vreg set has moved since the up-front classification: the earlier
+  // stage's spills and the pre-spill work added values. Rebuild the width tiers
+  // for this stage before anything consults them.
+  classifyVRegs();
+
   LLVM_DEBUG({
     dbgs() << "Coloring order (width descending):";
     for (unsigned W : ColoringOrder)
@@ -3741,6 +3938,17 @@ void AMDGPUSSARegisterAllocator::color() {
   // (V_ADD_CO/V_CMP emit VCC defs everywhere), needlessly reorders coloring, and
   // has triggered downstream SSA-destruction crashes. IsFree still consults ALL
   // of CallSites for legality — only the ACL priority membership is narrowed.
+  // Values live across a call can only occupy a register the call preserves, so
+  // they are assigned before anything else has a chance to take those registers.
+  preassignValuesLiveAcrossCalls();
+
+  // Rebuild the tiers again: the spills above introduce the reload remnants,
+  // whose width can be one no vreg had before (a 128-bit reload in a function
+  // whose tiers were 1024/64/32). The walk below visits defs one tier at a time,
+  // so a width missing from the list is never visited and its vregs reach
+  // operand rewrite uncolored.
+  classifyVRegs();
+
   DenseSet<Register> ACLSet;
   if (EnableAMDGPUSSAACLColoring) {
     SmallVector<SlotIndex, 8> CallOnlySites;
@@ -3944,6 +4152,15 @@ void AMDGPUSSARegisterAllocator::color() {
           if (fileOf(MRI->getRegClass(Reg)) != StageFile) {
             if (auto It = ColorMap.find(Reg); It != ColorMap.end())
               markOccupied(It->second);
+            continue;
+          }
+
+          // Assigned by the across-call pass before coloring began. Keep that
+          // register and mark it occupied at the def so this walk's values do not
+          // reuse it (the kill path frees it at its last use, exactly as for a
+          // wider already-colored def).
+          if (auto It = ColorMap.find(Reg); It != ColorMap.end()) {
+            markOccupied(It->second);
             continue;
           }
 
