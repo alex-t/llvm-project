@@ -1297,18 +1297,43 @@ AMDGPUSSARegisterAllocator::collectPhiHints(Register VReg,
   // (physreg, weight) candidates; dedup + weight-sort before returning.
   SmallVector<std::pair<MCRegister, uint64_t>, 4> Cand;
 
-  // Turn a colored φ partner into a candidate color for VReg. SubIdx is the
-  // sub-register index relating the two values; PartnerIsSub says which side it
-  // slices:
-  //   - PartnerIsSub == false (Direction A): VReg is the sub-register, reading
-  //     Partner.SubIdx (a lane φ reading %593.sub3 of a wide colored operand).
-  //     VReg's color is that SLICE of Partner's color -> getSubReg().
-  //   - PartnerIsSub == true  (Direction B): Partner is the sub-register; the φ
-  //     reads VReg.SubIdx into the narrow result Partner (a loop-carried tuple
-  //     whose header result is colored before the wide latch operand VReg).
-  //     VReg's color is the SUPER-register whose SubIdx slice is Partner's
-  //     color -> getMatchingSuperReg().
-  // Either composition must land in RC (VReg's class) to be a legal hint.
+  // Record a candidate color for VReg, composing SubIdx onto the physical
+  // register PR. PRIsSub says which side SubIdx slices:
+  //   - PRIsSub == false: VReg is the sub-register, reading PR.SubIdx (a lane φ
+  //     reading %593.sub3 of a wide colored operand, or a COPY of a slice of a
+  //     physreg). VReg's color is that SLICE of PR -> getSubReg().
+  //   - PRIsSub == true: PR is the sub-register; VReg's color is the SUPER
+  //     register whose SubIdx slice is PR -> getMatchingSuperReg().
+  // Shared by every hint direction below, so the legality rules live in exactly
+  // one place.
+  auto AddCandidate = [&](MCRegister PR, unsigned SubIdx, bool PRIsSub,
+                          uint64_t W) {
+    if (!PR)
+      return;
+    if (SubIdx) {
+      PR = PRIsSub ? TRI->getMatchingSuperReg(PR, SubIdx, RC)
+                   : TRI->getSubReg(PR, SubIdx);
+      if (!PR)
+        return; // no such slice/super in the physreg or class
+    }
+    if (!RC->contains(PR))
+      return; // class/width mismatch after composition
+    // Containment in RC does not imply the allocator may hand the register out:
+    // SReg_64 contains EXEC, so a value defined by `COPY $exec` composes to a
+    // hint onto the exec mask itself. Every other pick scans availableOrder(),
+    // which excludes reserved registers, so this is the one path that can
+    // introduce one. Coloring a value to EXEC and then spilling it emits a spill
+    // of the exec mask, which SGPR spill lowering rejects outright.
+    if (MRI->isReserved(PR))
+      return;
+    Cand.push_back({PR, W});
+  };
+
+  // Turn a colored φ partner into a candidate color for VReg. Direction A
+  // reads Partner.SubIdx (PartnerIsSub == false); Direction B has Partner as
+  // the narrow φ result of a loop-carried tuple, colored before this wide latch
+  // operand (PartnerIsSub == true). Weight is the edge's loop depth, so a hot
+  // back-edge outranks a cold one.
   auto AddPartner = [&](Register Partner, unsigned SubIdx, bool PartnerIsSub,
                         MachineBasicBlock *EdgeBlock) {
     if (!Partner.isVirtual())
@@ -1316,18 +1341,9 @@ AMDGPUSSARegisterAllocator::collectPhiHints(Register VReg,
     auto It = ColorMap.find(Partner);
     if (It == ColorMap.end())
       return; // partner not colored yet -- nothing to align to
-    MCRegister PR = It->second;
-    if (SubIdx) {
-      PR = PartnerIsSub ? TRI->getMatchingSuperReg(PR, SubIdx, RC)
-                        : TRI->getSubReg(PR, SubIdx);
-      if (!PR)
-        return; // no such slice/super in the physreg or class
-    }
-    if (!RC->contains(PR))
-      return; // class/width mismatch after composition
     unsigned Depth = EdgeBlock ? MLI->getLoopDepth(EdgeBlock) : 0;
     uint64_t W = Depth < 63 ? (uint64_t(1) << Depth) : ~uint64_t(0);
-    Cand.push_back({PR, W});
+    AddCandidate(It->second, SubIdx, PartnerIsSub, W);
   };
 
   MachineInstr *Def = MRI->getUniqueVRegDef(VReg);
@@ -1372,28 +1388,17 @@ AMDGPUSSARegisterAllocator::collectPhiHints(Register VReg,
   // defined by `COPY $phys` (an incoming argument / live-in) hint VReg->$phys; if
   // VReg is used by `$phys = COPY VReg` (an outgoing arg / return value) hint the
   // same. Keeping the value in its ABI register elides the copy. Sub-register
-  // copies compose like the φ cases. Weight high (unconditional ABI edge), above
-  // loop-depth-0 φ hints. Legality is still enforced by the shared IsFree gate in
-  // pickFreePhysReg, so this can never introduce interference or cause a spill.
-  auto AddPhysCopy = [&](MCRegister Phys, unsigned SubIdx, bool PhysIsSub) {
-    if (!Phys)
-      return;
-    MCRegister PR = Phys;
-    if (SubIdx) {
-      PR = PhysIsSub ? TRI->getMatchingSuperReg(PR, SubIdx, RC)
-                     : TRI->getSubReg(PR, SubIdx);
-      if (!PR)
-        return;
-    }
-    if (!RC->contains(PR))
-      return;
-    Cand.push_back({PR, uint64_t(1) << 20}); // above any loop-depth φ weight
-  };
+  // copies compose like the φ cases. The ABI edge is unconditional, so it
+  // outweighs any loop-depth φ hint. A hint is only a preference: pickFreePhysReg
+  // still gates it through IsFree for interference and call-clobber survival, and
+  // AddCandidate drops registers the allocator may never hand out.
+  constexpr uint64_t PhysCopyWeight = uint64_t(1) << 20;
   if (Def && Def->isCopy()) {
     const MachineOperand &Src = Def->getOperand(1);
     if (Src.isReg() && Src.getReg().isPhysical())
       // VReg = COPY $phys.SubIdx  ->  VReg's color is that slice of $phys.
-      AddPhysCopy(Src.getReg(), Src.getSubReg(), /*PhysIsSub=*/false);
+      AddCandidate(Src.getReg(), Src.getSubReg(), /*PRIsSub=*/false,
+                   PhysCopyWeight);
   }
   for (MachineInstr &UseMI : MRI->use_nodbg_instructions(VReg)) {
     if (!UseMI.isCopy())
@@ -1402,8 +1407,9 @@ AMDGPUSSARegisterAllocator::collectPhiHints(Register VReg,
     const MachineOperand &Src = UseMI.getOperand(1);
     if (Dst.getReg().isPhysical() && Src.isReg() && Src.getReg() == VReg)
       // $phys = COPY VReg.SubIdx  ->  VReg's color's SubIdx slice is $phys, so
-      // VReg's color is the super-register (PhysIsSub = true).
-      AddPhysCopy(Dst.getReg(), Src.getSubReg(), /*PhysIsSub=*/true);
+      // VReg's color is the super-register (PRIsSub = true).
+      AddCandidate(Dst.getReg(), Src.getSubReg(), /*PRIsSub=*/true,
+                   PhysCopyWeight);
   }
 
   // Hottest-first, deduped (keep max weight per physreg).
