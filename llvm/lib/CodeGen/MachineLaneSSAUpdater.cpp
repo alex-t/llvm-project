@@ -879,15 +879,39 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
                     << " LanesFromNew=" << PrintLaneMask(LanesFromNew)
                     << " LanesFromOld=" << PrintLaneMask(LanesFromOld) << "\n");
 
-  SmallDenseSet<unsigned, 8> AddedSubIdxs;
+  // A well-formed REG_SEQUENCE defines each of Dest's lanes exactly once, so
+  // track what the sources added so far cover. Lanes is in OrigVReg's namespace;
+  // DestSub() re-bases it to the destination slice actually written.
+  const LaneBitmask DestFull = MRI.getMaxLaneMaskForVReg(Dest);
+  LaneBitmask DestCovered = LaneBitmask::getNone();
+  auto AddSrc = [&](Register SrcReg, unsigned Flags, unsigned SrcSub,
+                    LaneBitmask Lanes) {
+    unsigned DestIdx = DestSub(Lanes);
+    // A zero index writes the whole destination (no slice narrower than Dest).
+    LaneBitmask Slice = DestIdx ? TRI.getSubRegIndexLaneMask(DestIdx) : DestFull;
+    assert((DestCovered & Slice).none() &&
+           "REG_SEQUENCE defines the same destination lanes twice");
+    DestCovered |= Slice;
+    RS.addReg(SrcReg, Flags, SrcSub).addImm(DestIdx);
+  };
 
   // Add source for lanes from NewVR (updated lanes)
-  if (LanesFromNew.any()) {
-    unsigned SubIdx = getSubRegIndexForLaneMask(LanesFromNew, &TRI);
-    assert(SubIdx && "Failed to find subregister index for LanesFromNew");
-    RS.addReg(NewVR, 0, 0).addImm(DestSub(LanesFromNew)); // NewVR whole
-    AddedSubIdxs.insert(SubIdx);
+  if (getSubRegIndexForLaneMask(LanesFromNew, &TRI)) {
+    AddSrc(NewVR, 0, 0, LanesFromNew); // NewVR whole
     LanesToExtend.push_back(LanesFromNew);
+  } else if (LanesFromNew.any()) {
+    // The group has no subregister index of its own -- e.g. sub1..sub15 of a
+    // vreg_512, formed when sub0 is established by a separate partial def. It
+    // can be neither read as one slice of NewVR nor written to one slice of
+    // Dest, so split it into covering subregisters, as the old lanes are below.
+    // A group without an index also means NewVR kept OrigVReg's register class,
+    // so each covering index addresses NewVR directly, with no rebasing.
+    for (unsigned CoverSubIdx : getCoveringSubRegsForLaneMask(
+             LanesFromNew, &TRI, MRI.getRegClass(NewVR))) {
+      LaneBitmask CovLanes = TRI.getSubRegIndexLaneMask(CoverSubIdx);
+      AddSrc(NewVR, 0, CoverSubIdx, CovLanes);
+      LanesToExtend.push_back(CovLanes);
+    }
   }
 
   // Source the old (unchanged) lanes per their reaching VNI at the use point
@@ -925,8 +949,7 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
         LaneBitmask RFull = MRI.getMaxLaneMaskForVReg(SrcReg);
         Sub = (RLane == RFull) ? 0 : getSubRegIndexForLaneMask(RLane, &TRI);
       }
-      RS.addReg(SrcReg, Flags, Sub).addImm(DestSub(CovLanes));
-      AddedSubIdxs.insert(getSubRegIndexForLaneMask(CovLanes, &TRI));
+      AddSrc(SrcReg, Flags, Sub, CovLanes);
       if (Live)
         LanesToExtend.push_back(CovLanes);
     };
@@ -985,7 +1008,8 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
     if (PieceLanes.any())
       AddOldGroup(PieceLanes, V);
 
-  assert(!AddedSubIdxs.empty() && "REG_SEQUENCE must have at least one source");
+  assert(DestCovered == DestFull &&
+         "REG_SEQUENCE must define every destination lane exactly once");
 
   LIS.InsertMachineInstrInMaps(*RS);
   OutIdx = LIS.getInstructionIndex(*RS);
