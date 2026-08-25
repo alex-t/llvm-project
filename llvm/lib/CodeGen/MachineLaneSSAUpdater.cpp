@@ -276,12 +276,27 @@ MachineLaneSSAUpdater::performSSARepair(Register NewVReg, Register OrigVReg,
     PHILI.RenumberValues();
   }
 
-  // Recompute OrigVReg's LiveInterval to account for PHI operands
-  // We do a full recomputation because PHI operands may reference subregisters
-  // that weren't previously live on those paths, and we need to extend liveness
-  // from the definition to the PHI use.
-  LIS.removeInterval(OrigVReg);
-  LIS.createAndComputeVirtRegInterval(OrigVReg);
+  // Update only the lanes this repair touched. A whole-value recompute
+  // (createAndComputeVirtRegInterval -> per-subrange extendToUses +
+  // constructMainRangeFromSubranges) is invalid here: this repair moved the
+  // DefMask lane's def to NewVReg, so OrigVReg's subranges no longer all belong to
+  // OrigVReg. Recomputing every subrange re-derives a sibling lane whose def is
+  // mid-migration, and constructMainRangeFromSubranges then aborts with "Use not
+  // jointly dominated by defs" (physreg-pair partial-def case). Keep the updater
+  // self-contained: refresh the DefMask subrange(s) from OrigVReg's remaining uses,
+  // leave sibling subranges untouched, and do not rebuild the main range while
+  // lanes are split across vregs (readers use the subrange path while subranges
+  // exist).
+  LiveInterval &OrigLI = LIS.getInterval(OrigVReg);
+  if (OrigLI.hasSubRanges()) {
+    for (LiveInterval::SubRange &S : OrigLI.subranges())
+      if ((S.LaneMask & DefMask).any())
+        LIS.shrinkToUses(S, OrigVReg);
+    OrigLI.removeEmptySubRanges();
+  } else {
+    LIS.removeInterval(OrigVReg);
+    LIS.createAndComputeVirtRegInterval(OrigVReg);
+  }
 
   // Note: We do NOT call shrinkToUses on OrigVReg even after recomputation
   // because: shrinkToUses has a fundamental bug with PHI operands - it doesn't
