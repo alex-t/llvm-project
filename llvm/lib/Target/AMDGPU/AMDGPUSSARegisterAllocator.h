@@ -440,7 +440,24 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
     unsigned UncoloredWidth = 0; // width of Uncolored in dwords (aligned-tuple feasibility)
     unsigned RPOvershoot = 0;    // peak (RP - Limit) across the window; 0 if never over
                                  // (spill-1 vs spill-N signal)
+    // Branch-3 pick: the register-resident prefix the classifier proved peelable,
+    // handed to trySelfSplitColor as its FIRST piece so the handler never
+    // re-derives what routed it here. Valid iff classifyRecovery returned
+    // SelfSplit; invalid on the CrossLiver/Web fall-through, where branch 3 was
+    // never evaluated and the handler picks for itself.
+    MCRegister PeelPR;
+    SlotIndex PeelBound;
   };
+
+  /// Pick the register free at \p V's start that stays free LONGEST, and decide
+  /// whether that free run is worth peeling. Returns false when nothing is free at
+  /// the start, or when the run does not reach past \p V's first use (genuine
+  /// over-pressure rather than fragmentation). On true, \p PR is the register and
+  /// \p Bound the slot where it becomes occupied (>= V's end means free across all
+  /// of V). THE single split-across policy: classifyRecovery (branch 3) asks "will
+  /// SelfSplit make progress?" and trySelfSplitColor asks "what do I peel now?",
+  /// so the gate cannot disagree with the handler. Const — reads LIS/MRI/ColorMap.
+  bool pickPeelableRun(Register V, MCRegister &PR, SlotIndex &Bound) const;
 
   /// [Recovery classifier, Stage 1] Collect the recovery window for \p Uncolored
   /// (see RecoveryWindow). Uses the trusted GCNUpwardRPTracker only. Const —
@@ -491,8 +508,9 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// [Recovery FSM] Classify \p RW into the FIRST handler STATE (web > cross-liver
   /// > self-split), or a terminal (Floor if a memory reload fits, else Infeasible)
   /// when no structural pattern applies. The driver runs the state's handler and
-  /// advances via nextRecoveryState. Reads \p RW + feasibility helpers.
-  RecoveryState classifyRecovery(const RecoveryWindow &RW) const;
+  /// advances via nextRecoveryState. Reads \p RW + feasibility helpers, and on a
+  /// SelfSplit verdict writes back the peel pick (RW.PeelPR / RW.PeelBound).
+  RecoveryState classifyRecovery(RecoveryWindow &RW) const;
 
   /// Emit the forensic recoveryWindow event for \p Failed / \p RW (analyst
   /// signal). Called by the recovery driver when the reporter is enabled; no
@@ -531,7 +549,11 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// short enough that one physreg is free across it, coloring each into that reg.
   /// Only valid when Failed is POINT-FEASIBLE (some PR free at every slot); aborts
   /// (returns false -> caller memory-spills) if any slot has zero free PRs.
-  RecoveryResult trySelfSplitColor(Register Failed, Register &Remnant);
+  /// \p FirstPR / \p FirstBound is the pick for the FIRST piece, supplied by the
+  /// FSM (RecoveryWindow::PeelPR). Pass an invalid \p FirstPR to have the handler
+  /// pick it, which is what the CrossLiver/Web fall-through entries do.
+  RecoveryResult trySelfSplitColor(Register Failed, MCRegister FirstPR,
+                                   SlotIndex FirstBound, Register &Remnant);
 
   /// Coloring-time recovery for one value \p Failed that color() could not place.
   /// Classifier-driven (see Recursive_Recovery_Fix.md): collectRecoveryWindow

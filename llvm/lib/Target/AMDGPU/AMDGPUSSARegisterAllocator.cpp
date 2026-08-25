@@ -3100,8 +3100,68 @@ SlotIndex AMDGPUSSARegisterAllocator::firstBlockAfter(
   return Best;
 }
 
+bool AMDGPUSSARegisterAllocator::pickPeelableRun(Register V, MCRegister &PR,
+                                                 SlotIndex &Bound) const {
+  // THE single split-across policy; see the header for why both callers share it.
+  PR = MCRegister();
+  Bound = SlotIndex();
+  if (!LIS->hasInterval(V))
+    return false;
+  const LiveInterval &CI = LIS->getInterval(V);
+  const TargetRegisterClass *RC = MRI->getRegClass(V);
+  const SlotIndex S = CI.beginIndex(), E = CI.endIndex();
+
+  SmallVector<std::pair<Register, MCRegister>, 16> Overlappers;
+  BitVector Occ;
+  scanOverlappersForVI(CI, Occ, &Overlappers);
+
+  // Pick the PR free at S that stays free the LONGEST (fewest future splits).
+  // getOrder(RC) already yields RC-width PRs; PR default-constructs to NoRegister
+  // (!PR tests it via MCRegister's unsigned conversion).
+  SlotIndex Best = S;
+  for (MCRegister P : RegClassInfo.getOrder(RC)) {
+    SlotIndex B = firstBlockAfter(P, S, E, Overlappers);
+    if (B <= S)
+      continue; // not free at S
+    if (!PR || Best < B) {
+      PR = P;
+      Best = B;
+    }
+  }
+  if (!PR) {
+    LLVM_DEBUG(dbgs() << "  peelable-run: " << printReg(V, TRI)
+                      << " NONE (no free reg at " << S << ")\n");
+    return false;
+  }
+
+  // A free run that does not even reach the next use is genuine over-pressure,
+  // not fragmentation — peeling there would grind the region into use-less
+  // confetti. A run covering all of V needs no such check.
+  if (Best < E) {
+    SlotIndex FirstUse;
+    for (MachineInstr &U : MRI->use_nodbg_instructions(V)) {
+      SlotIndex US = LIS->getInstructionIndex(U).getRegSlot();
+      if (US > S && (!FirstUse.isValid() || US < FirstUse))
+        FirstUse = US;
+    }
+    if (FirstUse.isValid() && Best <= FirstUse) {
+      LLVM_DEBUG(dbgs() << "  peelable-run: " << printReg(V, TRI)
+                        << " NONE (run [" << S << "," << Best
+                        << ") does not reach first use " << FirstUse << ")\n");
+      PR = MCRegister();
+      return false;
+    }
+  }
+  Bound = Best;
+  LLVM_DEBUG(dbgs() << "  peelable-run: " << printReg(V, TRI) << " -> "
+                    << TRI->getName(PR) << " [" << S << "," << Bound << ")\n");
+  return true;
+}
+
 AMDGPUSSARegisterAllocator::RecoveryResult
-AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed, Register &Remnant) {
+AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed, MCRegister FirstPR,
+                                              SlotIndex FirstBound,
+                                              Register &Remnant) {
   // SELF-SPLIT — Failed IS ITSELF the long liver: no single PR is free across its
   // whole range, and no separate live-through blocker exists to spill around.
   // Keep as much of Failed register-resident as possible: repeatedly peel off the
@@ -3147,40 +3207,13 @@ AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed, Register &Remnant
     const LiveInterval &CI = LIS->getInterval(Cur);
     SlotIndex S = CI.beginIndex(), E = CI.endIndex();
 
-    SmallVector<std::pair<Register, MCRegister>, 16> Overlappers;
-    BitVector Occ;
-    scanOverlappersForVI(CI, Occ, &Overlappers);
-
-    // Pick the PR free at S that stays free the LONGEST (fewest future splits).
-    // getOrder(RC) already yields RC-width PRs; BestPR default-constructs to
-    // NoRegister (!BestPR tests it via MCRegister's unsigned conversion).
-    MCRegister BestPR;
-    SlotIndex BestBound = S;
-    for (MCRegister PR : RegClassInfo.getOrder(RC)) {
-      SlotIndex B = firstBlockAfter(PR, S, E, Overlappers);
-      if (B <= S)
-        continue; // not free at S
-      if (!BestPR || BestBound < B) {
-        BestPR = PR;
-        BestBound = B;
-      }
-    }
-
-    // No free PR at S, or the free run does not even reach the next use (genuine
-    // over-pressure, not fragmentation — peeling here would grind the region into
-    // use-less confetti). This piece can't settle in a register: hand it back.
-    bool NoFreeRun = !BestPR;
-    if (!NoFreeRun && BestBound < E) {
-      SlotIndex FirstUse;
-      for (MachineInstr &U : MRI->use_nodbg_instructions(Cur)) {
-        SlotIndex US = LIS->getInstructionIndex(U).getRegSlot();
-        if (US > S && (!FirstUse.isValid() || US < FirstUse))
-          FirstUse = US;
-      }
-      if (FirstUse.isValid() && BestBound <= FirstUse)
-        NoFreeRun = true;
-    }
-    if (NoFreeRun) {
+    // FIRST piece: consume the pick the FSM already made when it routed here.
+    // Later pieces are DIFFERENT intervals (fresh tails, previous piece now
+    // colored), so they need their own pick — not a recomputation of the same
+    // question. Either way the policy lives only in pickPeelableRun.
+    MCRegister BestPR = (Pieces == 0) ? FirstPR : MCRegister();
+    SlotIndex BestBound = (Pieces == 0) ? FirstBound : SlotIndex();
+    if (!BestPR && !pickPeelableRun(Cur, BestPR, BestBound)) {
       LLVM_DEBUG(dbgs() << "  self-split: piece " << printReg(Cur, TRI)
                         << " cannot be placed -> hand back\n");
       return handBack(Cur, Pieces);
@@ -3396,7 +3429,7 @@ void AMDGPUSSARegisterAllocator::emitRecoveryWindow(
 }
 
 AMDGPUSSARegisterAllocator::RecoveryState
-AMDGPUSSARegisterAllocator::classifyRecovery(const RecoveryWindow &RW) const {
+AMDGPUSSARegisterAllocator::classifyRecovery(RecoveryWindow &RW) const {
   // FSM entry: classify RW into the FIRST handler state (or a terminal). Cheap
   // structural + feasibility preconditions, in priority order. Heavy proof lives in
   // the precondition helpers (reload-RP), evaluated ONCE here so the chosen handler
@@ -3416,11 +3449,18 @@ AMDGPUSSARegisterAllocator::classifyRecovery(const RecoveryWindow &RW) const {
   //    can be peeled falls through to SelfSplit.
   if (!RW.Crossers.empty() && hasCleanCrossLiver(RW.Uncolored, RPLimit))
     return RecoveryState::CrossLiver;
-  // 3. SELF-SPLIT — the value is the long liver; peel register-resident prefixes.
-  //    (No cheap precondition — trySelfSplitColor reports NoOp if it can't peel,
-  //    and the FSM then transitions to the terminal fork.) Enter whenever there
-  //    are crossers to peel around; else go straight to the terminal fork.
-  if (!RW.Crossers.empty())
+  // 3. SELF-SPLIT — scenario 2 (the DUAL of 1): there is no crosser to spill, so
+  //    Uncolored is itself the spanner and must be SPLIT ACROSS the BLOCKERS
+  //    occupying registers inside the region. Enter exactly when the handler can
+  //    peel a register-resident prefix, and hand it the pick. The old
+  //    !Crossers.empty() test asked about the DUAL scenario, so it refused
+  //    precisely the empty-crosser pattern SelfSplit exists to handle. Keeping a
+  //    predicate here (rather than always entering and letting the handler NoOp)
+  //    preserves branch 5's Infeasible diagnosis: nextRecoveryState ends at Floor,
+  //    so an unconditional entry would silently turn genuine point-over-pressure
+  //    into an unchecked Floor attempt. Region-agnostic — loop vs linear only
+  //    affects where the free windows fall.
+  if (pickPeelableRun(RW.Uncolored, RW.PeelPR, RW.PeelBound))
     return RecoveryState::SelfSplit;
   // 4. AGPR-RELIEF — no clean crosser to spill-around, but on a unified vector
   //    file a colored av-legal crosser can be spilled so its reload re-homes to
@@ -3515,10 +3555,12 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
            "Reduced must hand back a strictly shorter remnant");
     (void)LenBefore;
     Cur = Rem;
-    RecoveryWindow NRW = collectRecoveryWindow(Cur);
+    // Refresh the OUTER window: the SelfSplit dispatch reads RW.PeelPR, so the
+    // window must describe the value we are about to dispatch, not the old one.
+    RW = collectRecoveryWindow(Cur);
     if (SSAForensicReporter::enabled())
-      emitRecoveryWindow(Cur, NRW);
-    return classifyRecovery(NRW);
+      emitRecoveryWindow(Cur, RW);
+    return classifyRecovery(RW);
   };
 
   while (true) {
@@ -3575,7 +3617,7 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
     case RecoveryState::SelfSplit: {
       Register Rem;
       unsigned LenBefore = curLen(Cur);
-      RecoveryResult R = trySelfSplitColor(Cur, Rem);
+      RecoveryResult R = trySelfSplitColor(Cur, RW.PeelPR, RW.PeelBound, Rem);
       if (R == RecoveryResult::Resolved) {
         if (SSAForensicReporter::enabled())
           Reporter->transformation("self-split", Cur.virtRegIndex());
