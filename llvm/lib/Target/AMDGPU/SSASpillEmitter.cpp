@@ -404,8 +404,13 @@ Register SSASpillEmitter::splitLiveRangeAt(Register V,
     if (UseMI == CopyMI || UseMI->isDebugInstr() || isSpillInstr(UseMI))
       continue;
     SlotIndex UseSlot = LIS->getInstructionIndex(*UseMI).getRegSlot();
-    if (UseSlot < CopySlot)
-      continue; // before the split: keeps reading %v
+    // Redirect a use to %new only if the split COPY actually DOMINATES it. A
+    // slot-index comparison (UseSlot < CopySlot) is NOT a dominance test: for a
+    // multi-block value a use in a block the split point does not dominate can
+    // still have a later slot index, and redirecting it to %new leaves %new used
+    // where its def does not dominate ("defs don't dominate all uses").
+    if (!DT->dominates(CopyMI, UseMI))
+      continue; // not dominated by the split: keeps reading %v
     VNInfo *AtUse = LI.getVNInfoBefore(UseSlot);
     if (!AtUse || AtUse != SrcVNI)
       continue; // different reaching value: leave alone
