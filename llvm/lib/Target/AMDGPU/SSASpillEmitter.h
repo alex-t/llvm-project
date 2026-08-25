@@ -220,8 +220,12 @@ class SSASpillEmitter {
   // Max RP (current file) over the same-block span [DefMI, UseMI]; 0 if not same
   // block. Decides whether a same-block reaching reload spans an RP-tight region.
   unsigned maxRPBetween(MachineInstr *DefMI, MachineInstr *UseMI);
+  // \p SpanLoop, when non-null, is a loop the hoisted reload stays live across
+  // on every iteration; blocks inside it are measured in full rather than only
+  // down to the first use.
   bool canHoistReloadTo(MachineBasicBlock *NCD, MachineInstr *InsertPoint,
-                        unsigned RPLimit, Register SpilledReg);
+                        unsigned RPLimit, Register SpilledReg,
+                        const MachineLoop *SpanLoop = nullptr);
   bool walkPathsToUses(
       MachineBasicBlock *StartBB, Register SpilledReg,
       llvm::function_ref<bool(MachineBasicBlock *, MachineInstr *)> IsBad,

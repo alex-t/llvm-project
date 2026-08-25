@@ -1151,7 +1151,8 @@ unsigned SSASpillEmitter::getMaxRPInBlockDownTo(MachineBasicBlock *MBB,
 
 bool SSASpillEmitter::canHoistReloadTo(MachineBasicBlock *NCD,
                                        MachineInstr *InsertPoint,
-                                       unsigned RPLimit, Register SpilledReg) {
+                                       unsigned RPLimit, Register SpilledReg,
+                                       const MachineLoop *SpanLoop) {
   // Spilled register is already counted as live, so MaxRP > RPLimit means
   // no room for reload (no +1 needed).
 
@@ -1165,8 +1166,17 @@ bool SSASpillEmitter::canHoistReloadTo(MachineBasicBlock *NCD,
   }
 
   auto IsHighRP = [&](MachineBasicBlock *BB, MachineInstr *UseMI) -> bool {
-    unsigned CurRP =
-        UseMI ? getMaxRPInBlockDownTo(BB, UseMI) : getMaxRPForBlock(BB);
+    // Measuring down to the first use models a reload that dies at that use.
+    // A reload placed in SpanLoop's preheader instead occupies a register for
+    // all of BB on every iteration, so pressure arising after the first use
+    // still competes with it and must be counted.
+    bool SpansBlock = SpanLoop && SpanLoop->contains(BB);
+    unsigned CurRP = (UseMI && !SpansBlock) ? getMaxRPInBlockDownTo(BB, UseMI)
+                                            : getMaxRPForBlock(BB);
+    LLVM_DEBUG(dbgs() << "    hoist-gate: " << printMBBReference(*BB)
+                      << " spansBlock=" << SpansBlock
+                      << " use=" << (UseMI ? "yes" : "no") << " RP=" << CurRP
+                      << " limit=" << RPLimit << "\n");
     return CurRP > RPLimit;
   };
 
@@ -1250,8 +1260,8 @@ SSASpillEmitter::adjustReloadForLoop(MachineBasicBlock *ReloadBB,
       if (TermIt != Preheader->end())
         InsertPoint = &*TermIt;
 
-      bool CanHoist =
-          canHoistReloadTo(Preheader, InsertPoint, RPLimit, SpilledReg);
+      bool CanHoist = canHoistReloadTo(Preheader, InsertPoint, RPLimit,
+                                       SpilledReg, ReloadLoop);
 
       if (!CanHoist) {
         LLVM_DEBUG(
