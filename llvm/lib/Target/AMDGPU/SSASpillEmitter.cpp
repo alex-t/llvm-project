@@ -1302,8 +1302,11 @@ bool SSASpillEmitter::walkPathsToUses(
 
     // Skip blocks where spilled register is not live
     SlotIndex BBStart = Indexes->getMBBStartIdx(BB);
-    if (!LI.liveAt(BBStart))
+    if (!LI.liveAt(BBStart)) {
+      LLVM_DEBUG(dbgs() << "    walkPaths: skip " << printMBBReference(*BB)
+                        << " (spilled reg not live at block start)\n");
       continue;
+    }
 
     // Find first use of SpilledReg in this block (if any)
     MachineInstr *FirstUseMI = nullptr;
