@@ -309,6 +309,40 @@ MachineLaneSSAUpdater::performSSARepair(Register NewVReg, Register OrigVReg,
   // createAndComputeVirtRegInterval already produces correct, minimal liveness
   // that includes PHI uses properly.
 
+  // Flag live-out-undef subregister uses. A plain (non-PHI) use may read a lane
+  // that is undefined on some predecessor path (e.g. a poison-incoming PHI lane):
+  // that lane's SUBRANGE simply has no value reaching the use, while the value's
+  // main range (and its other lanes) do. Left as a strict read it demands a def on
+  // a path where the lane is genuinely undefined, which the downstream
+  // LiveIntervals rejects with "defs don't dominate all uses". Detection is local
+  // and search-free: the per-lane subrange carries exactly this — SR.getVNInfoAt
+  // returns null at the use iff no value of that lane reaches it.
+  {
+    MachineRegisterInfo &MRI = MF.getRegInfo();
+    LiveInterval &FinalLI = LIS.getInterval(OrigVReg);
+    if (FinalLI.hasSubRanges())
+      for (MachineOperand &MO :
+           llvm::make_early_inc_range(MRI.use_operands(OrigVReg))) {
+        MachineInstr *UseMI = MO.getParent();
+        if (UseMI->isPHI() || UseMI->isDebugInstr() || MO.isUndef())
+          continue;
+        LaneBitmask UseLane =
+            MO.getSubReg() ? TRI.getSubRegIndexLaneMask(MO.getSubReg())
+                           : MRI.getMaxLaneMaskForVReg(OrigVReg);
+        SlotIndex UseIdx = LIS.getInstructionIndex(*UseMI).getRegSlot();
+        // Undef iff NO lane the operand reads has a value at the use: every read
+        // lane's subrange is dead here. (A partially-live use is a real read.)
+        bool AnyLaneLive = false;
+        for (LiveInterval::SubRange &S : FinalLI.subranges())
+          if ((S.LaneMask & UseLane).any() && S.getVNInfoAt(UseIdx)) {
+            AnyLaneLive = true;
+            break;
+          }
+        if (!AnyLaneLive)
+          MO.setIsUndef(true);
+      }
+  }
+
   // Step 4: Update operand flags to match the LiveIntervals
   updateDeadFlags(NewVReg);
   for (auto &[PHIVRes, Lane] : AllPHIVResults)
