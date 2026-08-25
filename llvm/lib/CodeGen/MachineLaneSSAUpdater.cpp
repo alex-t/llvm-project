@@ -309,14 +309,19 @@ MachineLaneSSAUpdater::performSSARepair(Register NewVReg, Register OrigVReg,
   // createAndComputeVirtRegInterval already produces correct, minimal liveness
   // that includes PHI uses properly.
 
-  // Flag live-out-undef subregister uses. A plain (non-PHI) use may read a lane
-  // that is undefined on some predecessor path (e.g. a poison-incoming PHI lane):
-  // that lane's SUBRANGE simply has no value reaching the use, while the value's
-  // main range (and its other lanes) do. Left as a strict read it demands a def on
-  // a path where the lane is genuinely undefined, which the downstream
-  // LiveIntervals rejects with "defs don't dominate all uses". Detection is local
-  // and search-free: the per-lane subrange carries exactly this — SR.getVNInfoAt
-  // returns null at the use iff no value of that lane reaches it.
+  // Flag reads whose lanes are not JOINTLY DOMINATED by defs. A repair can leave a
+  // lane defined on only some paths to a use: %11 defined in one predecessor while
+  // a later EXP reads %11.sub1 (issue98474). Left as a strict read, the next
+  // whole-value LiveIntervals computation walks back from the use, reaches entry
+  // without finding a def on that path, and aborts with "Virtual register defs
+  // don't dominate all uses".
+  //
+  // The property is joint domination, NOT liveness at the use: a lane can be
+  // perfectly live along one edge and still undefined along another, so a
+  // getVNInfo*(UseIdx) probe cannot decide this. The updater maintains SSA, so the
+  // value reaching the use has a single def and joint domination reduces to one
+  // dominance query. A PHI-defined value is exempt: its operands are per-edge by
+  // construction.
   {
     MachineRegisterInfo &MRI = MF.getRegInfo();
     LiveInterval &FinalLI = LIS.getInterval(OrigVReg);
@@ -330,15 +335,39 @@ MachineLaneSSAUpdater::performSSARepair(Register NewVReg, Register OrigVReg,
             MO.getSubReg() ? TRI.getSubRegIndexLaneMask(MO.getSubReg())
                            : MRI.getMaxLaneMaskForVReg(OrigVReg);
         SlotIndex UseIdx = LIS.getInstructionIndex(*UseMI).getRegSlot();
-        // Undef iff NO lane the operand reads has a value at the use: every read
-        // lane's subrange is dead here. (A partially-live use is a real read.)
-        bool AnyLaneLive = false;
-        for (LiveInterval::SubRange &S : FinalLI.subranges())
-          if ((S.LaneMask & UseLane).any() && S.getVNInfoAt(UseIdx)) {
-            AnyLaneLive = true;
+        bool UndefOnSomePath = false;
+        for (LiveInterval::SubRange &S : FinalLI.subranges()) {
+          if ((S.LaneMask & UseLane).none())
+            continue;
+          VNInfo *VNI = S.getVNInfoBefore(UseIdx);
+          if (!VNI) {
+            UndefOnSomePath = true; // no value of this lane reaches the use
             break;
           }
-        if (!AnyLaneLive)
+          if (VNI->isPHIDef()) {
+            // Not a PHI instruction: a block-boundary value, i.e. the lane enters
+            // this block from its predecessors. It is jointly dominated only if
+            // EVERY predecessor carries the lane out; one that does not is the
+            // undefined path.
+            MachineBasicBlock *DefBB = LIS.getMBBFromIndex(VNI->def);
+            for (MachineBasicBlock *P : DefBB->predecessors())
+              if (!S.getVNInfoBefore(LIS.getMBBEndIdx(P))) {
+                UndefOnSomePath = true;
+                break;
+              }
+            if (UndefOnSomePath)
+              break;
+            continue;
+          }
+          // A def that does not dominate the use is absent on the paths it does
+          // not reach, which is exactly the joint-domination failure.
+          MachineInstr *DefMI = LIS.getInstructionFromIndex(VNI->def);
+          if (DefMI && !MDT.dominates(DefMI, UseMI)) {
+            UndefOnSomePath = true;
+            break;
+          }
+        }
+        if (UndefOnSomePath)
           MO.setIsUndef(true);
       }
   }
