@@ -483,6 +483,19 @@ MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
     return nullptr;
   }
 
+  // The def is dead: the value has no reader, so there is nothing to save and
+  // nothing will be reloaded. Emitting the store anyway leaves `dead %v = ...`
+  // immediately followed by a read of %v, which the verifier rejects once colored
+  // with "Using an undefined physical register" -- the same failure the
+  // IMPLICIT_DEF case above avoids (si-sgpr-spill: `dead %202:sreg_64` is the
+  // unused sdst of a V_DIV_SCALE, stored into %stack.12 as $sgpr52_sgpr53).
+  if (MRI->use_nodbg_empty(VReg) ||
+      DefMI->registerDefIsDead(VReg, /*TRI=*/nullptr)) {
+    LLVM_DEBUG(dbgs() << "spillAtDefinition(): def is dead (no readers) -> "
+                         "no store emitted\n");
+    return nullptr;
+  }
+
   MachineBasicBlock *DefMBB = DefMI->getParent();
   // Store right after the def. When the def is a PHI, all PHIs must stay
   // contiguous at the block top, so std::next(PHI) could land the store between
