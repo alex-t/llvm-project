@@ -57,49 +57,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   DenseMap<Register, MCRegister> ColorMap;
   BitVector OccupiedRegUnits;
 
-  // Width-tiered coloring (experiment, -amdgpu-ssa-virgin-order). Per tier the
-  // explicit VIRGIN allocation order — aligned tuples of that (pool, width) that
-  // NO already-allocated wider value of the SAME pool occupies anywhere in the
-  // function. A value colored into one of these cannot interfere with any wider
-  // value, so the tier is Hack-compliant BY CONSTRUCTION (auditable: this vector
-  // IS the proof — no interference test needed within it). SGPR and VGPR pools
-  // are disjoint, so a single pass could handle both; they are kept SEPARATE
-  // tiers purely for transparency. Key = (isVector?1:0, widthBits) — unsigned,
-  // not bool, since DenseMap's pair key needs a hashable integral. Built once
-  // per tier in color()'s width loop.
-  DenseMap<std::pair<unsigned, unsigned>, SmallVector<MCRegister, 64>>
-      VirginTierOrder;
-  void buildVirginTierOrder(bool IsVector, unsigned WidthBits);
-
-  // Per-tier pick tallies (experiment). Keyed like VirginTierOrder, incremented
-  // in pickFreePhysReg when a value of that (pool,width) is placed from the
-  // virgin order vs the gap-scan. analyzeTierRank reads AND resets the key it
-  // reports, so each entry counts exactly one (phase,pool,width) tier walk.
-  DenseMap<std::pair<unsigned, unsigned>, unsigned> VirginPickByTier;
-  DenseMap<std::pair<unsigned, unsigned>, unsigned> GapPickByTier;
-
-  // Forensic (post-pass) feasibility analysis: over the vregs a tier actually
-  // colored (\p TierVRegs) PLUS the ones it could not color (\p FailedVRegs —
-  // they still competed for the same virgin pool, so they belong in the rank),
-  // compute the tier's interference-graph rank via LIS and compare to the virgin
-  // pool size. Emits one [TIERPROOF] line (via errs(), so it survives a
-  // downstream crash) whose verdict separates colorer-fault from
-  // spiller-under-spill:
-  //   rank <= pool, no gap, no fail  -> HACK-OK (pure Hack held — the proof)
-  //   rank <= pool, but gap or fail  -> COLORER fault (feasible yet Hack missed)
-  //   rank >  pool, fail > 0         -> SPILLER under-spilled (infeasible tier)
-  // NOT on the coloring decision path.
-  void analyzeTierRank(unsigned Phase, bool IsVector, unsigned WidthBits,
-                       ArrayRef<Register> TierVRegs,
-                       ArrayRef<Register> FailedVRegs);
-
-  // Gap-scan fallback (virgin exhausted): find a PR of \p RC whose colored
-  // occupants' live intervals do NOT overlap \p VI along VI's whole range
-  // (queried via LIS) — a gap opened by an occupant's death that we may reuse.
-  // Returns 0 if none.
-  MCRegister findNonInterferingGap(const TargetRegisterClass *RC,
-                                   const LiveInterval &VI);
-  void dumpSpanWidthDelta(const TargetRegisterClass *RC, const LiveInterval &VI);
   unsigned MaxVGPRIdx = 0;
   unsigned MaxSGPRIdx = 0;
   unsigned MaxAGPRIdx = 0;
@@ -372,17 +329,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
                           llvm::function_ref<bool(Register)> Eligible,
                           unsigned *NumRecolored = nullptr);
 
-  /// Naive up-front pre-spiller. At each tight region's peak slot, spill
-  /// widest-first live values (kill-at-def memory spill) until point-RP <= the
-  /// allocatable pool, iterating (re-measure) until no tight region remains. Runs
-  /// BEFORE color() so the Hack fast-path colors by construction. Only guarantees
-  /// the PRESSURE precondition — width>1 aligned-tuple colorability (chi>omega) is
-  /// NOT ensured; such residuals still flow to color()'s recovery. Returns true if
-  /// anything was spilled. Flag-gated (-amdgpu-ssa-pre-spill).
-  bool preSpillToLimit(MachineFunction &MF);
-
   /// Width-aware up-front pre-spiller (-amdgpu-ssa-pre-spill-wa). Same tight-region
-  /// / kill-at-def+reload-at-use machinery as preSpillToLimit, but the frozen victim
+  /// / kill-at-def+reload-at-use machinery, but the frozen victim
   /// universe spans ALL widths and victims are chosen WIDEST-FIRST, decrementing the
   /// region peak by each victim's real dword width. This relieves regions dominated
   /// by wide tuples (SGPR/VGPR vreg_64/128/...) that the width-1-only naive version
@@ -589,13 +537,12 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   firstBlockAfter(MCRegister PR, SlotIndex S, SlotIndex End,
                   ArrayRef<std::pair<Register, MCRegister>> Overlappers) const;
 
-  /// Single linear scan over ColorMap for \p VI: the shared "collect" step of the
-  /// gap-scan / split pipeline. ORs the register units of every colored occupant
-  /// whose interval overlaps VI into \p OccupiedUnits. \p Overlappers is optional:
-  /// when non-null it also collects (occupant vreg, its physreg) for each. The gap
-  /// pick (findNonInterferingGap) passes nullptr (needs only occupancy); the
-  /// splitter (spillCrossLiver) passes a vector. NOT cacheable across the
-  /// two — they run in different phases with ColorMap mutated between.
+  /// Single linear scan over ColorMap for \p VI: the shared "collect" step of
+  /// the split pipeline. ORs the register units of every colored occupant whose
+  /// interval overlaps VI into \p OccupiedUnits. \p Overlappers is optional: when
+  /// non-null it also collects (occupant vreg, its physreg) for each, as every
+  /// current caller does. NOT cacheable across callers — they run in different
+  /// phases with ColorMap mutated between.
   void scanOverlappersForVI(
       const LiveInterval &VI, BitVector &OccupiedUnits,
       SmallVectorImpl<std::pair<Register, MCRegister>> *Overlappers = nullptr) const;

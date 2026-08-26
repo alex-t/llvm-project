@@ -1,5 +1,5 @@
 # RUN: llc -mtriple=amdgcn -mcpu=gfx900 -run-pass=amdgpu-ssa-register-allocator \
-# RUN:   -amdgpu-ssa-virgin-order -amdgpu-ssa-experiment-bail \
+# RUN:   -amdgpu-ssa-experiment-bail \
 # RUN:   -amdgpu-ssa-forensic-json=%t.json -o /dev/null %s
 # RUN: FileCheck %s --input-file=%t.json
 #

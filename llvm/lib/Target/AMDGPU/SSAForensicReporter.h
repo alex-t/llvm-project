@@ -211,12 +211,10 @@ public:
 
   // === Candidate facts inside pickFreePhysReg (E5/E6/E7) ===
   //
-  // SCHEMA NOTE: candidate-* events are emitted ONLY on the default first-fit
-  // pick path (and the phi-affinity-hint prelude). Under -amdgpu-ssa-virgin-order
-  // the virgin-order and gap-scan picks return before the instrumented loop, so
-  // an attempt-completed in that mode carries NO candidate trail. This is a
-  // deliberate v1 gap (the virgin path is not instrumented); consumers must not
-  // assume every attempt-completed has preceding candidate events.
+  // SCHEMA NOTE: candidate-* events are emitted on the first-fit pick path (and
+  // the phi-affinity-hint prelude). A pick that returns before that loop runs
+  // carries NO candidate trail, so consumers must not assume every
+  // attempt-completed has preceding candidate events.
 
   /// E5. A candidate physreg was considered at a given first-fit ordinal.
   void candidateConsidered(uint64_t AttemptCause, unsigned PhysRegID,
