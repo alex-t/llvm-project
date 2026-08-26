@@ -71,13 +71,6 @@ static cl::opt<bool> EnablePreservedRPFixpoint(
              "preserved-RP clique fits callee-saved capacity (Option A)"),
     cl::init(true), cl::Hidden);
 
-// Master switch for all around-call-liver (ACL) work, defined in
-// AMDGPUSSARegisterAllocator.cpp. When off, the spiller skips the preserved-RP
-// (callee-saved capacity) gate entirely, matching the committed baseline.
-namespace llvm {
-extern cl::opt<bool> EnableAMDGPUSSAACLColoring;
-}
-
 // isSpillInstr / isReloadInstr are now shared inline helpers in
 // SSASpillEmitter.h (used by both the spiller policy and the emitter).
 
@@ -1340,32 +1333,22 @@ bool AMDGPUSSARegisterSpiller::runOnMachineFunction(MachineFunction &MF) {
                     << ", SGPR=" << ST.getMaxNumSGPRs(MF) << ")\n");
 
   // Classify pinned (crosses-a-call) vregs and compute per-file callee-saved
-  // capacity k_cs. Only the ACL passes consume this, so skip it entirely when
-  // ACL is off — the spiller then behaves exactly as the original two total-RP
-  // passes with no ACL-related work.
-  if (EnableAMDGPUSSAACLColoring)
-    computePinnedAndCap(MF);
+  // capacity k_cs. Only the ACL passes consume this.
+  computePinnedAndCap(MF);
 
-  // Two-pass approach:
-  // Pass 1: Process SGPRs (spilled to VGPR lanes if needed)
-  // Pass 2: Process VGPRs (spilled to memory)
-
-  // Four-pass structure when ACL is enabled (mirrors the coloring side, which
-  // colors ACL then ordinary):
+  // Four-pass structure (mirrors the coloring side, which colors ACL then
+  // ordinary):
   //   1. ACL_SGPR   preserved-RP, SGPR   (processACLCalls)  -> spills to lanes
   //   2. main_SGPR  total-RP, SGPR       (processFunction)  -> more lanes
   //      -- count SGPR-spill lanes; debit VGPR total (and preserved) budget --
   //   3. ACL_VGPR   preserved-RP, VGPR   (processACLCalls)
   //   4. main_VGPR  total-RP, VGPR       (processFunction)
-  // When ACL is off, this reduces to the original two total-RP passes.
 
   // Pass 1: ACL_SGPR — spill SGPR around-call-livers to fit callee-saved
   // capacity, before ordinary SGPR spilling sees them.
   bool ChangedSGPR = false;
-  if (EnableAMDGPUSSAACLColoring) {
-    IsVGPRPass = false;
-    ChangedSGPR |= processACLCalls(MF);
-  }
+  IsVGPRPass = false;
+  ChangedSGPR |= processACLCalls(MF);
 
   // Pass 2: main_SGPR — ordinary total-RP SGPR spilling.
   LLVM_DEBUG(dbgs() << "\n=== Pass 2: Processing SGPRs (total-RP) ===\n");
@@ -1395,16 +1378,13 @@ bool AMDGPUSSARegisterSpiller::runOnMachineFunction(MachineFunction &MF) {
   // NOTE: debiting VGPRPreservedCap by the call-crossing spill lanes is a
   // separate follow-up (see ACL_Pass_and_CallSite_Capacity.md Part 1b) — this
   // recompute picks up reload-vreg pins but not the not-yet-materialized lanes.
-  if (EnableAMDGPUSSAACLColoring)
-    computePinnedAndCap(MF);
+  computePinnedAndCap(MF);
 
   // Pass 3: ACL_VGPR — spill VGPR around-call-livers to fit callee-saved
   // capacity, before ordinary VGPR spilling.
   bool ChangedVGPR = false;
-  if (EnableAMDGPUSSAACLColoring) {
-    IsVGPRPass = true;
-    ChangedVGPR |= processACLCalls(MF);
-  }
+  IsVGPRPass = true;
+  ChangedVGPR |= processACLCalls(MF);
 
   // Pass 4: main_VGPR — ordinary total-RP VGPR spilling.
   LLVM_DEBUG(dbgs() << "\n=== Pass 4: Processing VGPRs (total-RP) ===\n");

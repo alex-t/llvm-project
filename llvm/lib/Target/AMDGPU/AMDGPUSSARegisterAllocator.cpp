@@ -27,20 +27,6 @@ using namespace llvm;
 
 #define DEBUG_TYPE "amdgpu-ssa-register-allocator"
 
-// Master switch for the around-call-liver (ACL) work: the allocator's two-phase
-// (ACL-first) coloring walk AND the spiller's preserved-RP (callee-saved
-// capacity) gate. This work is uncommitted/unproven and currently regresses the
-// corpus (malformed MIR out of the two-phase walk on call functions). Default
-// OFF so the tree matches the committed `ssara` baseline; flip on to develop it.
-// The spiller reads this via a declaration in AMDGPUSSARegisterSpiller.cpp.
-namespace llvm {
-cl::opt<bool> EnableAMDGPUSSAACLColoring(
-    "amdgpu-ssa-acl-coloring",
-    cl::desc("Enable around-call-liver two-phase coloring and the spiller's "
-             "preserved-register-pressure gate (default on; corpus-validated)"),
-    cl::init(true), cl::Hidden);
-} // namespace llvm
-
 static cl::opt<bool> EnableAGPRFirst(
     "amdgpu-ssa-agpr-first", cl::Hidden, cl::init(false),
     cl::desc("On unified targets, order av_ classes AGPR-first so av-legal values "
@@ -56,15 +42,6 @@ static cl::opt<bool> EnableExperimentBail(
              "later NoVRegs pass will abort) — for measurement only. Off = the "
              "real width-1 spill path runs and the function completes."));
 
-static cl::opt<bool> EnablePreSpillWA(
-    "amdgpu-ssa-pre-spill-wa", cl::Hidden, cl::init(true),
-    cl::desc("Width-aware up-front spiller: like -amdgpu-ssa-pre-spill but the "
-             "victim universe spans ALL widths and spills are WIDEST-FIRST, "
-             "decrementing region peak by the victim's real dword width. Models "
-             "per-width availability (pool/W tuples per class) so wide-tuple "
-             "regions (e.g. SGPR-wide) the width-1-only naive version cannot "
-             "relieve are handled. Off = current (color-then-recover)."));
-
 static cl::opt<bool> EnableVerifyValueFlow(
     "amdgpu-ssa-verify-value-flow", cl::Hidden, cl::init(false),
     cl::desc("Certify every physreg use holds the SSA value its vreg named "
@@ -73,31 +50,6 @@ static cl::opt<bool> EnableVerifyValueFlow(
 static cl::opt<bool> VerifyValueFlowFatal(
     "amdgpu-ssa-verify-value-flow-fatal", cl::Hidden, cl::init(false),
     cl::desc("Abort on a value-flow violation (default: warn to stderr)"));
-
-static cl::opt<bool> EnableAGPRRescue(
-    "amdgpu-ssa-agpr-rescue", cl::Hidden, cl::init(true),
-    cl::desc("On unified-file targets, widen VGPR-class vregs to the av_ vector "
-             "super-class up front when every operand constraint admits AGPRs, "
-             "so narrow values can draw the virgin AGPR tuples left free by "
-             "wider VGPR tuples (Greedy-style AGPR rescue, done as a sound "
-             "regclass widen rather than a pick-time fallback)"));
-
-// [region-rp-reduction Stage 3] Region-based RP reduction: spill cost-ranked
-// crossers across tight regions to drop RP <= pool, then re-color from clean.
-// Default off; the reproducer/corpus gate flips it on.
-static cl::opt<bool> EnableRegionRP(
-    "amdgpu-ssa-region-rp", cl::Hidden, cl::init(true),
-    cl::desc("Reduce register pressure region-by-region (spill cost-ranked "
-             "live-through crossers across each tight region) before re-coloring, "
-             "instead of the per-failed-value coloring-time recovery"));
-
-// In-memory PHI-web coalescing: when region-rp picks a PHI victim, spill the whole
-// PHI web to one shared stack slot (store operands in predecessors, reload uses,
-// erase the PHIs) instead of storing the PHI result at the saturated join (which
-// is useless — the store lands inside the wall it should dissolve). Default off.
-static cl::opt<bool> EnablePhiWebSpill(
-    "amdgpu-ssa-phi-web-spill", cl::Hidden, cl::init(true),
-    cl::desc("region-rp: spill a PHI victim as an in-memory-coalesced web"));
 
 // Shadow register-tree oracle (SSARegisterTree). When on AND the forensic sink
 // is active, a shadow SSARegisterTree mirrors the VGPR_32 occupancy the
@@ -133,7 +85,6 @@ STATISTIC(NumPhiCopyInfeasible,
 STATISTIC(NumPhiCopySubreg,
           "PHI-copy operands with a sub-register source (context tally; overlaps "
           "the feasible/infeasible split, now lane-classified)");
-
 
 STATISTIC(NumTierSpills,
           "Values that coloring could not place and that entered recovery");
@@ -1798,15 +1749,15 @@ bool AMDGPUSSARegisterAllocator::relieveTightRegion(
 }
 
 bool AMDGPUSSARegisterAllocator::preSpillToLimitWidthAware(MachineFunction &MF) {
-  // WIDTH-AWARE up-front spiller (-amdgpu-ssa-pre-spill-wa). Same tight-region /
-  // kill-at-def+reload-at-use machinery as preSpillToLimit, but two things change
-  // vs. the naive version:
-  //   (1) the frozen victim UNIVERSE spans ALL widths (naive: width-1 only), and
-  //   (2) victims are chosen WIDEST-FIRST and the region peak is decremented by the
-  //       victim's REAL dword width (naive: always -1).
-  // (1)+(2) let it relieve regions dominated by wide tuples (vreg_64/128/... in
-  // either file) that the width-1-only naive version can never touch — nothing of
-  // width 1 is live at such a peak, so naive spins to its CAP doing nothing. The
+  // WIDTH-AWARE up-front spiller. Runs BEFORE color(): at each tight region's
+  // peak it spills frozen victims (kill-at-def store, reload at use) until the
+  // peak fits the allocatable pool, so the coloring walk succeeds by
+  // construction. Two properties decide which regions it can relieve:
+  //   (1) the frozen victim UNIVERSE spans ALL widths, and
+  //   (2) victims are chosen WIDEST-FIRST and the region peak is decremented by
+  //       the victim's REAL dword width.
+  // Both are what reach a region dominated by wide tuples (vreg_64/128/... in
+  // either file), where nothing of width 1 is live at the peak at all. The
   // SGPR-wide bookkeeping bug and the 128xfloat emergency-slot cases are exactly
   // these: the pressure is carried by wide SGPR/VGPR tuples.
   //
@@ -2079,10 +2030,8 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
           // the web never reloads the operand into R — so it would wrongly reject
           // the exact candidates the web is meant to handle. BYPASS the gate for
           // web candidates and give a fixed cost (feasible by construction, the
-          // monotone wall-dissolution). Only when the flag is on.
-          PhiWeb Web;
-          if (EnablePhiWebSpill)
-            Web = closePhiWeb(I.VReg);
+          // monotone wall-dissolution).
+          PhiWeb Web = closePhiWeb(I.VReg);
           double Ratio;
           if (Web.valid()) {
             // RA-side feasibility (shared gate): decline if any web reload would
@@ -2120,32 +2069,30 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
                           << (R.Peak - long(BestW)) << "\n");
         Emitter->beginPass(WantVGPR);
         bool DidWeb = false;
-        if (EnablePhiWebSpill) {
-          // Route to the PHI-web spill when the victim participates in a PHI web —
-          // EITHER it IS a PHI result, OR (the common case region-rp actually
-          // picks) it is a PHI OPERAND feeding a web PHI. A PHI operand cannot be
-          // resolved by a plain spill (it must be live at the PHI edge); only the
-          // web spill (store operands, reload result-uses, erase the PHIs)
-          // dissolves the join wall. closePhiWeb keys the whole web on the
-          // consuming PHI's result and runs the soundness gate.
-          PhiWeb Web = closePhiWeb(BestB);
-          if (Web.valid()) {
-            LLVM_DEBUG(dbgs() << "    region-rp region [" << R.S << "," << R.E
-                              << ") victim=" << printReg(BestB, TRI) << " -> WEB root="
-                              << printReg(Web.Root, TRI) << "\n");
-            // No shared color is forced (the SGPR-lane assert is a per-store WIDTH
-            // check, not a color/count check — see spillPhiWeb doc). Ground ops keep
-            // their colors and are stored directly; a sub-register operand is
-            // COPY-extracted to slot width, and that fresh short-lived vreg is
-            // colored in place here (it lives only [copy, store], so a free reg
-            // always exists).
-            auto ColorFreshVReg = [&](Register C) {
-              if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
-                colorOneInPlace(C);
-            };
-            Emitter->spillPhiWeb(Web, Limit, ColorFreshVReg);
-            DidWeb = true;
-          }
+        // Route to the PHI-web spill when the victim participates in a PHI web —
+        // EITHER it IS a PHI result, OR (the common case region-rp actually
+        // picks) it is a PHI OPERAND feeding a web PHI. A PHI operand cannot be
+        // resolved by a plain spill (it must be live at the PHI edge); only the
+        // web spill (store operands, reload result-uses, erase the PHIs)
+        // dissolves the join wall. closePhiWeb keys the whole web on the
+        // consuming PHI's result and runs the soundness gate.
+        PhiWeb Web = closePhiWeb(BestB);
+        if (Web.valid()) {
+          LLVM_DEBUG(dbgs() << "    region-rp region [" << R.S << "," << R.E
+                            << ") victim=" << printReg(BestB, TRI) << " -> WEB root="
+                            << printReg(Web.Root, TRI) << "\n");
+          // No shared color is forced (the SGPR-lane assert is a per-store WIDTH
+          // check, not a color/count check — see spillPhiWeb doc). Ground ops keep
+          // their colors and are stored directly; a sub-register operand is
+          // COPY-extracted to slot width, and that fresh short-lived vreg is
+          // colored in place here (it lives only [copy, store], so a free reg
+          // always exists).
+          auto ColorFreshVReg = [&](Register C) {
+            if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
+              colorOneInPlace(C);
+          };
+          Emitter->spillPhiWeb(Web, Limit, ColorFreshVReg);
+          DidWeb = true;
         }
         if (!DidWeb) {
           // Fall back to a plain spill — but only if BestB still has a non-empty
@@ -3000,7 +2947,7 @@ AMDGPUSSARegisterAllocator::classifyRecovery(RecoveryWindow &RW) const {
       const_cast<MachineFunction &>(MF), IsVGPR ? RegFile::VGPR : RegFile::SGPR);
 
   // 1. WEB — the value feeds a PHI (divergent-diamond / loop-carried value merge).
-  if (EnablePhiWebSpill && RW.WebPhi)
+  if (RW.WebPhi)
     return RecoveryState::Web;
   // 2. CROSS-LIVER — a cleanly-spillable blocker exists (live-through OR
   //    born-in-F; hasCleanCrossLiver covers both). This IS the remnant router
@@ -3280,9 +3227,6 @@ AMDGPUSSARegisterAllocator::getCSRSet(const MachineInstr &CallMI,
 }
 
 void AMDGPUSSARegisterAllocator::preassignValuesLiveAcrossCalls() {
-  if (!EnableAMDGPUSSAACLColoring)
-    return;
-
   // Real calls only: a regmask call is what confines a crossing value to the
   // preserved set, while a site that merely carries an implicit def (V_ADD_CO
   // defining VCC) constrains that one register and is left to the walk's own
@@ -3557,24 +3501,22 @@ void AMDGPUSSARegisterAllocator::color() {
   classifyVRegs();
 
   DenseSet<Register> ACLSet;
-  if (EnableAMDGPUSSAACLColoring) {
-    SmallVector<SlotIndex, 8> CallOnlySites;
-    for (const auto &[CallIdx, CallMI] : CallSites)
-      if (CallMI->isCall())
-        CallOnlySites.push_back(CallIdx);
-    if (!CallOnlySites.empty())
-      for (unsigned I = 0, E = MRI->getNumVirtRegs(); I < E; ++I) {
-        Register VReg = Register::index2VirtReg(I);
-        if (MRI->reg_nodbg_empty(VReg) || !LIS->hasInterval(VReg))
-          continue;
-        const LiveInterval &LI = LIS->getInterval(VReg);
-        for (SlotIndex CS : CallOnlySites)
-          if (LI.liveAt(CS)) {
-            ACLSet.insert(VReg);
-            break;
-          }
-      }
-  }
+  SmallVector<SlotIndex, 8> CallOnlySites;
+  for (const auto &[CallIdx, CallMI] : CallSites)
+    if (CallMI->isCall())
+      CallOnlySites.push_back(CallIdx);
+  if (!CallOnlySites.empty())
+    for (unsigned I = 0, E = MRI->getNumVirtRegs(); I < E; ++I) {
+      Register VReg = Register::index2VirtReg(I);
+      if (MRI->reg_nodbg_empty(VReg) || !LIS->hasInterval(VReg))
+        continue;
+      const LiveInterval &LI = LIS->getInterval(VReg);
+      for (SlotIndex CS : CallOnlySites)
+        if (LI.liveAt(CS)) {
+          ACLSet.insert(VReg);
+          break;
+        }
+    }
   LLVM_DEBUG(dbgs() << "ACL set: " << ACLSet.size()
                     << " vregs live across calls\n");
 
@@ -5264,8 +5206,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
       MI.eraseFromParent();
     }
 
-  if (EnableAGPRRescue)
-    widenToAVOnUnified(); // before classifyVRegs: widened widths feed the order
+  widenToAVOnUnified(); // before classifyVRegs: widened widths feed the order
   classifyVRegs();
 
   // TWO INDEPENDENT ALLOCATION STAGES: SGPR first, then VGPR/AGPR. The SGPR
@@ -5294,8 +5235,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // re-anchors it per block. No-op / not built unless the flag AND a forensic
   // sink are on.
   setupShadowTree();
-  if (EnablePreSpillWA)
-    preSpillToLimitWidthAware(MF);
+  preSpillToLimitWidthAware(MF);
   color();
 
   // [Stage 3] Region RP-reduction: do our BEST-EFFORT spill-across to drop the
@@ -5315,7 +5255,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // sees RP > Limit at its range and spills a live-through across it. Loop until
   // no uncolorables remain, or a pass performs no spill (genuine residual for the
   // split path), guarded by a hard cap.
-  if (EnableRegionRP && !UncolorableVRegs.empty()) {
+  if (!UncolorableVRegs.empty()) {
     // TEMPORARY / KNOWN-FLAWED termination (stopgap — see task #47 for the real
     // fix, an atomic region-relief transaction). The measure is the post-recolor
     // uncolorable COUNT: keep a round only if it strictly beats the previous

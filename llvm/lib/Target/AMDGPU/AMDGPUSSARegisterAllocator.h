@@ -329,15 +329,16 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
                           llvm::function_ref<bool(Register)> Eligible,
                           unsigned *NumRecolored = nullptr);
 
-  /// Width-aware up-front pre-spiller (-amdgpu-ssa-pre-spill-wa). Same tight-region
-  /// / kill-at-def+reload-at-use machinery, but the frozen victim
-  /// universe spans ALL widths and victims are chosen WIDEST-FIRST, decrementing the
-  /// region peak by each victim's real dword width. This relieves regions dominated
-  /// by wide tuples (SGPR/VGPR vreg_64/128/...) that the width-1-only naive version
-  /// cannot touch. Models per-width availability honestly (pool/W aligned tuples per
-  /// class) but does NOT claim to resolve aligned-tuple fragmentation (chi>omega):
-  /// pool-fit is necessary, not always sufficient; placement residuals still flow to
-  /// color()'s recovery. Returns true if anything was spilled.
+  /// Width-aware up-front pre-spiller. At each tight region's peak, spills frozen
+  /// victims (kill-at-def store, reload at use) until the peak fits the allocatable
+  /// pool; runs BEFORE color() so the coloring walk succeeds by construction. The
+  /// victim universe spans ALL widths and victims are chosen WIDEST-FIRST,
+  /// decrementing the region peak by each victim's real dword width, which is what
+  /// lets it relieve regions dominated by wide tuples (SGPR/VGPR vreg_64/128/...).
+  /// Models per-width availability honestly (pool/W aligned tuples per class) but
+  /// does NOT claim to resolve aligned-tuple fragmentation (chi>omega): pool-fit is
+  /// necessary, not always sufficient; placement residuals still flow to color()'s
+  /// recovery. Returns true if anything was spilled.
   bool preSpillToLimitWidthAware(MachineFunction &MF);
 
   /// [Recovery classifier, Stage 1] Register file of a class for the recovery
