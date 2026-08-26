@@ -447,7 +447,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// VGPR-only-constrained use (the copy lives only [copy,use] -> trivially
   /// colorable). This is Greedy's v_accvgpr_read pattern for an asm-pinned block.
   /// Returns true if R was rescued (colored); false if the conditions do not hold
-  /// (caller then screams). Flag-gated on EnableAGPRFirst.
+  /// (caller then screams).
   bool tryAGPRHomeRescue(Register R);
 
   /// FSM transition: given the current handler \p S and its \p R result, return

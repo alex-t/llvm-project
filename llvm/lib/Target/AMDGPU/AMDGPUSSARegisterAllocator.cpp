@@ -27,12 +27,6 @@ using namespace llvm;
 
 #define DEBUG_TYPE "amdgpu-ssa-register-allocator"
 
-static cl::opt<bool> EnableAGPRFirst(
-    "amdgpu-ssa-agpr-first", cl::Hidden, cl::init(false),
-    cl::desc("On unified targets, order av_ classes AGPR-first so av-legal values "
-             "drain AGPRs before arch-VGPRs (SSARA experiment; can starve "
-             "frame-lowering's VGPR-spill-to-AGPR scratch)"));
-
 static cl::opt<bool> EnableExperimentBail(
     "amdgpu-ssa-experiment-bail", cl::Hidden, cl::init(false),
     cl::desc("Forensic mode: when width-tiered coloring cannot place a value, "
@@ -187,7 +181,7 @@ bool AMDGPUSSARegisterAllocator::avReloadLegal(Register B) const {
 
 AMDGPUSSARegisterAllocator::RecoveryResult
 AMDGPUSSARegisterAllocator::agprRelief(Register Failed, unsigned RPLimit) {
-  if (!EnableAGPRFirst || !ST->hasGFX90AInsts() ||
+  if (!ST->hasGFX90AInsts() ||
       fileOf(MRI->getRegClass(Failed)) != RegFile::VGPR)
     return RecoveryResult::NoOp;
   const LiveInterval &FI = LIS->getInterval(Failed);
@@ -721,7 +715,7 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
   // boundary instead (exactly Greedy's v_accvgpr scratch). Only under pressure ->
   // low-pressure functions are untouched.
   bool PreferAGPR = false;
-  if (EnableAGPRFirst && ST->hasGFX90AInsts() && TRI->isVectorSuperClass(RC)) {
+  if (ST->hasGFX90AInsts() && TRI->isVectorSuperClass(RC)) {
     unsigned VGPRPool = allocatablePool(
         const_cast<MachineFunction &>(MRI->getMF()), RegFile::VGPR);
     unsigned Peak = 0;
@@ -1137,29 +1131,23 @@ unsigned AMDGPUSSARegisterAllocator::pressureOf(const GCNRegPressure &P,
   case RegFile::AGPR:
     return P.getAGPRNum();
   case RegFile::VGPR:
-    // TWO-FILE MODEL (flag-gated, EXPERIMENT): the VGPR file's demand is arch-VGPR
-    // (arch + avgpr); AGPR is its OWN file (case above), so a value colored to AGPR
-    // relieves the VGPR file — which the old unified sum cannot express.
+    // TWO-FILE MODEL: the VGPR file's demand is arch-VGPR (arch + avgpr); AGPR is
+    // its OWN file (case above), so a value colored to AGPR relieves the VGPR file,
+    // which a unified arch+acc sum cannot express.
     //
-    // NOT neutral by default: the earlier "identical when Value[AGPR]==0" argument
-    // is FALSE in practice because agpr-rescue (default ON) already places values
-    // in AGPRs, so AGPR!=0 on much AGPR-using code (e.g. buffer-fat-pointer-*),
-    // where getArchVGPRNum() != getVGPRNum(true). Using arch-VGPR there shifted
-    // spill decisions and produced "undefined physical register" crashes. So the
-    // two-file metric is gated on EnableAGPRFirst; the default path keeps the
-    // unified count exactly as before. PERMANENT FIX (make the two-file model
-    // uniformly correct on AGPR-using code so it can be default) is a follow-up.
-    if (EnableAGPRFirst)
-      return P.getArchVGPRNum();
-    return ST->hasGFX90AInsts() ? P.getVGPRNum(/*UnifiedVGPRFile=*/true)
-                                : P.getArchVGPRNum();
+    // This was gated behind a flag for a while, on the grounds that arch-VGPR
+    // shifted spill decisions on AGPR-using code (agpr-rescue puts values in AGPRs,
+    // so Value[AGPR] != 0 and the two counts genuinely differ there). The unified
+    // count is now the configuration that fails on exactly that code:
+    // buffer-fat-pointers-memcpy.ll aborts in recovery on gfx90a and gfx942 with
+    // the unified count and completes with arch-VGPR.
+    return P.getArchVGPRNum();
   }
   llvm_unreachable("bad RegFile");
 }
 
 // Feasibility policy moved from the Emitter (which is pure spill/reload mechanics).
-// Same VGPR metric as pressureOf: two-file arch-VGPR under EnableAGPRFirst, else
-// the unified count (kept default so AGPR-using code is byte-identical to before).
+// Same VGPR metric as pressureOf: two-file arch-VGPR.
 unsigned AMDGPUSSARegisterAllocator::reloadRPBeforeUse(const MachineInstr *UseMI,
                                                        bool IsVGPR) const {
   GCNUpwardRPTracker Tracker(*LIS);
@@ -1168,7 +1156,7 @@ unsigned AMDGPUSSARegisterAllocator::reloadRPBeforeUse(const MachineInstr *UseMI
   GCNRegPressure P = Tracker.getPressure();
   if (!IsVGPR)
     return P.getSGPRNum();
-  return EnableAGPRFirst ? P.getArchVGPRNum() : P.getVGPRNum(ST->hasGFX90AInsts());
+  return P.getArchVGPRNum();
 }
 
 unsigned AMDGPUSSARegisterAllocator::reloadRPAtBlockEnd(const MachineBasicBlock *NCD,
@@ -1178,7 +1166,7 @@ unsigned AMDGPUSSARegisterAllocator::reloadRPAtBlockEnd(const MachineBasicBlock 
   GCNRegPressure P = Tracker.getPressure();
   if (!IsVGPR)
     return P.getSGPRNum();
-  return EnableAGPRFirst ? P.getArchVGPRNum() : P.getVGPRNum(ST->hasGFX90AInsts());
+  return P.getArchVGPRNum();
 }
 
 void AMDGPUSSARegisterAllocator::findTightRegions(
@@ -1706,7 +1694,7 @@ bool AMDGPUSSARegisterAllocator::relieveTightRegion(
   // the AGPR file starts empty (true for these SSARA-target functions, which do
   // not use AGPRs for compute).
   long AGPRBudget = 0;
-  if (EnableAGPRFirst && ST->hasGFX90AInsts() && R.File == RegFile::VGPR)
+  if (ST->hasGFX90AInsts() && R.File == RegFile::VGPR)
     AGPRBudget = allocatablePool(
         const_cast<MachineFunction &>(MRI->getMF()), RegFile::AGPR);
 
@@ -2775,7 +2763,7 @@ bool AMDGPUSSARegisterAllocator::tryAGPRHomeRescue(Register R) {
   // implicit-defs all 64 VGPRs) but that has VGPR-only-constrained uses: HOME the
   // value in an AGPR (survives the VGPR clobber), then copy AGPR->VGPR into a fresh
   // short-lived vreg right before each VGPR-only use.
-  if (!EnableAGPRFirst || !ST->hasGFX90AInsts())
+  if (!ST->hasGFX90AInsts())
     return false;
   const TargetRegisterClass *RC = MRI->getRegClass(R);
   if (fileOf(RC) != RegFile::VGPR || TRI->isAGPRClass(RC))
@@ -2971,9 +2959,8 @@ AMDGPUSSARegisterAllocator::classifyRecovery(RecoveryWindow &RW) const {
   // 4. AGPR-RELIEF — no clean crosser to spill-around, but on a unified vector
   //    file a colored av-legal crosser can be spilled so its reload re-homes to
   //    a free AGPR, freeing a VGPR for Failed. Try before the memory floor.
-  //    Flag-gated (experiment; can leave reload redefs uncolored -> rewrite bug).
-  if (EnableAGPRFirst && ST->hasGFX90AInsts() &&
-      (TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC)))
+  //    Known risk: a reload redef this leaves uncolored surfaces as a rewrite bug.
+  if (ST->hasGFX90AInsts() && (TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC)))
     return RecoveryState::AGPRRelief;
   // 5. TERMINAL — nothing structural applies. Memory-spill Failed iff a reload
   //    fits (Floor); else genuine point-over-pressure (Infeasible).
@@ -5183,7 +5170,6 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
   Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT, MLI);
   Emitter->setReporter(Reporter.get());
-  Emitter->setAGPRFirst(EnableAGPRFirst);
 
   // Erase fully-DEAD IMPLICIT_DEFs (def-only vreg, zero uses) before coloring.
   // Such an instruction produces no value, but if left in it is still colored to a
