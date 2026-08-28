@@ -58,6 +58,11 @@ static cl::opt<bool> EnableSSAShadowTree(
              "forensic NDJSON (observer only; requires a forensic sink; default "
              "off; byte-identical output on vs off)"));
 
+static cl::opt<bool> EnableLaneWasteDump(
+    "amdgpu-ssa-lane-waste-dump", cl::Hidden, cl::init(false),
+    cl::desc("Report per-function capacity held by dead lanes of partially "
+             "live tuples: whole-tuple occupancy vs subrange occupancy."));
+
 // Step-0 PHI-copy metric (see PHI_Coalescer design section 9). Counted at the
 // copy-vs-fixed-point decision in lowerPHIs(); pure instrumentation, no MIR
 // change. Baseline for the coalescer and regression guard for every later step.
@@ -669,36 +674,60 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     dbgs() << "\n";
   });
 
-  // Augment OccupiedRegUnits with wider-width assignments that overlap VI.
-  // Two sources: (1) WiderDefs — wider defs in THIS block not yet live at
-  // BBStart (O(k), k = wider defs in block); (2) ColorMap scan for wider
-  // cross-block entries (O(|ColorMap|), but only in narrower width passes
-  // after wider passes committed their assignments).
-  unsigned VIWidth = TRI->getRegSizeInBits(*RC);
-  BitVector OccupiedAtDef = OccupiedRegUnits;
-  for (const auto &[WPhysReg, WLI] : WiderDefs) {
-    if (WLI->overlaps(VI)) {
-      for (MCRegUnit Unit : TRI->regunits(WPhysReg))
-        OccupiedAtDef.set(Unit);
-    }
-  }
+  // Interference against the colored values, one register unit at a time. A
+  // colored value claims a unit only over the sub-range covering that unit's
+  // lanes, so a tuple whose high lanes are dead no longer blocks the registers
+  // those lanes map to. This replaces two approximations that were applied
+  // together: a point-in-time scanline that marked every unit of an assigned
+  // tuple regardless of live lanes, and a LiveInterval::overlaps() augmentation
+  // that compared main ranges only and was restricted to wider values.
+  //
+  // VI is compared by its main range, which over-claims for VI itself. That is
+  // conservative and self-correcting: VI's own dead lanes are accounted exactly
+  // when some later value asks whether it may use the units VI holds.
+  auto claimsUnit = [&](const LiveInterval &WLI, LaneBitmask UnitMask) {
+    if (!WLI.hasSubRanges())
+      return WLI.overlaps(VI);
+    // Every sub-range touching the unit, not just the first: a unit covered by
+    // two sub-ranges must be claimed if either is live across VI. An empty
+    // sub-range is skipped because overlaps() asserts on an empty receiver.
+    for (const LiveInterval::SubRange &S : WLI.subranges())
+      if (!S.empty() && (S.LaneMask & UnitMask).any() && S.overlaps(VI))
+        return true;
+    return false;
+  };
+  BitVector OccupiedAtDef(TRI->getNumRegUnits());
   for (const auto &[WReg, WPhysReg] : ColorMap) {
-    if (TRI->getRegSizeInBits(*MRI->getRegClass(WReg)) <= VIWidth)
+    if (!LIS->hasInterval(WReg))
       continue;
-    if (LIS->getInterval(WReg).overlaps(VI)) {
-      for (MCRegUnit Unit : TRI->regunits(WPhysReg))
+    const LiveInterval &WLI = LIS->getInterval(WReg);
+    if (WLI.empty() || !WLI.overlaps(VI))
+      continue; // cheap main-range reject before the per-unit work
+    for (MCRegUnitMaskIterator UI(WPhysReg, TRI); UI.isValid(); ++UI) {
+      auto [Unit, UnitMask] = *UI;
+      if (claimsUnit(WLI, UnitMask))
         OccupiedAtDef.set(Unit);
     }
   }
 
   // Shared legality test: a candidate PR is usable iff none of its reg units are
-  // occupied at this def AND no clobber site VI is live at writes it (a call's
-  // regmask or explicit def, an inline-asm clobber, an implicit-def $vcc) - the
-  // value would be undefined past that site.
+  // taken by a colored value or by physical-register liveness over VI's range,
+  // AND no clobber site VI is live at writes it (a call's regmask or explicit
+  // def, an inline-asm clobber, an implicit-def $vcc) - the value would be
+  // undefined past that site.
   auto IsFree = [&](MCRegister PR) -> bool {
-    for (MCRegUnit Unit : TRI->regunits(PR))
+    for (MCRegUnit Unit : TRI->regunits(PR)) {
       if (OccupiedAtDef.test(Unit))
         return false;
+      // Physical registers and block live-ins come from the reg-unit ranges
+      // LiveIntervals already maintains, which are range-accurate, rather than
+      // from a per-block live-in seed that held the whole block.
+      // A unit range can exist but be empty; overlaps() asserts on an empty
+      // receiver.
+      if (const LiveRange *RU = LIS->getCachedRegUnit(Unit); RU && !RU->empty())
+        if (RU->overlaps(VI))
+          return false;
+    }
     return survivesClobberSites(VI, PR);
   };
 
@@ -1228,6 +1257,51 @@ void AMDGPUSSARegisterAllocator::findTightRegions(
                         << RE << ") peak=" << Peak << "@" << PeakSlot
                         << " limit=" << Limit << "\n");
     }
+  }
+}
+
+void AMDGPUSSARegisterAllocator::reportLaneWaste(MachineFunction &MF) const {
+  // Two occupancy models over one tracker walk: what this allocator charges
+  // (the whole tuple, from markOccupied) and what LiveRegMatrix would charge
+  // (only the register units whose subrange is live). The difference is
+  // capacity Greedy keeps and this allocator does not.
+  for (RegFile File : {RegFile::SGPR, RegFile::VGPR}) {
+    unsigned PeakWhole = 0, LaneAtPeak = 0, MaxWaste = 0;
+    for (MachineBasicBlock &MBB : MF) {
+      if (MBB.empty())
+        continue;
+      GCNUpwardRPTracker Tracker(*LIS);
+      Tracker.reset(MBB);
+      for (MachineInstr &MI : llvm::reverse(MBB)) {
+        if (MI.isDebugInstr())
+          continue;
+        Tracker.recede(MI);
+        if (MI.isPHI())
+          continue;
+        unsigned Whole = 0, Lanes = 0;
+        for (auto [RegNum, Mask] : Tracker.getLiveRegs()) {
+          Register Reg(RegNum);
+          const TargetRegisterClass *RC =
+              Reg.isVirtual() ? MRI->getRegClassOrNull(Reg) : nullptr;
+          if (!RC || fileOf(RC) != File)
+            continue;
+          // divideCeil, not /32: a 16-bit class covers one 32-bit unit, and
+          // truncating it to 0 makes Lanes exceed Whole.
+          Whole += divideCeil(TRI->getRegSizeInBits(*RC), 32);
+          Lanes += SIRegisterInfo::getNumCoveredRegs(Mask);
+        }
+        if (Whole > PeakWhole) {
+          PeakWhole = Whole;
+          LaneAtPeak = Lanes;
+        }
+        MaxWaste = std::max(MaxWaste, Whole - Lanes);
+      }
+    }
+    errs() << "ssara-lane-waste: " << MF.getName()
+           << " file=" << (File == RegFile::SGPR ? "SGPR" : "VGPR")
+           << " pool=" << allocatablePool(MF, File)
+           << " peakWhole=" << PeakWhole << " laneAtPeak=" << LaneAtPeak
+           << " maxWaste=" << MaxWaste << "\n";
   }
 }
 
@@ -2770,6 +2844,11 @@ bool AMDGPUSSARegisterAllocator::tryAGPRHomeRescue(Register R) {
     return false;
   if (!LIS->hasInterval(R) || ColorMap.count(R))
     return false;
+  // Never rescue a copy this rescue minted: homing it in an AGPR cannot satisfy
+  // the VGPR-only use it was created for, and re-entering here per copy does not
+  // terminate.
+  if (RescueCopies.count(R))
+    return false;
 
   // PRECONDITION: R must be genuinely un-placeable in the VGPR file (no VGPR is
   // free across its whole range — the clobbered-range case). If a VGPR IS free,
@@ -2826,8 +2905,12 @@ bool AMDGPUSSARegisterAllocator::tryAGPRHomeRescue(Register R) {
     LIS->InsertMachineInstrInMaps(*Copy);
     MO->setReg(Tmp);
     LIS->createAndComputeVirtRegInterval(Tmp);
+    RescueCopies.insert(Tmp);
     if (!colorOneInPlace(Tmp))
-      UncolorableVRegs.push_back(Tmp); // should not happen: [copy,use] is tiny
+      // The VGPR file is saturated at this use, so even a [copy,use] value does
+      // not fit. Queue it so rewrite cannot see an uncolored live value; the
+      // terminal then reports the real over-pressure at this point.
+      UncolorableVRegs.push_back(Tmp);
   }
   // R's interval changed (uses repointed to copies); recompute so downstream
   // rewrite sees the truncated AGPR range.
@@ -4004,6 +4087,25 @@ void AMDGPUSSARegisterAllocator::emitSwap(MachineBasicBlock &MBB,
              .addReg(RegB));
   };
 
+  // In-place XOR swap for the VOP3-encoded 16-bit XOR. Unlike the opcodes above
+  // it carries source modifiers and op_sel, so the operand list is
+  // dst, src0_mods, src0, src1_mods, src1, op_sel.
+  auto EmitXorTripletT16 = [&] {
+    auto Build = [&](MCRegister Dst) {
+      LIS->InsertMachineInstrInMaps(
+          *BuildMI(MBB, InsertPt, DebugLoc(),
+                   TII->get(AMDGPU::V_XOR_B16_t16_e64), Dst)
+               .addImm(0)
+               .addReg(RegA)
+               .addImm(0)
+               .addReg(RegB)
+               .addImm(0));
+    };
+    Build(RegA);
+    Build(RegB);
+    Build(RegA);
+  };
+
   auto SwapInChunks = [&](unsigned ElemBytes) {
     for (int16_t SubIdx : TRI->getRegSplitParts(RC, ElemBytes))
       emitSwap(MBB, InsertPt, TRI->getSubReg(RegA, SubIdx),
@@ -4045,12 +4147,19 @@ void AMDGPUSSARegisterAllocator::emitSwap(MachineBasicBlock &MBB,
   // 16-bit swap (V_SWAP_B16, present on every true16 target, which is the only
   // place 16-bit VGPR subregs are allocated), or a 16-bit XOR triplet fallback.
   if (RegWidth == 16) {
-    if (ST->hasTrue16BitInsts())
+    // V_SWAP_B16 is VOP1-encoded, so both operands must lie in VGPR_16_Lo128
+    // (the lo16/hi16 halves of v0-v127). Coloring is free to place a 16-bit
+    // value above v127, and there the swap must go through the VOP3-encoded
+    // 16-bit XOR, whose operands are unrestricted VGPR_16.
+    const TargetRegisterClass &Lo128 = AMDGPU::VGPR_16_Lo128RegClass;
+    if (ST->hasTrue16BitInsts() && Lo128.contains(RegA) && Lo128.contains(RegB))
       LIS->InsertMachineInstrInMaps(
           *BuildMI(MBB, InsertPt, DebugLoc(), TII->get(AMDGPU::V_SWAP_B16), RegA)
                .addDef(RegB)
                .addReg(RegB)
                .addReg(RegA));
+    else if (ST->hasTrue16BitInsts())
+      EmitXorTripletT16();
     else
       EmitXorTriplet(AMDGPU::V_XOR_B16_fake16_e64);
     return;
@@ -5195,6 +5304,9 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   widenToAVOnUnified(); // before classifyVRegs: widened widths feed the order
   classifyVRegs();
 
+  if (EnableLaneWasteDump)
+    reportLaneWaste(MF);
+
   // TWO INDEPENDENT ALLOCATION STAGES: SGPR first, then VGPR/AGPR. The SGPR
   // stage may spill SGPRs; those spills lower (downstream) to VGPR lanes needing
   // WWM scratch. Between stages we reserve ceil(spilledSGPRlanes / wavesize)
@@ -5216,6 +5328,9 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   MaxSGPRIdx = 0;
   MaxAGPRIdx = 0;
   UncolorableVRegs.clear();
+  // Only per function: a rescue copy stays a rescue copy across the full recolor
+  // that clears UncolorableVRegs again below, since the copy instruction remains.
+  RescueCopies.clear();
   // Shadow register-tree oracle (observer, default off). Build the VGPR_32
   // physreg<->leaf map + empty tree for this function; seedOccupiedAtBBEntry
   // re-anchors it per block. No-op / not built unless the flag AND a forensic

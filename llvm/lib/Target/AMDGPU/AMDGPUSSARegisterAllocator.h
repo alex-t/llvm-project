@@ -141,6 +141,13 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // vregs left are the short reload remainders — which provably settle.
   SmallVector<Register, 8> UncolorableVRegs;
 
+  // The AGPR->VGPR copies tryAGPRHomeRescue itself minted. A copy that fails to
+  // color joins UncolorableVRegs, and both the drain loop and the terminal sweep
+  // walk values queued while they run, so without this the rescue would be
+  // applied to its own copies, each minting another (unbounded). Rescuing a copy
+  // can never help anyway: it exists precisely to hold a VGPR at one instruction.
+  SmallDenseSet<Register, 8> RescueCopies;
+
   // === Coloring ===
   void classifyVRegs();
   // On unified-file targets (gfx90a/gfx942: VALU reads/writes AGPRs directly),
@@ -311,6 +318,11 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// machinery as findTightRegions, so the RP is bit-identical.
   std::pair<SlotIndex, unsigned>
   peakSlotForValueInRegion(const TightRegion &R, Register V) const;
+
+  /// Diagnostic (-amdgpu-ssa-lane-waste-dump): per function and file, report the
+  /// peak whole-tuple occupancy this allocator charges against the subrange
+  /// occupancy LiveRegMatrix would charge. Mutates no allocator state.
+  void reportLaneWaste(MachineFunction &MF) const;
 
   /// Spill victims from ONE tight region until its total-dword excess (Peak-Limit)
   /// is gone. Candidates are frozen-\p Universe values of \p R's file, live at
