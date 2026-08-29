@@ -209,8 +209,9 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
 
   // Step 6: Perform common SSA repair (PHI placement + use rewriting)
   // LiveInterval for NewSSAVReg will be created by getInterval() as needed
-  PHIRegDefOps =
-      performSSARepair(NewSSAVReg, OrigVReg, DefMask, NewDefMI.getParent());
+  PHIRegDefOps = performSSARepair(
+      NewSSAVReg, OrigVReg, DefMask, NewDefMI.getParent(),
+      LIS.getInstructionIndex(NewDefMI).getRegSlot(DefOp->isEarlyClobber()));
 
   // Step 7: If SSA repair created subregister uses of OrigVReg (e.g., in PHIs
   // or REG_SEQUENCEs), recompute its LiveInterval to create subranges
@@ -241,6 +242,19 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
   return NewSSAVReg;
 }
 
+void MachineLaneSSAUpdater::rebuildMainRangeFromSubranges(Register OrigVReg) {
+  if (!LIS.hasInterval(OrigVReg))
+    return;
+  LiveInterval &LI = LIS.getInterval(OrigVReg);
+  if (!LI.hasSubRanges())
+    return;
+  LLVM_DEBUG(dbgs() << "  rebuilding main range of " << printReg(OrigVReg, &TRI)
+                    << " from subranges\n");
+  LI.clear();
+  LI.removeEmptySubRanges();
+  LIS.constructMainRangeFromSubranges(LI);
+}
+
 //===----------------------------------------------------------------------===//
 // Common SSA Repair Logic
 //===----------------------------------------------------------------------===//
@@ -248,7 +262,8 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
 SmallVector<MachineOperand *>
 MachineLaneSSAUpdater::performSSARepair(Register NewVReg, Register OrigVReg,
                                         LaneBitmask DefMask,
-                                        MachineBasicBlock *DefBB) {
+                                        MachineBasicBlock *DefBB,
+                                        SlotIndex MigratedDef) {
   LLVM_DEBUG(dbgs() << "MachineLaneSSAUpdater::performSSARepair NewVReg="
                     << NewVReg << " OrigVReg=" << OrigVReg
                     << " DefMask=" << PrintLaneMask(DefMask) << "\n");
@@ -283,15 +298,26 @@ MachineLaneSSAUpdater::performSSARepair(Register NewVReg, Register OrigVReg,
   // OrigVReg. Recomputing every subrange re-derives a sibling lane whose def is
   // mid-migration, and constructMainRangeFromSubranges then aborts with "Use not
   // jointly dominated by defs" (physreg-pair partial-def case). Keep the updater
-  // self-contained: refresh the DefMask subrange(s) from OrigVReg's remaining uses,
-  // leave sibling subranges untouched, and do not rebuild the main range while
-  // lanes are split across vregs (readers use the subrange path while subranges
-  // exist).
+  // self-contained: drop the migrated def, refresh the DefMask subrange(s) from
+  // OrigVReg's remaining uses, and leave sibling subranges untouched. The main
+  // range is the union of the subranges and cannot be maintained while lanes are
+  // split across vregs, so the driver rebuilds it once via
+  // rebuildMainRangeFromSubranges() after its last repair call.
   LiveInterval &OrigLI = LIS.getInterval(OrigVReg);
   if (OrigLI.hasSubRanges()) {
-    for (LiveInterval::SubRange &S : OrigLI.subranges())
-      if ((S.LaneMask & DefMask).any())
-        LIS.shrinkToUses(S, OrigVReg);
+    for (LiveInterval::SubRange &S : OrigLI.subranges()) {
+      if ((S.LaneMask & DefMask).none())
+        continue;
+      // The def at MigratedDef belongs to NewVReg now - its operand was
+      // retargeted before this repair ran - so OrigVReg must lose that value.
+      // shrinkToUses cannot do it: it trims segments but keeps dead defs, and
+      // the surviving zero-length segment still reports as overlapping any
+      // range that starts at the same slot.
+      if (VNInfo *VNI = S.getVNInfoAt(MigratedDef))
+        if (VNI->def.getBaseIndex() == MigratedDef.getBaseIndex())
+          S.removeValNo(VNI);
+      LIS.shrinkToUses(S, OrigVReg);
+    }
     OrigLI.removeEmptySubRanges();
   } else {
     LIS.removeInterval(OrigVReg);

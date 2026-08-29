@@ -218,6 +218,10 @@ bool AMDGPURebuildSSALegacy::runOnMachineFunction(MachineFunction &MF) {
         // may have severed (e.g. V_MOVRELS src0 must stay a subreg of the
         // implicit vector use).
         Updater.finalizeCoupledUses(VReg);
+
+        // All defs this pass intended to rename are renamed; VReg's main range
+        // is the union of its now-final subranges.
+        Updater.rebuildMainRangeFromSubranges(VReg);
       }
     }
   }

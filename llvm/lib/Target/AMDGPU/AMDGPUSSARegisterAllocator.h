@@ -295,6 +295,18 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// AGPR is the separate AGPR count (only meaningful on non-unified targets).
   unsigned pressureOf(const GCNRegPressure &P, RegFile File) const;
 
+  /// 32-bit slots \p Lanes of \p RC occupy, in the SAME unit pressureOf reports:
+  /// GCNRegPressure::inc charges a 32-bit class exactly 1 whatever its mask and a
+  /// tuple the number of slots its live lanes cover. Use this, never the class
+  /// width, whenever a value's demand is compared against a region peak.
+  unsigned coveredSlots(const TargetRegisterClass *RC, LaneBitmask Lanes) const;
+
+  /// 32-bit slots a spill of \p Lanes of \p V actually MOVES. Normally
+  /// coveredSlots, because the store narrows to the subregister the mask names and
+  /// the stack slot is sized to it; but a mask naming NO subregister falls back to
+  /// storing the whole register, and then the traffic is the full class.
+  unsigned spilledSlots(Register V, LaneBitmask Lanes) const;
+
   /// Post-spill RP just BEFORE \p UseMI (per-use reload site): reset(*MI) seeds
   /// just after the use, recede steps to just-before; -W+W cancel => post-spill RP
   /// there. Feasibility POLICY — RA-owned (moved from the Emitter, which is pure
@@ -318,6 +330,24 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// machinery as findTightRegions, so the RP is bit-identical.
   std::pair<SlotIndex, unsigned>
   peakSlotForValueInRegion(const TightRegion &R, Register V) const;
+
+  /// What a region holds of one virtual register: the UNION of the lane masks the
+  /// tracker reported live at in-region slots, and how many such slots. The mask is
+  /// not decoration — pressure is charged per covered 32-bit slot, so it is what
+  /// puts a victim's demand (and the spill that relieves it) in the peak's unit.
+  struct RegionOccupancy {
+    LaneBitmask Lanes = LaneBitmask::getNone();
+    unsigned Slots = 0;
+  };
+
+  /// Peak RP of \p R's file over ONLY [R.Start,R.End), measured with the same
+  /// GCNUpwardRPTracker + pressureOf machinery findTightRegions used, so it is
+  /// directly comparable to R.Peak. With \p Occupants, the same walk also reports
+  /// every virtual register live inside R — which IS the overlap test, hole-accurate
+  /// by construction. Returns 0 if R's first instruction no longer exists.
+  unsigned measureRegionPeak(
+      const TightRegion &R,
+      DenseMap<Register, RegionOccupancy> *Occupants = nullptr) const;
 
   /// Diagnostic (-amdgpu-ssa-lane-waste-dump): per function and file, report the
   /// peak whole-tuple occupancy this allocator charges against the subrange
@@ -485,9 +515,10 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   ///   Cost     : NReloads * Width. NReloads = 1 when B's uses are commonly
   ///              dominated and the shared reload hoists to their NCD; else one
   ///              reload per use.
-  ///   Width    : dwords B frees in R per spill (RP relief).
-  /// Ranking (Stage 3): Feasible, then Cost asc, then Width desc (equal traffic
-  /// -> widest wins: frees more RP in R).
+  ///   Width    : dwords the spill of \p Lanes MOVES (spilledSlots) — traffic, not
+  ///              relief. Relief is coveredSlots(Lanes) and the caller divides by
+  ///              it, so the two cancel except where an unnamed lane span forces a
+  ///              whole-register store.
   struct SpillCost {
     bool Feasible;
     unsigned Cost;
@@ -495,7 +526,21 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
     explicit operator bool() const { return Feasible; }
     static SpillCost Infeasible() { return {false, 0, 0}; }
   };
-  SpillCost costOfSpilling(Register B, const TightRegion &R);
+  SpillCost costOfSpilling(Register B, const TightRegion &R, LaneBitmask Lanes);
+
+  /// How to spill \p V (its \p Lanes, worth \p W slots of relief) out of \p R, and
+  /// how expensive that is. ALL victim-kind routing (PHI web vs plain value) and
+  /// both feasibility gates live here, so the selection loop only compares ratios.
+  /// Infeasible means "reject this candidate". Ratios are comparable across kinds;
+  /// lower is better.
+  struct SpillPlan {
+    enum KindTy { Infeasible, Plain, WebSpill };
+    KindTy Kind = Infeasible;
+    PhiWeb Web; // meaningful only when Kind == WebSpill
+    double Ratio = 0.0;
+  };
+  SpillPlan planSpill(Register V, const TightRegion &R, bool IsVGPRFile,
+                      LaneBitmask Lanes, unsigned W);
 
   /// [Stage 3] Region RP-reduction driver. While tight regions remain, service
   /// the worst (highest Peak) by spilling the cheapest feasible crosser ACROSS
@@ -696,6 +741,12 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// post-RA LIS verifier fatals "missing from live-in list").
   void markRegSequenceUndefLaneUses(MachineFunction &MF, RegFile Only);
   void eliminateRegSequences(MachineFunction &MF);
+  /// After rewriteOperands: erase a COPY whose source and destination were
+  /// colored to the same physical register. lowerPHIs and eliminateRegSequences
+  /// never emit such a copy; one that predates this pass — a live-in copy of a
+  /// kernel argument, or a live-range split/narrow copy from the spill emitter —
+  /// can only be recognized as a no-op once both its operands are physical.
+  void eliminateIdentityCopies(MachineFunction &MF);
   void addPhysRegLiveIns(MachineFunction &MF);
   void finalizeProperties(MachineFunction &MF);
 

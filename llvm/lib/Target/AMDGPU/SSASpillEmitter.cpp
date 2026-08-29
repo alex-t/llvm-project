@@ -1054,6 +1054,11 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
       ReloadedRegs.insert(
           VRegMaskPair(ReloadReg, MRI->getMaxLaneMaskForVReg(ReloadReg)));
   }
+  // Every reload redef has been renamed, so SpilledReg's subranges are final.
+  // Rebuild its main range as their union: repair left it spanning the defs that
+  // moved to the reload vregs, which would make SpilledReg claim registers it no
+  // longer occupies once coloring consults it.
+  SSAUpdater->rebuildMainRangeFromSubranges(SpilledReg);
   // SSA is restored inline; do not clear the IsSSA property at pass end.
   SSAInvalidated = false;
 

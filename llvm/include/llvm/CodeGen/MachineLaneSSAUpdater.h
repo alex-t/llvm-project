@@ -152,6 +152,17 @@ public:
   /// use instruction read OrigVReg in >=2 operands.
   void finalizeCoupledUses(Register OrigVReg);
 
+  /// After all repairSSAForNewDef calls for \p OrigVReg, rebuild its main range
+  /// as the union of its subranges. Repair keeps each subrange accurate for the
+  /// lanes it migrated, but the main range spans lanes that now live in several
+  /// vregs and cannot be maintained incrementally, so it is reconstructed once
+  /// the driver has renamed every def it intends to. Leaving it stale makes the
+  /// value claim registers it no longer occupies: readers that consult the main
+  /// range (LiveInterval::overlaps, point-liveness queries) then disagree with
+  /// readers that consult the subranges. No-op when OrigVReg has no subranges -
+  /// that path recomputes the whole interval during repair.
+  void rebuildMainRangeFromSubranges(Register OrigVReg);
+
   /// Reaching-VNI path: rewrite a single use operand \p MO. Owns exactly the
   /// \p OpMask lanes whose reaching value at the use is this def (\p DefMI /
   /// \p NewSSA covering \p MaskToRewrite). Owned==OpMask -> direct NewSSA
@@ -168,7 +179,8 @@ private:
   SmallVector<MachineOperand *> performSSARepair(Register NewVReg,
                                                  Register OrigVReg,
                                                  LaneBitmask DefMask,
-                                                 MachineBasicBlock *DefBB);
+                                                 MachineBasicBlock *DefBB,
+                                                 SlotIndex MigratedDef);
 
   // --- Internal helpers ---
 
