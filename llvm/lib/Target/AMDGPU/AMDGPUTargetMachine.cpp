@@ -1718,12 +1718,16 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
   addPass(&GCNPreRALongBranchRegID);
 
   if (EnableSSARegAlloc) {
-    // SSARA replaces the SGPR allocator's slot: it allocates BOTH SGPR and VGPR
-    // in one SSA-based pass. Placed HERE (where createSGPRAllocPass would run) so
-    // it inherits the whole downstream tail below — VirtRegRewriter,
-    // StackSlotColoring, SILowerSGPRSpills (lowers our SI_SPILL_S32 pseudos to
-    // VGPR LANES, not memory), WWM alloc, and the VGPR allocator (which allocates
-    // the lane-holder VGPRs SILowerSGPRSpills's virtual-lane path creates).
+    // SSARA allocates BOTH the SGPR and the VGPR file in one SSA-based pass, so
+    // it replaces both greedy allocators — the per-thread VGPR pass below is
+    // skipped. Placed where createSGPRAllocPass would run so it inherits the
+    // downstream tail: VirtRegRewriter, StackSlotColoring, and SILowerSGPRSpills
+    // (which lowers SI_SPILL_S32 pseudos to VGPR LANES, not memory).
+    //
+    // WWM allocation stays greedy. SILowerSGPRSpills mints the lane-holder VGPRs
+    // after SSARA has finished and flags them WWM_REG, so they do not exist when
+    // SSARA colors the function; SSARA only has to leave physical VGPRs free for
+    // them.
     addPass(createAMDGPURebuildSSALegacyPass());
     // Undef-aware PHI simplification: fold diamond-merge "one real operand, rest
     // undef" PHIs so ordinary spillable ranges are seen instead of un-spillable
@@ -1760,8 +1764,9 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
   addPass(createVirtRegRewriter(false));
   addPass(&AMDGPUReserveWWMRegsLegacyID);
 
-  // For allocating per-thread VGPRs.
-  addPass(createVGPRAllocPass(true));
+  // For allocating per-thread VGPRs. Under SSARA these are already physical.
+  if (!EnableSSARegAlloc)
+    addPass(createVGPRAllocPass(true));
 
   addPreRewrite();
   addPass(&VirtRegRewriterID);
