@@ -9,7 +9,7 @@
 // Undef-aware PHI SIMPLIFICATION for the SSA register-allocation stack.
 //
 // NOTE: this is NOT a PHI coalescer. It performs no interference-graph
-// coalescing and no Hack-style permutation fixed point; it is two local,
+// coalescing and no Hack-style permutation fixed point; it is a few local,
 // SSA-preserving peephole rewrites run PRE-RA that remove the artificial
 // register-pressure inflation the structurizer's undef-PHIs create. The real
 // PHI coalescer (Hack sec. 4.3) is a separate, later component.
@@ -34,20 +34,28 @@
 //      program point at which storing it shortens the range that crosses the
 //      edge.
 //
-// The transform is two local, SSA-preserving rewrites:
+// The transform is three local, SSA-preserving rewrites:
 //
 //   (a) Flag every PHI operand that reads a fully-undef value (a vreg whose sole
 //       def is IMPLICIT_DEF) with the `undef` flag. This does not change
 //       semantics -- the read was already undef -- but it lets liveness see the
 //       placeholder as dead, reclaiming its registers.
 //
-//   (b) When, after (a), a PHI has exactly one non-undef operand `%real` and
-//       %real's def dominates the PHI's block, replace the PHI result with
-//       %real and delete the PHI. This is the classic undef-PHI simplification:
-//       on the real edge %res IS %real; on every other edge %res is a
-//       don't-care, so %real (available by dominance) is a legal value there
-//       too. The value is no longer double-counted, and %real -- an ordinary
-//       def/use range -- is spillable where the φ-operand was not.
+//   (b) When, after (a), every non-undef operand of a PHI reads one and the same
+//       value `%real` and %real's def dominates the PHI's block, replace the PHI
+//       result with %real and delete the PHI. This is the classic undef-PHI
+//       simplification: on a real edge %res IS %real; on every other edge %res
+//       is a don't-care, so %real (available by dominance) is a legal value
+//       there too. It also covers the PHI whose edges all carry the identical
+//       value, which is a copy rather than a merge. The value is no longer
+//       double-counted, and %real -- an ordinary def/use range -- is spillable
+//       where the φ-operand was not.
+//
+//   (c) Erase an IMPLICIT_DEF once (a) has made every read of it undef. Nothing
+//       reads a defined value from it, so holding a register for it is waste.
+//       The operands reading it keep referring to a def-less vreg, which is
+//       valid for an undef read, and PHI lowering materialises an IMPLICIT_DEF
+//       on the PHYSICAL register for the undef edge where one is needed.
 //
 // This is the tractable, high-value slice of a full PHI-aware coalescer (Hack):
 // it needs only "one real operand" plus a dominance test, not an interference
@@ -76,18 +84,17 @@ using namespace llvm;
 
 STATISTIC(NumUndefFlagged, "Number of fully-undef PHI operands flagged undef");
 STATISTIC(NumPHIsSimplified, "Number of single-real PHIs folded to their operand");
+STATISTIC(NumImplicitDefsErased,
+          "Number of IMPLICIT_DEFs erased once all their reads were undef");
 
 // Escape hatch for A/B measurement and bisection. On by default.
 static cl::opt<bool> EnablePHISimplifier(
     "amdgpu-phi-simplify", cl::Hidden, cl::init(true),
     cl::desc("Enable undef-aware PHI simplification before the SSA spiller"));
 
-// Sub-flags for differential diagnostics: attribute crash/pressure effects to
-// rewrite (a) [undef-flagging] vs (b) [single-real fold] independently. Both on
-// by default; the master flag above still gates the whole pass.
-static cl::opt<bool> EnableUndefFlagging(
-    "amdgpu-phi-simplify-undef", cl::Hidden, cl::init(true),
-    cl::desc("(a) flag fully-undef PHI operands undef"));
+// Sub-flag for differential diagnostics: attribute crash/pressure effects to
+// the single-real fold independently. On by default; the master flag above
+// still gates the whole pass.
 static cl::opt<bool> EnableSingleRealFold(
     "amdgpu-phi-simplify-fold", cl::Hidden, cl::init(true),
     cl::desc("(b) fold single-real PHIs onto their real operand"));
@@ -156,9 +163,14 @@ bool AMDGPUPHISimplifier::runOnMachineFunction(MachineFunction &MF) {
   // until the PHI is gone Real transiently has two defs. A deferred erase would
   // let a later getVRegDef(Real) assert on the multiple definition.
   SmallVector<MachineInstr *, 32> PHIs;
+  SmallVector<MachineInstr *, 32> ImplicitDefs;
   for (MachineBasicBlock &MBB : MF)
-    for (MachineInstr &PHI : MBB.phis())
-      PHIs.push_back(&PHI);
+    for (MachineInstr &MI : MBB) {
+      if (MI.isPHI())
+        PHIs.push_back(&MI);
+      else if (MI.isImplicitDef())
+        ImplicitDefs.push_back(&MI);
+    }
 
   for (MachineInstr *PHIPtr : PHIs) {
     MachineInstr &PHI = *PHIPtr;
@@ -172,18 +184,19 @@ bool AMDGPUPHISimplifier::runOnMachineFunction(MachineFunction &MF) {
       if (Src.isUndef())
         continue;
       if (isFullyUndef(Src.getReg())) {
-        // Detection is pure analysis (always runs so (b)'s candidate set is
-        // stable); only the undef-flag mutation is gated for A/B diagnostics.
-        if (EnableUndefFlagging) {
-          Src.setIsUndef(true);
-          ++NumUndefFlagged;
-          Changed = true;
-        }
+        Src.setIsUndef(true);
+        ++NumUndefFlagged;
+        Changed = true;
         continue;
       }
-      if (SoleReal)
-        MultipleReal = true;
-      else
+      if (SoleReal) {
+        // The same (register, sub-register) read on several edges is ONE real
+        // value: every edge carries the identical value, so the PHI is a copy of
+        // it. Only a genuinely different source makes the PHI a real merge.
+        if (SoleReal->getReg() != Src.getReg() ||
+            SoleReal->getSubReg() != Src.getSubReg())
+          MultipleReal = true;
+      } else
         SoleReal = &Src;
     }
 
@@ -230,6 +243,23 @@ bool AMDGPUPHISimplifier::runOnMachineFunction(MachineFunction &MF) {
     MRI->replaceRegWith(Res, Real);
     PHI.eraseFromParent();
     ++NumPHIsSimplified;
+    Changed = true;
+  }
+
+  // (c) An IMPLICIT_DEF all of whose reads are undef has no reader liveness can
+  // see, yet it is still assigned a physical register. Erase it; the operands
+  // reading it keep referring to a now def-less vreg, which is valid for an
+  // undef read, and PHI lowering materialises an IMPLICIT_DEF on the physical
+  // register for the undef edge where the value must appear defined.
+  for (MachineInstr *ID : ImplicitDefs) {
+    Register Def = ID->getOperand(0).getReg();
+    if (!Def.isVirtual())
+      continue;
+    if (!all_of(MRI->use_nodbg_operands(Def),
+                [](const MachineOperand &MO) { return MO.isUndef(); }))
+      continue;
+    ID->eraseFromParent();
+    ++NumImplicitDefsErased;
     Changed = true;
   }
 
