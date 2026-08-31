@@ -5286,6 +5286,25 @@ void AMDGPUSSARegisterAllocator::finalizeAfterRewrite(MachineFunction &MF) {
 
 // === Main entry point ===
 
+// Callee-saved SGPRs are spilled by SILowerSGPRSpills into PHYSICAL VGPR lanes,
+// a lane space separate from the virtual lane holders, and those holders are
+// taken from the free registers (findUnusedRegister, highest first) BEFORE the
+// WWM reservation is computed. The allocation has to leave room for them too,
+// or that reservation comes up short. Counted exactly as spillCalleeSavedRegs
+// does: one lane per saved register of the target's callee-saved list. Entry
+// functions have an empty list and so cost nothing.
+static unsigned countCalleeSavedSGPRLanes(MachineFunction &MF) {
+  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  BitVector SavedRegs;
+  ST.getFrameLowering()->determineCalleeSavesSGPR(MF, SavedRegs);
+  unsigned Lanes = 0;
+  for (const MCPhysReg *CSRegs = MRI.getCalleeSavedRegs(); *CSRegs; ++CSRegs)
+    if (SavedRegs.test(*CSRegs))
+      ++Lanes;
+  return Lanes;
+}
+
 bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   TRI =
       static_cast<const SIRegisterInfo *>(MF.getSubtarget().getRegisterInfo());
@@ -5362,10 +5381,12 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   Emitter->clearSGPRSpillLanes();
   for (RegFile Stage : {RegFile::SGPR, RegFile::VGPR}) {
     StageFile = Stage;
-    VGPRReserve = (Stage == RegFile::VGPR)
-                      ? divideCeil(Emitter->numSGPRSpillLanes(),
-                                   ST->isWave32() ? 32u : 64u)
-                      : 0;
+    const unsigned WaveSize = ST->isWave32() ? 32u : 64u;
+    VGPRReserve =
+        (Stage == RegFile::VGPR)
+            ? divideCeil(Emitter->numSGPRSpillLanes(), WaveSize) +
+                  divideCeil(countCalleeSavedSGPRLanes(MF), WaveSize)
+            : 0;
   OccupiedRegUnits.clear();
   OccupiedRegUnits.resize(TRI->getNumRegUnits());
   ColorMap.clear();
