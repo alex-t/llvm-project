@@ -56,6 +56,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   std::set<unsigned, std::greater<unsigned>> ColoringOrder;
   DenseMap<Register, MCRegister> ColorMap;
   BitVector OccupiedRegUnits;
+  mutable DenseMap<const TargetRegisterClass *, unsigned> StrideCache;
 
   unsigned MaxVGPRIdx = 0;
   unsigned MaxSGPRIdx = 0;
@@ -290,6 +291,20 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// budget never diverge.
   ArrayRef<MCPhysReg> availableOrder(const TargetRegisterClass *RC) const;
 
+  /// Spacing of legal first registers for \p RC, read off availableOrder: 1 where
+  /// any register may start the value, 2 for 64-bit SGPRs and Align2 VGPR tuples,
+  /// 4 for wider SGPRs. Cached per class.
+  unsigned allocStride(const TargetRegisterClass *RC) const;
+
+  /// Registers of \p File the values in \p Live will actually OCCUPY — the full
+  /// class width of each, rounded up for the classes that must start aligned, not
+  /// the live lanes. This is what the colorer spends, so it is the number the
+  /// pre-spill gate must compare against the pool. \p Live is spelled out rather
+  /// than named GCNRPTracker::LiveRegSet so this header need not pull in
+  /// GCNRegPressure.h, which only the .cpp uses.
+  unsigned wholeBlockDemand(const DenseMap<unsigned, LaneBitmask> &Live,
+                            RegFile File) const;
+
   /// [Stage 1] Per-file pressure at a tracker point. VGPR uses the UNIFIED count
   /// on gfx90a+ (arch+agpr+avgpr share one budget) and arch-VGPR alone otherwise;
   /// AGPR is the separate AGPR count (only meaningful on non-unified targets).
@@ -354,11 +369,24 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// occupancy LiveRegMatrix would charge. Mutates no allocator state.
   void reportLaneWaste(MachineFunction &MF) const;
 
-  /// Spill victims from ONE tight region until its total-dword excess (Peak-Limit)
-  /// is gone. Candidates are frozen-\p Universe values of \p R's file, live at
-  /// R.PeakSlot, not already in \p Spilled, and admitted by \p Eligible; chosen
-  /// over-subscribed-then-widest-first, each decrementing the excess by its real
-  /// width. Spilled victims are added to \p Spilled. Returns true if it spilled.
+  /// TEMPORARY diagnostic (-amdgpu-ssa-block-demand-dump): per slot, how many
+  /// live values carry each (class width, allocation stride) pair, beside the
+  /// lane-accurate pressure and the whole-block dword sum. Measurement input for
+  /// the width-aware region gate; delete together with it. Mutates no state.
+  void reportBlockDemand(MachineFunction &MF) const;
+
+  /// Spill victims from ONE tight region until its MEASURED peak fits the pool.
+  /// Candidates are frozen-\p Universe values of \p R's file, live at R.PeakSlot,
+  /// not already in \p Spilled, and admitted by \p Eligible; chosen
+  /// over-subscribed-then-widest-first, then routed through planSpill, which
+  /// rejects a victim whose reload would land back inside \p R and turns a
+  /// PHI-web victim into a web spill. Spilled victims are added to \p Spilled.
+  /// Returns true if it spilled.
+  ///
+  /// TEMPORARY: this borrows reduceRegionPressure's planner and measured-relief
+  /// rule but remains a SECOND victim-selection loop over the same regions. The
+  /// intended end state is one shared per-region loop parameterized by candidate
+  /// admission; see the note at the top of the definition.
   /// Shared by the width-aware pre-spiller (Eligible = always) and AGPR-relief
   /// (Eligible = avReloadLegal, so reloads re-home to a free AGPR).
   /// If \p NumRecolored is non-null, it is incremented by the number of victims
