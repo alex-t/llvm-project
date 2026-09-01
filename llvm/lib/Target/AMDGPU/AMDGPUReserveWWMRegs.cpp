@@ -107,5 +107,15 @@ bool AMDGPUReserveWWMRegs::run(MachineFunction &MF) {
   // Now clear the NonWWMRegMask earlier set during wwm-regalloc.
   MFI->clearNonWWMRegAllocMask();
 
+  // The mask above feeds SIRegisterInfo::getReservedRegs, so the frozen reserved
+  // set is stale the moment it is cleared: it still reserves the whole per-thread
+  // VGPR range that whole-wave allocation was restricted away from. Refresh it
+  // here rather than leaving that to the next register allocator, because a
+  // pipeline need not run one after this pass. Without the refresh,
+  // shiftWwmVGPRsToLowestRange finds nothing allocatable and leaves the SGPR
+  // spill lane holders parked at the top of the register file, which inflates
+  // the reported VGPR count and starves the register scavenger.
+  MF.getRegInfo().freezeReservedRegs();
+
   return Changed;
 }
