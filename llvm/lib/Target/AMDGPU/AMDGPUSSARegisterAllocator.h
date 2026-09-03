@@ -359,10 +359,14 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// GCNUpwardRPTracker + pressureOf machinery findTightRegions used, so it is
   /// directly comparable to R.Peak. With \p Occupants, the same walk also reports
   /// every virtual register live inside R — which IS the overlap test, hole-accurate
-  /// by construction. Returns 0 if R's first instruction no longer exists.
+  /// by construction. With \p Slots it also reports the demand at each in-region
+  /// slot, which is what predictSpill needs: the peak alone cannot say whether a
+  /// victim covers the slots that are actually over the limit.
+  /// Returns 0 if R's first instruction no longer exists.
   unsigned measureRegionPeak(
       const TightRegion &R,
-      DenseMap<Register, RegionOccupancy> *Occupants = nullptr) const;
+      DenseMap<Register, RegionOccupancy> *Occupants = nullptr,
+      SmallVectorImpl<std::pair<SlotIndex, unsigned>> *Slots = nullptr) const;
 
   /// Diagnostic (-amdgpu-ssa-lane-waste-dump): per function and file, report the
   /// peak whole-tuple occupancy this allocator charges against the subrange
@@ -537,38 +541,53 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void emitRecoveryWindow(Register Failed, const RecoveryWindow &RW) const;
 
   /// [Stage 2] Cost of spilling candidate \p B to relieve region \p R.
-  ///   Feasible : no use is strictly inside R (case 2) nor in R's loop (case 3),
-  ///              and every reload's post-spill RP <= R.Limit (Test 2). Else B
-  ///              cannot relieve R — drop it.
   ///   Cost     : NReloads * Width. NReloads = 1 when B's uses are commonly
   ///              dominated and the shared reload hoists to their NCD; else one
-  ///              reload per use.
+  ///              reload per use, plus one per predecessor supplying a PHI use.
   ///   Width    : dwords the spill of \p Lanes MOVES (spilledSlots) — traffic, not
   ///              relief. Relief is coveredSlots(Lanes) and the caller divides by
   ///              it, so the two cancel except where an unnamed lane span forces a
   ///              whole-register store.
+  /// Every candidate is priceable: a reload only ever restores a register the
+  /// reload point already needed, so placement cannot make a candidate unusable.
+  /// Admission is predictSpill's measured relief, not a placement predicate.
   struct SpillCost {
-    bool Feasible;
     unsigned Cost;
     unsigned Width;
-    explicit operator bool() const { return Feasible; }
-    static SpillCost Infeasible() { return {false, 0, 0}; }
   };
   SpillCost costOfSpilling(Register B, const TightRegion &R, LaneBitmask Lanes);
 
-  /// How to spill \p V (its \p Lanes, worth \p W slots of relief) out of \p R, and
-  /// how expensive that is. ALL victim-kind routing (PHI web vs plain value) and
-  /// both feasibility gates live here, so the selection loop only compares ratios.
-  /// Infeasible means "reject this candidate". Ratios are comparable across kinds;
-  /// lower is better.
+  /// How to spill \p V (the \p Lanes that \p R holds of it) out of \p R, and how
+  /// expensive that is. ALL victim-kind routing (PHI web vs plain value) and every
+  /// gate live here, so the selection loop only compares ratios. \p Slots is R's
+  /// per-slot demand profile, from which the relief is predicted: a plain victim
+  /// that frees nothing over R is reported Infeasible, so no driver can emit a
+  /// store that buys nothing. Infeasible means "reject this candidate". Ratios are
+  /// comparable across kinds; lower is better.
   struct SpillPlan {
     enum KindTy { Infeasible, Plain, WebSpill };
     KindTy Kind = Infeasible;
     PhiWeb Web; // meaningful only when Kind == WebSpill
     double Ratio = 0.0;
+    unsigned Relief = 0;  // over-limit demand this removes from R
+    unsigned NewPeak = 0; // peak R is left with; only to check the model in -debug
   };
   SpillPlan planSpill(Register V, const TightRegion &R, bool IsVGPRFile,
-                      LaneBitmask Lanes, unsigned W);
+                      LaneBitmask Lanes,
+                      ArrayRef<std::pair<SlotIndex, unsigned>> Slots);
+
+  /// What spilling \p Lanes of \p B out of \p R would do to \p R, computed from
+  /// its per-slot demand profile BEFORE any code is emitted. NewPeak is the peak
+  /// R would be left with; ExcessDrop is the over-limit demand the spill removes,
+  /// summed over R's slots. A zero ExcessDrop means the spill buys nothing, so it
+  /// must not be emitted — the driver used to find that out only by measuring
+  /// after the store was already in the function.
+  struct SpillEffect {
+    unsigned NewPeak = 0;
+    unsigned ExcessDrop = 0;
+  };
+  SpillEffect predictSpill(Register B, LaneBitmask Lanes, const TightRegion &R,
+                           ArrayRef<std::pair<SlotIndex, unsigned>> Slots) const;
 
   /// [Stage 3] Region RP-reduction driver. While tight regions remain, service
   /// the worst (highest Peak) by spilling the cheapest feasible crosser ACROSS

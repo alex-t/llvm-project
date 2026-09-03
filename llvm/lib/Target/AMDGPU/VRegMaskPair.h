@@ -78,7 +78,13 @@ public:
     LaneBitmask Mask = MRI->getMaxLaneMaskForVReg(VReg);
     if (LaneMask != Mask) {
       unsigned SubRegIdx = TRI->getSubRegIndexForLaneMask(LaneMask);
-      return TRI->getSubRegisterClass(RC, SubRegIdx);
+      // A contiguous lane span need not name a subregister — channels 6..15 of a
+      // wide tuple name none. The spill then stores the WHOLE register, which is
+      // what spillAtDefinition emits and what spilledSlots already charges, so
+      // the slot must be sized for the full class rather than a null subclass.
+      if (const TargetRegisterClass *SubRC =
+              SubRegIdx ? TRI->getSubRegisterClass(RC, SubRegIdx) : nullptr)
+        return SubRC;
     }
     return RC;
   }

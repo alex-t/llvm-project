@@ -27,6 +27,7 @@
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/Register.h"
 #include <algorithm>
+#include "SSARATrace.h"
 
 using namespace llvm;
 
@@ -38,6 +39,7 @@ STATISTIC(NumReloads, "Number of register reloads");
 bool llvm::usesSpilledVMP(const MachineInstr *MI, VRegMaskPair SpilledVMP,
                           const SIRegisterInfo *TRI,
                           const MachineRegisterInfo *MRI) {
+  SSARA_TRACE();
   Register SpilledReg = SpilledVMP.getVReg();
   LaneBitmask SpilledMask = SpilledVMP.getLaneMask();
 
@@ -64,6 +66,7 @@ SSASpillEmitter::SSASpillEmitter(MachineFunction &MF, LiveIntervals *LIS,
                                  SlotIndexes *Indexes, MachineDominatorTree *DT,
                                  const MachineLoopInfo *MLI)
     : MF(MF), MLI(MLI), LIS(LIS), Indexes(Indexes), DT(DT) {
+  SSARA_TRACE();
   TRI = static_cast<const SIRegisterInfo *>(MF.getSubtarget().getRegisterInfo());
   TII = static_cast<const SIInstrInfo *>(MF.getSubtarget().getInstrInfo());
   MRI = &MF.getRegInfo();
@@ -71,12 +74,14 @@ SSASpillEmitter::SSASpillEmitter(MachineFunction &MF, LiveIntervals *LIS,
 }
 
 void SSASpillEmitter::beginPass(bool IsVGPR) {
+  SSARA_TRACE();
   IsVGPRPass = IsVGPR;
   // Fresh SSA updater per pass (caches IDF computations per run).
   SSAUpdater = std::make_unique<MachineLaneSSAUpdater>(MF, *LIS, *DT, *TRI);
 }
 
 int SSASpillEmitter::assignVirt2StackSlot(VRegMaskPair VMP) {
+  SSARA_TRACE();
   assert(VMP.getVReg().isVirtual() && "Expected virtual register");
 
   // Check if we already have a stack slot for this VRegMaskPair
@@ -97,6 +102,7 @@ int SSASpillEmitter::assignVirt2StackSlot(VRegMaskPair VMP) {
 }
 
 int SSASpillEmitter::createSpillSlot(const TargetRegisterClass *RC) {
+  SSARA_TRACE();
   unsigned SpillSize = TRI->getSpillSize(*RC);
   Align SpillAlign = TRI->getSpillAlign(*RC);
   return FrameInfo->CreateSpillStackObject(SpillSize, SpillAlign);
@@ -104,6 +110,7 @@ int SSASpillEmitter::createSpillSlot(const TargetRegisterClass *RC) {
 
 void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
                                   unsigned RPLimit) {
+  SSARA_TRACE();
   // Reload-hoist decisions in the reload path use this file's RP budget, chosen
   // by policy and threaded in per spill.
   CurRPLimit = RPLimit;
@@ -147,6 +154,7 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
 void SSASpillEmitter::spillPhiWeb(
     const PhiWeb &Web, unsigned RPLimit,
     llvm::function_ref<void(Register)> ColorFreshVReg) {
+  SSARA_TRACE();
   CurRPLimit = RPLimit;
   LastWebErased.clear();
   LastWebGround.clear();
@@ -287,6 +295,7 @@ void SSASpillEmitter::spillPhiWeb(
 
 bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
                                             LaneBitmask RemnantMask) {
+  SSARA_TRACE();
   MachineInstr *DefMI = MRI->getVRegDef(WideVReg);
   if (!DefMI)
     return false;
@@ -377,6 +386,7 @@ bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
 
 Register SSASpillEmitter::splitLiveRangeAt(Register V,
                                            MachineBasicBlock::iterator SplitPt) {
+  SSARA_TRACE();
   if (!LIS->hasInterval(V))
     return Register();
   MachineBasicBlock &MBB = *SplitPt->getParent();
@@ -437,6 +447,7 @@ Register SSASpillEmitter::splitLiveRangeAt(Register V,
 }
 
 MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
+  SSARA_TRACE();
   if (MachineInstr *Existing = StoredAtDefinition.lookup(VMP)) {
     LLVM_DEBUG({
       StringRef Name = MRI->getVRegName(VMP.getVReg());
@@ -511,11 +522,19 @@ MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
   unsigned SubRegIdx = VMP.getSubReg(MRI, TRI);
 
   // Get the appropriate register class
+  const TargetRegisterClass *FullRC = TRI->getRegClassForReg(*MRI, VReg);
   const TargetRegisterClass *RC =
-      (SubRegIdx == AMDGPU::NoRegister)
-          ? TRI->getRegClassForReg(*MRI, VReg)
-          : TRI->getSubRegisterClass(TRI->getRegClassForReg(*MRI, VReg),
-                                     SubRegIdx);
+      SubRegIdx == AMDGPU::NoRegister
+          ? nullptr
+          : TRI->getSubRegisterClass(FullRC, SubRegIdx);
+  if (!RC) {
+    // A named lane span need not have a register class — sub6..sub15 of a
+    // 512-bit tuple is 10 channels wide and the legal widths stop at 8 before
+    // jumping to 16. Store the whole register, which is what VRegMaskPair's
+    // getRegClass sized the stack slot for.
+    RC = FullRC;
+    SubRegIdx = AMDGPU::NoRegister;
+  }
 
   LLVM_DEBUG({
     if (SubRegIdx != AMDGPU::NoRegister) {
@@ -557,6 +576,7 @@ MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
 // ===========================================================================
 
 void SSASpillEmitter::buildDomGroupsForSpill(SpillInfo &Info) {
+  SSARA_TRACE();
   Register SpilledReg = Info.SpilledVMP.getVReg();
   MachineInstr *KillMI = Indexes->getInstructionFromIndex(Info.KillIdx);
 
@@ -639,6 +659,7 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
                                           VRegMaskPair SpilledVMP,
                                           MachineInstr *InsertBefore,
                                           LaneBitmask ReloadMask) {
+  SSARA_TRACE();
   Register OrigVReg = SpilledVMP.getVReg();
 
   // Narrow the reload to the lanes actually requested. The stack slot stays the
@@ -813,6 +834,7 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
 bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
                                          VRegMaskPair SpilledVMP,
                                          MachineBasicBlock *KillBB) {
+  SSARA_TRACE();
   Register SpilledReg = SpilledVMP.getVReg();
   LaneBitmask SpilledMask = SpilledVMP.getLaneMask();
   unsigned RPLimit = CurRPLimit;
@@ -875,6 +897,7 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
 }
 
 void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
+  SSARA_TRACE();
   VRegMaskPair SpilledVMP = Info.SpilledVMP;
   Register SpilledReg = SpilledVMP.getVReg();
 
@@ -1081,6 +1104,7 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
 // Optimization: if we find RP > Limit at any point, return early and cache
 // that value - no need to compute the actual maximum.
 unsigned SSASpillEmitter::getMaxRPForBlock(MachineBasicBlock *MBB) {
+  SSARA_TRACE();
   auto It = MaxRPCache.find(MBB);
   if (It != MaxRPCache.end())
     return It->second;
@@ -1116,6 +1140,7 @@ unsigned SSASpillEmitter::getMaxRPForBlock(MachineBasicBlock *MBB) {
 
 unsigned SSASpillEmitter::maxRPBetween(MachineInstr *DefMI,
                                        MachineInstr *UseMI) {
+  SSARA_TRACE();
   // Max RP (current pass's file) at the program points strictly between DefMI
   // and UseMI in the same block, inclusive of the span the reaching value would
   // occupy. Used to decide whether a same-block reaching reload SPANS an
@@ -1145,6 +1170,7 @@ unsigned SSASpillEmitter::maxRPBetween(MachineInstr *DefMI,
 
 unsigned SSASpillEmitter::getMaxRPInBlockDownTo(MachineBasicBlock *MBB,
                                                 MachineInstr *StopMI) {
+  SSARA_TRACE();
   if (!StopMI || StopMI->getParent() != MBB)
     return getMaxRPForBlock(MBB);
 
@@ -1175,6 +1201,7 @@ bool SSASpillEmitter::canHoistReloadTo(MachineBasicBlock *NCD,
                                        MachineInstr *InsertPoint,
                                        unsigned RPLimit, Register SpilledReg,
                                        const MachineLoop *SpanLoop) {
+  SSARA_TRACE();
   // Spilled register is already counted as live, so MaxRP > RPLimit means
   // no room for reload (no +1 needed).
 
@@ -1211,6 +1238,7 @@ bool SSASpillEmitter::canHoistReloadTo(MachineBasicBlock *NCD,
 
 MachineBasicBlock *
 SSASpillEmitter::getEffectiveKillBB(MachineBasicBlock *SpillBB) const {
+  SSARA_TRACE();
   // Find outermost loop containing spill point
   MachineLoop *Loop = MLI->getLoopFor(SpillBB);
   if (!Loop)
@@ -1240,6 +1268,7 @@ SSASpillEmitter::adjustReloadForLoop(MachineBasicBlock *ReloadBB,
                                      MachineInstr *InsertBeforeMI,
                                      MachineBasicBlock *KillBB,
                                      Register SpilledReg) {
+  SSARA_TRACE();
   MachineLoop *ReloadLoop = MLI->getLoopFor(ReloadBB);
   if (ReloadLoop && !ReloadLoop->contains(KillBB)) {
     // Do NOT hoist the reload to the preheader if the loop body contains a call
@@ -1310,6 +1339,7 @@ bool SSASpillEmitter::walkPathsToUses(
     MachineBasicBlock *StartBB, Register SpilledReg,
     llvm::function_ref<bool(MachineBasicBlock *, MachineInstr *)> IsBad,
     bool StopOnBad) const {
+  SSARA_TRACE();
 
   const LiveInterval &LI = LIS->getInterval(SpilledReg);
 
