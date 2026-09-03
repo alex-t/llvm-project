@@ -5103,6 +5103,20 @@ void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF,
           continue;
         MCRegister PhysReg = ColorMap.lookup(VReg);
         if (!PhysReg) {
+          // A debug instruction does not compute a program value, and every
+          // coloring path deliberately ignores a vreg with no non-debug use
+          // (MRI->reg_nodbg_empty), so such a vreg never receives a color. The
+          // location is simply unavailable: drop it, the same treatment
+          // RegAllocFast gives a register that did not survive.
+          if (MI.isDebugInstr()) {
+            if (MI.isDebugValue()) {
+              MI.setDebugValueUndef();
+            } else {
+              MO.setReg(Register());
+              MO.setSubReg(0);
+            }
+            continue;
+          }
           // A vreg that only ever appears as an `undef` operand has no value to
           // color (no def drives it). Its content is a don't-care; assign any
           // allocatable physreg of its class so the operand is well-formed. The
