@@ -4583,7 +4583,12 @@ MCRegister AMDGPUSSARegisterAllocator::findLocalScratch(
       TRI->isSGPRClass(RC)   ? &AMDGPU::SGPR_32RegClass
       : TRI->isAGPRClass(RC) ? &AMDGPU::AGPR_32RegClass
                              : &AMDGPU::VGPR_32RegClass;
-  for (MCRegister PR : RegClassInfo.getOrder(BaseRC)) {
+  // Must use availableOrder, not the raw allocation order: the tail of the
+  // vector order is withheld for the lane holders and WWM scratch that the
+  // downstream spill lowering and frame lowering take off the top of the file.
+  // Those registers are not yet in MRI's reserved set here, so the isReserved
+  // check below does not cover them.
+  for (MCRegister PR : availableOrder(BaseRC)) {
     if (MRI->isReserved(PR))
       continue;
     // Skip the cycle's own registers (live here) and any that alias them.
@@ -4726,7 +4731,7 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
   // destination can never equal an SGPR source — so the file (and thus the
   // scratch counter, HW limit, occupancy model and swap lowering) is derived
   // per cycle from its own registers, never from a block-wide assumption.
-  const MachineFunction &MF = *MBB.getParent();
+  MachineFunction &MF = *MBB.getParent();
 
   // A cycle's scratch register is TRANSIENT: it is saved at the cycle start and
   // restored (its value moved out, leaving it dead) at the cycle end, so the
@@ -4750,6 +4755,19 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
     // AGPRs draw from the vector register budget alongside VGPRs.
     unsigned MaxHWLimit =
         (IsVGPR || IsAGPR) ? ST->getMaxNumVGPRs(MF) : ST->getMaxNumSGPRs(MF);
+    // The scratch below is VGPR0 + MaxIdx, one past the colored high-water, so
+    // for the VGPR file the bound has to be the allocator's own availability
+    // rather than the hardware limit. The tail of the VGPR order is withheld
+    // (VGPRReserve) for the lane holder and the WWM scratch that the downstream
+    // spill lowering and frame lowering take off the top of the file. Once the
+    // colorer fills its pool the high-water lands exactly on the first withheld
+    // register, so bounding by the hardware limit hands a cycle a register the
+    // WWM pass is counting on and that pass then finds nothing free. Refusing
+    // the scratch is safe: the cycle breaks in place via emitSwap's V_XOR
+    // triplet, which needs no scratch. AGPRs keep the hardware bound — they are
+    // a separate file, and the lane holders are always VGPRs.
+    if (IsVGPR)
+      MaxHWLimit = std::min(MaxHWLimit, allocatablePool(MF, RegFile::VGPR));
     unsigned CurrentOcc =
         IsVGPR ? ST->getOccupancyWithNumVGPRs(MaxIdx, DynVGPRBlockSize)
                : ST->getOccupancyWithNumSGPRs(MaxIdx);
