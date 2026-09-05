@@ -100,10 +100,6 @@ void initializeAMDGPUAlwaysInlinePass(PassRegistry&);
 
 void initializeAMDGPUAsmPrinterPass(PassRegistry &);
 
-MachineFunctionPass *createAMDGPUSSARegisterSpillerPass();
-void initializeAMDGPUSSARegisterSpillerPass(PassRegistry &);
-extern char &AMDGPUSSARegisterSpillerID;
-
 FunctionPass *createAMDGPURebuildSSALegacyPass();
 void initializeAMDGPURebuildSSALegacyPass(PassRegistry &);
 extern char &AMDGPURebuildSSALegacyID;

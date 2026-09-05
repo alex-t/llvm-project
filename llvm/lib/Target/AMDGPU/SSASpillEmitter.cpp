@@ -8,10 +8,8 @@
 ///
 /// \file
 /// \brief Exec-safe SSA spill/reload emission mechanism (see SSASpillEmitter.h).
-/// The bodies here were factored verbatim out of AMDGPUSSARegisterSpiller; the
-/// only rewrites are (1) VGPRLimit/SGPRLimit reads become the per-spill
-/// CurRPLimit threaded through spillOneVMP, and (2) usesSpilledVMP is a shared
-/// free function taking TRI/MRI rather than a member.
+/// Reload-placement decisions query the pool demand oracle bound by beginPass,
+/// so emission and spill planning share one pressure model.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -73,9 +71,11 @@ SSASpillEmitter::SSASpillEmitter(MachineFunction &MF, LiveIntervals *LIS,
   FrameInfo = &MF.getFrameInfo();
 }
 
-void SSASpillEmitter::beginPass(bool IsVGPR) {
+void SSASpillEmitter::beginPass(bool IsVGPR, DemandFn Demand) {
   SSARA_TRACE();
   IsVGPRPass = IsVGPR;
+  PoolDeficiency = std::move(Demand);
+  assert(PoolDeficiency && "spill emission needs the pool demand oracle");
   // Fresh SSA updater per pass (caches IDF computations per run).
   SSAUpdater = std::make_unique<MachineLaneSSAUpdater>(MF, *LIS, *DT, *TRI);
 }
@@ -108,12 +108,8 @@ int SSASpillEmitter::createSpillSlot(const TargetRegisterClass *RC) {
   return FrameInfo->CreateSpillStackObject(SpillSize, SpillAlign);
 }
 
-void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
-                                  unsigned RPLimit) {
+void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx) {
   SSARA_TRACE();
-  // Reload-hoist decisions in the reload path use this file's RP budget, chosen
-  // by policy and threaded in per spill.
-  CurRPLimit = RPLimit;
 
   LLVM_DEBUG({
     Register VReg = VMP.getVReg();
@@ -152,10 +148,8 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
 }
 
 void SSASpillEmitter::spillPhiWeb(
-    const PhiWeb &Web, unsigned RPLimit,
-    llvm::function_ref<void(Register)> ColorFreshVReg) {
+    const PhiWeb &Web, llvm::function_ref<void(Register)> ColorFreshVReg) {
   SSARA_TRACE();
-  CurRPLimit = RPLimit;
   LastWebErased.clear();
   LastWebGround.clear();
   // Detection, the shared-slot soundness gate, AND the reload-feasibility gate all
@@ -837,7 +831,6 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
   SSARA_TRACE();
   Register SpilledReg = SpilledVMP.getVReg();
   LaneBitmask SpilledMask = SpilledVMP.getLaneMask();
-  unsigned RPLimit = CurRPLimit;
 
   if (UseMI->isPHI()) {
     // PHI use: reload must be in predecessor block(s) that provide the spilled
@@ -856,13 +849,12 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
 
       MachineBasicBlock *PredBB = BBOp.getMBB();
 
-      // Check RP in predecessor
-      unsigned PredRP = getMaxRPForBlock(PredBB);
-      if (PredRP > RPLimit) {
+      // Check the predecessor has room for the reload
+      if (unsigned PredShort = maxDeficiencyForBlock(PredBB)) {
         LLVM_DEBUG(dbgs() << "    WARNING: Predecessor "
-                          << printMBBReference(*PredBB) << " has RP=" << PredRP
-                          << " > limit=" << RPLimit
-                          << ", but must insert reload for PHI use\n");
+                          << printMBBReference(*PredBB) << " is short "
+                          << PredShort
+                          << " value(s), but must insert reload for PHI use\n");
       }
 
       // Place the reload redef; SSA is repaired inline after all reloads.
@@ -887,8 +879,7 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
   UseMask &= SpilledMask;
 
   // Non-PHI use: insert before use with loop adjustment
-  auto Adjusted =
-      adjustReloadForLoop(UseMI->getParent(), UseMI, KillBB, SpilledReg);
+  auto Adjusted = reloadPlacementForUse(UseMI, KillBB, SpilledReg);
   MachineInstr *InsertBeforeUse =
       (Adjusted.first == UseMI->getParent()) ? UseMI : nullptr;
   // Place the reload redef; SSA is repaired inline after all reloads.
@@ -896,12 +887,92 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
   return true;
 }
 
+std::pair<MachineBasicBlock *, MachineInstr *>
+SSASpillEmitter::reloadPlacementForUse(MachineInstr *UseMI,
+                                       MachineBasicBlock *KillBB,
+                                       Register SpilledReg) {
+  return adjustReloadForLoop(UseMI->getParent(), UseMI, KillBB, SpilledReg);
+}
+
+SSASpillEmitter::SpillFootprint
+SSASpillEmitter::modelSpillFootprint(VRegMaskPair VMP, SlotIndex KillIdx,
+                                     ArrayRef<MachineInstr *> Sites) {
+  SSARA_TRACE();
+  SpillFootprint Result;
+  Register V = VMP.getVReg();
+  MachineInstr *KillMI = Indexes->getInstructionFromIndex(KillIdx);
+  if (!KillMI)
+    return Result;
+  MachineBasicBlock *KillBB = KillMI->getParent();
+
+  auto IsSite = [&](const MachineInstr *MI) {
+    return llvm::is_contained(Sites, MI);
+  };
+  if (MachineInstr *DefMI = MRI->getVRegDef(V); DefMI && IsSite(DefMI))
+    Result.ResidentSites.insert(DefMI);
+
+  SmallVector<std::pair<MachineInstr *, MachineInstr *>, 8> PossibleReloads;
+  for (MachineInstr &UseMI : MRI->use_nodbg_instructions(V)) {
+    if (isSpillInstr(&UseMI) || !usesSpilledVMP(&UseMI, VMP, TRI, MRI))
+      continue;
+    if (UseMI.isPHI()) {
+      for (unsigned I = 1, E = UseMI.getNumOperands(); I + 1 < E; I += 2) {
+        MachineOperand &Val = UseMI.getOperand(I);
+        if (!Val.isReg() || Val.getReg() != V ||
+            (VRegMaskPair(Val, TRI, MRI).getLaneMask() & VMP.getLaneMask())
+                .none())
+          continue;
+        MachineBasicBlock *Pred = UseMI.getOperand(I + 1).getMBB();
+        auto FirstTerm = Pred->getFirstTerminator();
+        if (FirstTerm == Pred->end())
+          continue;
+        for (MachineInstr *Site : Sites)
+          if (Site->getParent() == Pred &&
+              (&*FirstTerm == Site || DT->dominates(&*FirstTerm, Site)))
+            Result.ResidentSites.insert(Site);
+      }
+      continue;
+    }
+
+    // Exact reload sharing is decided by the cut-interval query after each
+    // earlier reload redef has changed the reaching value. Collect every
+    // possible reload placement and use, then conservatively retain their
+    // dominance spans below.
+    Result.Exact = false;
+    auto Placement = reloadPlacementForUse(&UseMI, KillBB, V);
+    MachineInstr *Start = Placement.second;
+    if (!Start) {
+      auto FirstTerm = Placement.first->getFirstTerminator();
+      if (FirstTerm != Placement.first->end())
+        Start = &*FirstTerm;
+    }
+    if (!Start)
+      continue;
+    PossibleReloads.push_back({Start, &UseMI});
+  }
+
+  for (const auto &Reload : PossibleReloads) {
+    MachineInstr *Start = Reload.first;
+    MachineInstr *Use = Reload.second;
+    bool MayBeShared = Start != Use;
+    if (!MayBeShared)
+      MayBeShared = llvm::any_of(PossibleReloads, [&](const auto &Other) {
+        return Other.second != Use && DT->dominates(Use, Other.second);
+      });
+    for (MachineInstr *Site : Sites)
+      if ((!MayBeShared && Site == Use) ||
+          (MayBeShared && DT->dominates(Start, Site)))
+        Result.ResidentSites.insert(Site);
+  }
+  return Result;
+}
+
 void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
   SSARA_TRACE();
   VRegMaskPair SpilledVMP = Info.SpilledVMP;
   Register SpilledReg = SpilledVMP.getVReg();
 
-  MaxRPCache.clear();
+  DeficiencyCache.clear();
   BlockReloadCache.clear();
 
   MachineInstr *KillMI = Indexes->getInstructionFromIndex(Info.KillIdx);
@@ -999,7 +1070,7 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
           // across a high-pressure INLINEASM etc. that never lowers RP there and
           // makes coloring fail). Force a fresh reload right before U instead, so
           // the reaching value's range ends before the tight point.
-          if (CurRPLimit && maxRPBetween(DMI, U) > CurRPLimit)
+          if (maxDeficiencyBetween(DMI, U))
             return true;
           return false;
         }
@@ -1103,116 +1174,99 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
 // Callers only care whether RP exceeds the limit, not by how much.
 // Optimization: if we find RP > Limit at any point, return early and cache
 // that value - no need to compute the actual maximum.
-unsigned SSASpillEmitter::getMaxRPForBlock(MachineBasicBlock *MBB) {
+unsigned SSASpillEmitter::maxDeficiencyForBlock(MachineBasicBlock *MBB) {
   SSARA_TRACE();
-  auto It = MaxRPCache.find(MBB);
-  if (It != MaxRPCache.end())
+  auto It = DeficiencyCache.find(MBB);
+  if (It != DeficiencyCache.end())
     return It->second;
 
-  // Compute max RP by tracking backwards through the block
+  // Compute max deficiency by tracking backwards through the block
   GCNUpwardRPTracker Tracker(*LIS);
   Tracker.reset(*MBB);
 
-  const GCNSubtarget &ST = MBB->getParent()->getSubtarget<GCNSubtarget>();
-
-  // Include initial pressure (live-out at block end)
-  GCNRegPressure InitPressure = Tracker.getPressure();
-  unsigned MaxRP = IsVGPRPass ? InitPressure.getVGPRNum(ST.hasGFX90AInsts())
-                              : InitPressure.getSGPRNum();
+  // Include the live-out set at block end
+  unsigned Max = PoolDeficiency(Tracker.getLiveRegs());
 
   for (MachineInstr &MI : reverse(*MBB)) {
     if (MI.isDebugInstr())
       continue;
     Tracker.recede(MI);
-    GCNRegPressure Pressure = Tracker.getPressure();
-    unsigned CurRP = IsVGPRPass ? Pressure.getVGPRNum(ST.hasGFX90AInsts())
-                                : Pressure.getSGPRNum();
-    MaxRP = std::max(MaxRP, CurRP);
+    Max = std::max(Max, PoolDeficiency(Tracker.getLiveRegs()));
   }
 
-  MaxRPCache[MBB] = MaxRP;
-  return MaxRP;
+  DeficiencyCache[MBB] = Max;
+  return Max;
 }
 
 // reloadRPBeforeUse / reloadRPAtBlockEnd moved to the RA (feasibility POLICY;
 // the Emitter is pure spill/reload/SSA-repair mechanics). See
 // AMDGPUSSARegisterAllocator::reloadRPBeforeUse / reloadRPAtBlockEnd.
 
-unsigned SSASpillEmitter::maxRPBetween(MachineInstr *DefMI,
-                                       MachineInstr *UseMI) {
+unsigned SSASpillEmitter::maxDeficiencyBetween(MachineInstr *DefMI,
+                                               MachineInstr *UseMI) {
   SSARA_TRACE();
-  // Max RP (current pass's file) at the program points strictly between DefMI
-  // and UseMI in the same block, inclusive of the span the reaching value would
-  // occupy. Used to decide whether a same-block reaching reload SPANS an
-  // RP-tight region: if so, the shared reload must not be reused across it — a
+  // Max deficiency of the current pool at the program points strictly between
+  // DefMI and UseMI in the same block, inclusive of the span the reaching value
+  // would occupy. Used to decide whether a same-block reaching reload SPANS a
+  // tight region: if so, the shared reload must not be reused across it — a
   // fresh reload is forced right before UseMI so the span ends before the tight
   // point (C1: a reload live across a pressure region does not lower RP there).
   MachineBasicBlock *MBB = UseMI->getParent();
   if (!DefMI || DefMI->getParent() != MBB)
     return 0;
-  const GCNSubtarget &ST = MBB->getParent()->getSubtarget<GCNSubtarget>();
   GCNUpwardRPTracker Tracker(*LIS);
   Tracker.reset(*UseMI);
-  unsigned MaxRP = 0;
+  unsigned Max = 0;
   for (auto It = UseMI->getReverseIterator(); It != MBB->rend(); ++It) {
     MachineInstr &MI = *It;
     if (MI.isDebugInstr())
       continue;
     Tracker.recede(MI);
-    GCNRegPressure P = Tracker.getPressure();
-    unsigned RP = IsVGPRPass ? P.getVGPRNum(ST.hasGFX90AInsts()) : P.getSGPRNum();
-    MaxRP = std::max(MaxRP, RP);
+    Max = std::max(Max, PoolDeficiency(Tracker.getLiveRegs()));
     if (&MI == DefMI)
       break; // reached the reaching def; span is [DefMI, UseMI]
   }
-  return MaxRP;
+  return Max;
 }
 
-unsigned SSASpillEmitter::getMaxRPInBlockDownTo(MachineBasicBlock *MBB,
-                                                MachineInstr *StopMI) {
+unsigned SSASpillEmitter::maxDeficiencyInBlockDownTo(MachineBasicBlock *MBB,
+                                                    MachineInstr *StopMI) {
   SSARA_TRACE();
   if (!StopMI || StopMI->getParent() != MBB)
-    return getMaxRPForBlock(MBB);
+    return maxDeficiencyForBlock(MBB);
 
-  // Compute max RP from block start up to (not including) StopMI
+  // Compute max deficiency from block start up to (not including) StopMI
   GCNUpwardRPTracker Tracker(*LIS);
 
   // Start from StopMI and track backwards to block start
   Tracker.reset(*StopMI);
 
-  unsigned MaxRP = 0;
-  const GCNSubtarget &ST = MBB->getParent()->getSubtarget<GCNSubtarget>();
+  unsigned Max = 0;
 
   for (auto It = StopMI->getReverseIterator(); It != MBB->rend(); ++It) {
     MachineInstr &MI = *It;
     if (MI.isDebugInstr())
       continue;
     Tracker.recede(MI);
-    GCNRegPressure Pressure = Tracker.getPressure();
-    unsigned CurRP = IsVGPRPass ? Pressure.getVGPRNum(ST.hasGFX90AInsts())
-                                : Pressure.getSGPRNum();
-    MaxRP = std::max(MaxRP, CurRP);
+    Max = std::max(Max, PoolDeficiency(Tracker.getLiveRegs()));
   }
 
-  return MaxRP;
+  return Max;
 }
 
 bool SSASpillEmitter::canHoistReloadTo(MachineBasicBlock *NCD,
                                        MachineInstr *InsertPoint,
-                                       unsigned RPLimit, Register SpilledReg,
+                                       Register SpilledReg,
                                        const MachineLoop *SpanLoop) {
   SSARA_TRACE();
-  // Spilled register is already counted as live, so MaxRP > RPLimit means
-  // no room for reload (no +1 needed).
+  // The spilled register is already counted as live, so a non-zero deficiency
+  // means the pool has no room for the reload (no +1 needed).
 
-  // Check RP in NCD block only if reload is placed inside NCD (InsertPoint set)
-  // If InsertPoint is nullptr, reload goes at NCD end - skip NCD RP check,
+  // Check NCD block only if reload is placed inside NCD (InsertPoint set).
+  // If InsertPoint is nullptr, reload goes at NCD end - skip the NCD check,
   // walkPathsToUses will check paths from NCD to uses.
-  if (InsertPoint) {
-    unsigned NCDRP = getMaxRPInBlockDownTo(NCD, InsertPoint);
-    if (NCDRP > RPLimit)
-      return false;
-  }
+  if (InsertPoint && maxDeficiencyInBlockDownTo(NCD, InsertPoint))
+    return false;
 
   auto IsHighRP = [&](MachineBasicBlock *BB, MachineInstr *UseMI) -> bool {
     // Measuring down to the first use models a reload that dies at that use.
@@ -1220,13 +1274,14 @@ bool SSASpillEmitter::canHoistReloadTo(MachineBasicBlock *NCD,
     // all of BB on every iteration, so pressure arising after the first use
     // still competes with it and must be counted.
     bool SpansBlock = SpanLoop && SpanLoop->contains(BB);
-    unsigned CurRP = (UseMI && !SpansBlock) ? getMaxRPInBlockDownTo(BB, UseMI)
-                                            : getMaxRPForBlock(BB);
+    unsigned Short = (UseMI && !SpansBlock)
+                         ? maxDeficiencyInBlockDownTo(BB, UseMI)
+                         : maxDeficiencyForBlock(BB);
     LLVM_DEBUG(dbgs() << "    hoist-gate: " << printMBBReference(*BB)
                       << " spansBlock=" << SpansBlock
-                      << " use=" << (UseMI ? "yes" : "no") << " RP=" << CurRP
-                      << " limit=" << RPLimit << "\n");
-    return CurRP > RPLimit;
+                      << " use=" << (UseMI ? "yes" : "no") << " short=" << Short
+                      << "\n");
+    return Short != 0;
   };
 
   return walkPathsToUses(NCD, SpilledReg, IsHighRP);
@@ -1305,19 +1360,18 @@ SSASpillEmitter::adjustReloadForLoop(MachineBasicBlock *ReloadBB,
     // Use in loop, spill outside - consider hoisting reload to preheader
     MachineBasicBlock *Preheader = ReloadLoop->getLoopPreheader();
     if (Preheader) {
-      unsigned RPLimit = CurRPLimit;
       MachineInstr *InsertPoint = nullptr;
       auto TermIt = Preheader->getFirstTerminator();
       if (TermIt != Preheader->end())
         InsertPoint = &*TermIt;
 
-      bool CanHoist = canHoistReloadTo(Preheader, InsertPoint, RPLimit,
-                                       SpilledReg, ReloadLoop);
+      bool CanHoist =
+          canHoistReloadTo(Preheader, InsertPoint, SpilledReg, ReloadLoop);
 
       if (!CanHoist) {
         LLVM_DEBUG(
             dbgs() << "  Cannot hoist reload to preheader: "
-                   << "RP exceeds limit on path, keeping reload inside loop\n");
+                   << "no placement on some path, keeping reload inside loop\n");
         return {ReloadBB,
                 InsertBeforeMI}; // Don't hoist - accept reload in loop
       }

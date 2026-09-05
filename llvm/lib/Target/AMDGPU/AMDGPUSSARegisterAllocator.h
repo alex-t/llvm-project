@@ -142,12 +142,29 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // vregs left are the short reload remainders — which provably settle.
   SmallVector<Register, 8> UncolorableVRegs;
 
-  // The AGPR->VGPR copies tryAGPRHomeRescue itself minted. A copy that fails to
+  struct PendingTie {
+    MachineInstr *MI;
+    unsigned DefOpIdx;
+    unsigned UseOpIdx;
+  };
+  // Exact tied operand pairs encountered by the current coloring walk.
+  // Recovery may repoint the use after the def inherited its old color, so
+  // validate these only after every coloring failure has been recovered.
+  SmallVector<PendingTie, 8> PendingTies;
+
+  // The cross-pool copies tryCrossFileHome itself minted. A copy that fails to
   // color joins UncolorableVRegs, and both the drain loop and the terminal sweep
   // walk values queued while they run, so without this the rescue would be
   // applied to its own copies, each minting another (unbounded). Rescuing a copy
-  // can never help anyway: it exists precisely to hold a VGPR at one instruction.
+  // can never help anyway: it exists precisely to hold one pool at one instruction.
   SmallDenseSet<Register, 8> RescueCopies;
+
+  // Recovery mutations that must not repeat. A value moved to the sibling
+  // vector pool may reclaim that home later, but is never moved back; a value
+  // spilled as a blocker or by the memory floor is never selected for another
+  // recovery spill. Cleared at the start of each allocation stage.
+  SmallDenseSet<Register, 8> RehomedVRegs;
+  SmallDenseSet<Register, 16> RecoverySpilledVRegs;
 
   // === Coloring ===
   void classifyVRegs();
@@ -173,6 +190,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// after a coloring-failure spill. Returns false if no register is free
   /// (should not happen for a width-1 reload — point pressure ≤ limit < file).
   bool colorOneInPlace(Register R);
+  bool tiedAssignmentsValid() const;
+  void drainUncolorableWorklist(MachineFunction &MF);
 
   /// CSR(CS): the registers this allocation may use for \p RC that \p CallMI
   /// preserves. A call's regmask IS its preserved set, and ISel builds that mask
@@ -201,24 +220,9 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// it, else takes one from CSR(CS), else is spilled across the call.
   void preassignValuesLiveAcrossCalls();
 
-  /// What a recovery handler achieved (driver -> FSM stream). nextRecoveryState
-  /// maps it to the next state; Resolved -> OK terminal, Infeasible -> terminal.
-  enum class RecoveryResult {
-    Resolved,  // value fully placed — done (FSM -> OK)
-    Reduced,   // progress: shorter remnant (SelfSplit) or a blocker spilled
-               // (SpillBlockers) — re-dispatch
-    NoOp,      // precondition did not hold; nothing changed — next strategy
-    Infeasible // genuine point-over-pressure — honest terminal
-  };
-
-  /// Recovery FSM states (FSM -> driver stream: which handler to run). Start
-  /// classifies to a handler state; each handler's RecoveryResult drives
-  /// nextRecoveryState; OK/Infeasible are terminals. The driver loops to a
-  /// terminal with a monotone-progress detector (candidate length decreasing OR a
-  /// blocker spilled) that breaks the SelfSplit<->CrossLiver cycle.
-  enum class RecoveryState {
-    Start, Web, CrossLiver, SelfSplit, AGPRRelief, Floor, OK, Infeasible
-  };
+  /// Result of one recovery strategy. NoChange guarantees that the strategy
+  /// left MIR, LIS, register classes, and ColorMap unchanged.
+  enum class RecoveryResult { Resolved, Changed, NoChange };
 
   /// Spill a colored blocker B (occupying a physreg P legal for \p Failed) to
   /// free P over \p Failed's range. Two candidate classes, both requiring B live
@@ -228,12 +232,11 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   ///    -> Resolved.
   ///  - BORN-IN-F (B.def in (FS,FE)): frees P over F's TAIL [B.def,FE); F is
   ///    split at B.def, the tail colors into P, the HEAD [FS,B.def) is handed
-  ///    back in \p Remnant -> Reduced.
+  ///    back in \p Remnant -> Changed.
   /// Multi-candidate pick = COVERAGE: live-through (frees all of F) beats
   /// born-in-F; among born-in-F the earliest def frees the longest tail. Returns
-  /// NoOp if no clean candidate exists.
-  RecoveryResult spillBlocker(Register Failed, unsigned RPLimit,
-                              Register &Remnant);
+  /// NoChange if no clean candidate exists.
+  RecoveryResult spillBlocker(Register Failed, Register &Remnant);
 
   /// Close the PHI web seeded by \p Seed (a PHI result, or a PHI operand feeding
   /// one). Bidirectional closure over PHI operand/result edges, then the
@@ -242,14 +245,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// pure mechanics). Returns an INVALID PhiWeb (see PhiWeb::valid) if \p Seed is
   /// not part of a spillable web, so the caller falls back to a plain spill.
   PhiWeb closePhiWeb(Register Seed) const;
-
-  /// RA-side feasibility gate for spilling \p Web: a web spill is a monotone
-  /// wall-dissolution, so the ONLY failure is a reload landing where post-spill RP
-  /// still exceeds \p Limit. Probe exactly that at each web member's EXTERNAL
-  /// (non-PHI-edge) use via the shared reloadRPBeforeUse helper. \p IsVGPR selects
-  /// the file. Enforces web-spill ATOMICITY: the RA proves feasibility BEFORE
-  /// dispatch; spillPhiWeb is then pure spill/reload mechanics that cannot fail.
-  bool webReloadFeasible(const PhiWeb &Web, bool IsVGPR, unsigned Limit) const;
 
   /// [Design: region-rp-reduction, Stage 1] Register file for region
   /// enumeration. AGPR is a DISTINCT file on non-unified targets (gfx908):
@@ -272,11 +267,14 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   struct TightRegion {
     MachineBasicBlock *MBB;
     SlotIndex Start, End; // half-open, within MBB
-    SlotIndex PeakSlot;   // slot where Peak RP is reached (a value must be live
-                          // here to relieve the region by being spilled)
+    SlotIndex PeakSlot;   // slot carrying the largest deficiency (a value must be
+                          // live here to relieve the region by being spilled)
     RegFile File;
-    unsigned Peak;  // max RP observed in the span
-    unsigned Limit; // allocatable-pool count for the file
+    unsigned Deficiency; // max runs SHORT over the span, from demandDeficiency
+    unsigned Limit;      // allocatable-pool count. A budget handed to the emitter
+                         // and a number to report — never again a feasibility
+                         // threshold: whether a slot fits is a packing question
+                         // a pool size cannot answer.
   };
 
   /// [Stage 1] Allocatable-pool size for \p File (SGPR_32 / VGPR_32 / AGPR_32
@@ -296,18 +294,58 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// 4 for wider SGPRs. Cached per class.
   unsigned allocStride(const TargetRegisterClass *RC) const;
 
-  /// Registers of \p File the values in \p Live will actually OCCUPY — the full
-  /// class width of each, rounded up for the classes that must start aligned, not
-  /// the live lanes. This is what the colorer spends, so it is the number the
-  /// pre-spill gate must compare against the pool. \p Live is spelled out rather
-  /// than named GCNRPTracker::LiveRegSet so this header need not pull in
-  /// GCNRegPressure.h, which only the .cpp uses.
-  unsigned wholeBlockDemand(const DenseMap<unsigned, LaneBitmask> &Live,
-                            RegFile File) const;
+  /// The register POOL a value must be placed in — the tier axis of the demand
+  /// oracle. Deliberately NOT fileOf(), which selects the allocation STAGE and
+  /// folds AGPR into the vector stage: charging an AGPR value against the
+  /// arch-VGPR pool measures a shortage that does not exist, because the two
+  /// register sets are physically disjoint with separate allocation orders.
+  RegFile poolOf(const TargetRegisterClass *RC) const;
 
-  /// [Stage 1] Per-file pressure at a tracker point. VGPR uses the UNIFIED count
-  /// on gfx90a+ (arch+agpr+avgpr share one budget) and arch-VGPR alone otherwise;
-  /// AGPR is the separate AGPR count (only meaningful on non-unified targets).
+  /// One (pool, width) tier at one slot: how many live values need it, and how
+  /// many the oracle could actually place. The shortfall is Demand - Placed.
+  struct TierDemand {
+    const TargetRegisterClass *RC;
+    unsigned Width, Stride, Demand, Placed;
+  };
+
+  /// THE demand oracle. At one slot, for \p Pool, per (pool, width) tier in
+  /// DESCENDING width order, place each live value first-fit into the pool's
+  /// remaining hardware registers, taking legal starts from availableOrder() so
+  /// that stride, alignment, reserved registers and the withheld WWM tail all
+  /// come from the one list the colorer itself scans. Returns the number of
+  /// values that could not be placed: the deficiency, in RUNS.
+  ///
+  /// A dword total cannot answer this. Forty-four aligned pairs into exactly
+  /// forty-four pair starts is at the limit with zero slack, and one 32-bit
+  /// value landing on an even register destroys a start without changing any
+  /// dword count. Descending width order is required because a wide tier
+  /// constrains the narrow ones and never the reverse.
+  ///
+  /// \p Live is GCNRPTracker::LiveRegSet, spelled out here.
+  unsigned demandDeficiency(const DenseMap<unsigned, LaneBitmask> &Live,
+                            RegFile Pool,
+                            SmallVectorImpl<TierDemand> &Out) const;
+
+  /// The oracle bound to \p Pool, for the spill emitter's reload-placement
+  /// queries. The emitter must ask the same question spill planning does: its
+  /// own scalar count read getVGPRNum(), so for an AGPR value it compared a
+  /// pool of AGPRs against a total of arch VGPRs.
+  SSASpillEmitter::DemandFn demandFor(RegFile Pool) const;
+
+  /// One in-region slot: the live set there and its deficiency. Carrying the SET
+  /// rather than a number is what lets a candidate be priced by MEASUREMENT —
+  /// re-query the oracle without the victim — instead of subtracting its width
+  /// from a scalar that had already rounded.
+  struct RegionSlot {
+    SlotIndex SI;
+    MachineInstr *MI;
+    DenseMap<unsigned, LaneBitmask> Live;
+    unsigned Short;
+  };
+
+  /// [Stage 1] Per-file pressure at a tracker point. VGPR is the arch-VGPR count
+  /// on every target (rationale at the definition); AGPR is the separate AGPR
+  /// count.
   unsigned pressureOf(const GCNRegPressure &P, RegFile File) const;
 
   /// 32-bit slots \p Lanes of \p RC occupy, in the SAME unit pressureOf reports:
@@ -322,16 +360,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// storing the whole register, and then the traffic is the full class.
   unsigned spilledSlots(Register V, LaneBitmask Lanes) const;
 
-  /// Post-spill RP just BEFORE \p UseMI (per-use reload site): reset(*MI) seeds
-  /// just after the use, recede steps to just-before; -W+W cancel => post-spill RP
-  /// there. Feasibility POLICY — RA-owned (moved from the Emitter, which is pure
-  /// spill/reload/SSA-repair mechanics). \p IsVGPR selects the file. NOTE: uses
-  /// getVGPRNum(hasGFX90A) — NOT pressureOf's getArchVGPRNum — to stay bit-identical
-  /// to the pre-move behavior (they differ by the AGPR term on non-unified targets).
-  unsigned reloadRPBeforeUse(const MachineInstr *UseMI, bool IsVGPR) const;
-
   /// Post-spill RP at the END of \p NCD (shared hoisted-reload site). Valid for an
-  /// empty NCD. Same file/accounting notes as reloadRPBeforeUse.
+  /// empty NCD.
   unsigned reloadRPAtBlockEnd(const MachineBasicBlock *NCD, bool IsVGPR) const;
 
   /// [Stage 1] Enumerate tight regions for \p File: per block, maximal contiguous
@@ -355,18 +385,24 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
     unsigned Slots = 0;
   };
 
-  /// Peak RP of \p R's file over ONLY [R.Start,R.End), measured with the same
-  /// GCNUpwardRPTracker + pressureOf machinery findTightRegions used, so it is
-  /// directly comparable to R.Peak. With \p Occupants, the same walk also reports
-  /// every virtual register live inside R — which IS the overlap test, hole-accurate
-  /// by construction. With \p Slots it also reports the demand at each in-region
-  /// slot, which is what predictSpill needs: the peak alone cannot say whether a
-  /// victim covers the slots that are actually over the limit.
-  /// Returns 0 if R's first instruction no longer exists.
+  /// Largest demand DEFICIENCY of \p R's pool over ONLY [R.Start,R.End), from the
+  /// oracle, so it is directly comparable to R.Deficiency. With \p Occupants the
+  /// same walk also reports every virtual register live inside R — which IS the
+  /// overlap test, hole-accurate by construction. With \p Slots it reports each
+  /// in-region slot's instruction, live set, and deficiency, which the cumulative
+  /// set planner copies and re-evaluates. With \p PeakTiers it reports which
+  /// (pool, width) tiers were short at the worst slot.
+  /// Returns 0 if the region packs, or if R's first instruction no longer exists.
   unsigned measureRegionPeak(
       const TightRegion &R,
       DenseMap<Register, RegionOccupancy> *Occupants = nullptr,
-      SmallVectorImpl<std::pair<SlotIndex, unsigned>> *Slots = nullptr) const;
+      SmallVectorImpl<RegionSlot> *Slots = nullptr,
+      SmallVectorImpl<TierDemand> *PeakTiers = nullptr) const;
+
+  /// Print the values live at the worst slot in \p Slots with their widths, so a
+  /// relief prediction that did not come true can be compared against what
+  /// actually stayed resident. Debug output only.
+  void dumpWorstSlotLiveSet(ArrayRef<RegionSlot> Slots, const char *Tag) const;
 
   /// Diagnostic (-amdgpu-ssa-lane-waste-dump): per function and file, report the
   /// peak whole-tuple occupancy this allocator charges against the subrange
@@ -379,20 +415,17 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// the width-aware region gate; delete together with it. Mutates no state.
   void reportBlockDemand(MachineFunction &MF) const;
 
-  /// Spill victims from ONE tight region until its MEASURED peak fits the pool.
-  /// Candidates are frozen-\p Universe values of \p R's file, live at R.PeakSlot,
-  /// not already in \p Spilled, and admitted by \p Eligible; chosen
-  /// over-subscribed-then-widest-first, then routed through planSpill, which
-  /// rejects a victim whose reload would land back inside \p R and turns a
-  /// PHI-web victim into a web spill. Spilled victims are added to \p Spilled.
-  /// Returns true if it spilled.
+  /// Spill a complete area-planned set for one tight region. Candidates are
+  /// frozen-\p Universe occupants admitted by \p Eligible. No source mutation is
+  /// performed unless virtual oracle evaluation reaches zero deficiency.
+  /// Spilled victims are added to \p Spilled.
   ///
   /// TEMPORARY: this borrows reduceRegionPressure's planner and measured-relief
   /// rule but remains a SECOND victim-selection loop over the same regions. The
   /// intended end state is one shared per-region loop parameterized by candidate
   /// admission; see the note at the top of the definition.
-  /// Shared by the width-aware pre-spiller (Eligible = always) and AGPR-relief
-  /// (Eligible = avReloadLegal, so reloads re-home to a free AGPR).
+  /// The width-aware pre-spiller passes Eligible = always; other callers may
+  /// restrict which frozen candidates participate in area planning.
   /// If \p NumRecolored is non-null, it is incremented by the number of victims
   /// relieved by AGPR RECOLOR (not memory spill) — a MONOTONE action (AGPR budget
   /// and the frozen universe both strictly shrink), so a round that recolored is
@@ -420,174 +453,71 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// count (SGPR classes -> SGPR, everything else -> VGPR).
   RegFile fileOf(const TargetRegisterClass *RC) const;
 
-  /// Control-flow ordering of two slots. THE SINGLE SOURCE OF TRUTH for "does
-  /// slot A come before slot B" — based on DOMINANCE, never on block layout /
-  /// SlotIndex numeric distance (layout order is NOT program order; comparing
-  /// slot ordinals is a bug and is forbidden). Same block -> instruction order;
-  /// different blocks -> dominator-tree relation; divergent paths -> Incomparable
-  /// (neither precedes the other — e.g. sibling diamond arms).
-  enum class SlotOrder { Before, After, Same, Incomparable };
-  SlotOrder compareSlots(SlotIndex A, SlotIndex B) const;
-
-  /// [Recovery classifier, Stage 1] A "recovery window" for one uncolored value:
-  /// the forward slot span from the value's def down to the first non-PHI point
-  /// where real register pressure drops below the file limit, plus the universe
-  /// of already-colored, same-file crossers with NO use inside the window (the
-  /// spill-candidate universe a later stage will draw from). SIDE-EFFECT-FREE:
-  /// collected and logged only; it drives nothing in Stage 1.
-  /// Why a recovery window stopped growing. Exactly one reason per window.
-  /// BackEdge is the loop-carried-web signal (the window's single hop to a loop
-  /// header PHI) and is distinct from ForkDivergence — do NOT lump them.
-  enum class WindowStop {
-    RPRecovered,    // closed cleanly: first non-PHI slot with RP < Limit
-    ForkDivergence, // stopped at a >1-successor (or 0-successor) block
-    BackEdge,       // followed a unique successor back into a visited block (loop)
-    Cap             // hit MaxWindowSlots without RP recovering
-  };
-
-  struct RecoveryWindow {
-    Register Uncolored;
-    SlotIndex Start;                    // def slot of Uncolored
-    SlotIndex End;                      // first non-PHI slot fwd with real RP < Limit
-    SmallVector<Register, 16> Crossers; // spill-candidate universe (see collect)
-    WindowStop Stop = WindowStop::RPRecovered;
-    // PHI-web membership — the analyst signal. A PHI-web is one CFG primitive:
-    // Uncolored feeds a PHI (a value-merge node). Loop-carried vs. divergent-
-    // diamond is a LATER cost-model distinction, not a detection concern (YAGNI
-    // now). WebPhi = the PHI result reg this value merges into, or invalid if the
-    // value feeds no PHI. See Recursive_Recovery_Fix.md.
-    Register WebPhi;
-    // Stage-2 dispatch inputs (spill-around ranking). Per-crosser widths are NOT
-    // stored — derived from the vreg id (consumer-side for the analyst, live for
-    // the in-allocator dispatcher).
-    unsigned UncoloredWidth = 0; // width of Uncolored in dwords (aligned-tuple feasibility)
-    unsigned RPOvershoot = 0;    // peak (RP - Limit) across the window; 0 if never over
-                                 // (spill-1 vs spill-N signal)
-    // Branch-3 pick: the register-resident prefix the classifier proved peelable,
-    // handed to trySelfSplitColor as its FIRST piece so the handler never
-    // re-derives what routed it here. Valid iff classifyRecovery returned
-    // SelfSplit; invalid on the CrossLiver/Web fall-through, where branch 3 was
-    // never evaluated and the handler picks for itself.
-    MCRegister PeelPR;
-    SlotIndex PeelBound;
-  };
-
   /// Pick the register free at \p V's start that stays free LONGEST, and decide
   /// whether that free run is worth peeling. Returns false when nothing is free at
   /// the start, or when the run does not reach past \p V's first use (genuine
   /// over-pressure rather than fragmentation). On true, \p PR is the register and
   /// \p Bound the slot where it becomes occupied (>= V's end means free across all
-  /// of V). THE single split-across policy: classifyRecovery (branch 3) asks "will
-  /// SelfSplit make progress?" and trySelfSplitColor asks "what do I peel now?",
-  /// so the gate cannot disagree with the handler. Const — reads LIS/MRI/ColorMap.
+  /// of V). This is the single split-across policy used by SelfSplit. Const —
+  /// reads LIS/MRI/ColorMap.
   bool pickPeelableRun(Register V, MCRegister &PR, SlotIndex &Bound) const;
 
-  /// [Recovery classifier, Stage 1] Collect the recovery window for \p Uncolored
-  /// (see RecoveryWindow). Uses the trusted GCNUpwardRPTracker only. Const —
-  /// reads LIS / MRI / ColorMap; mutates no allocator state.
-  RecoveryWindow collectRecoveryWindow(Register Uncolored) const;
+  /// True iff splitLiveRangeAt(V, SplitMI) will redirect at least one real use.
+  /// The emitter creates its result vreg before discovering an empty split, so
+  /// every recovery NoChange path must run this side-effect-free preflight.
+  bool splitWouldRedirect(Register V, MachineInstr *SplitMI) const;
 
-
-  /// Cross-liver PRECONDITION: true iff \p Failed has a cleanly-spillable
-  /// live-through blocker — colored, same-file (getCommonSubClass), live across
-  /// Failed's whole range with no use strictly inside (so its reload lands after
-  /// FE), AND that reload's post-spill RP stays within \p RPLimit
-  /// (reloadRPBeforeUse). The classifier calls this so CrossLiver is chosen ONLY
-  /// when spillCrossLiver will find a feasible candidate (no spill-then-fail).
-  bool hasCleanCrossLiver(Register Failed, unsigned RPLimit) const;
-
-  /// A memory spill of \p R relieves it only if some non-PHI use has post-spill RP
-  /// <= \p RPLimit (the reload lands below saturation). Else the reload re-enters
-  /// the same pressure (a spill-reload thrash). No non-PHI use -> trivially viable.
-  /// The Floor-vs-Infeasible discriminator.
-  bool floorViable(Register R, bool IsVGPR, unsigned RPLimit) const;
-
-  /// Unified-file (gfx90a+) VGPR-saturation relief: spill an av-LEGAL colored
-  /// crosser of \p Failed so its reload re-homes to a free AGPR (availableOrder
-  /// lists VGPRs then AGPRs; when VGPRs are saturated the reload falls through to
-  /// an AGPR), freeing a VGPR across Failed's range. Resolved if Failed then
-  /// colors; NoOp otherwise (freed nothing usable -> Floor).
-  RecoveryResult agprRelief(Register Failed, unsigned RPLimit);
-
-  /// True iff \p B's reload may legally be colored to an AGPR: every operand
-  /// admits an AGPR (av_ is a subclass of each operand's required class) and no
-  /// operand is a sub-register slice. Same legality test as widenToAVOnUnified.
-  bool avReloadLegal(Register B) const;
-
-  /// LAST-DITCH rescue fired right before reportPointOverPressure would abort. On
-  /// a unified target, when \p R cannot be placed in the VGPR file (its whole
-  /// range is VGPR-clobbered / over-pressure) but the AGPR file has a free tuple
-  /// of R's width, HOME R in an AGPR and insert a short AGPR->VGPR copy before each
-  /// VGPR-only-constrained use (the copy lives only [copy,use] -> trivially
-  /// colorable). This is Greedy's v_accvgpr_read pattern for an asm-pinned block.
-  /// Returns true if R was rescued (colored); false if the conditions do not hold
-  /// (caller then screams).
-  bool tryAGPRHomeRescue(Register R);
-
-  /// FSM transition: given the current handler \p S and its \p R result, return
-  /// the next state per the recovery transition table.
-  RecoveryState nextRecoveryState(RecoveryState S, RecoveryResult R) const;
-
-  /// [Recovery FSM] Classify \p RW into the FIRST handler STATE (web > cross-liver
-  /// > self-split), or a terminal (Floor if a memory reload fits, else Infeasible)
-  /// when no structural pattern applies. The driver runs the state's handler and
-  /// advances via nextRecoveryState. Reads \p RW + feasibility helpers, and on a
-  /// SelfSplit verdict writes back the peel pick (RW.PeelPR / RW.PeelBound).
-  RecoveryState classifyRecovery(RecoveryWindow &RW) const;
-
-  /// Emit the forensic recoveryWindow event for \p Failed / \p RW (analyst
-  /// signal). Called by the recovery driver when the reporter is enabled; no
-  /// effect on dispatch.
-  void emitRecoveryWindow(Register Failed, const RecoveryWindow &RW) const;
+  /// Cross-file recovery strategy. First try to place \p R in its current
+  /// class or in that class's sibling vector pool. If that fails, temporarily
+  /// uncolor each colored crosser and try to move it from its ACTUAL physical
+  /// pool to the sibling pool. A successful crosser move returns Changed so the
+  /// recovery pipeline restarts from Web. Failed probes restore the old class and
+  /// color exactly. Its internal forced-target probe bypasses current-home
+  /// reclamation for a temporarily uncolored crosser.
+  RecoveryResult tryCrossFileHome(Register R);
 
   /// [Stage 2] Cost of spilling candidate \p B to relieve region \p R.
   ///   Cost     : NReloads * Width. NReloads = 1 when B's uses are commonly
   ///              dominated and the shared reload hoists to their NCD; else one
   ///              reload per use, plus one per predecessor supplying a PHI use.
   ///   Width    : dwords the spill of \p Lanes MOVES (spilledSlots) — traffic, not
-  ///              relief. Relief is coveredSlots(Lanes) and the caller divides by
-  ///              it, so the two cancel except where an unnamed lane span forces a
-  ///              whole-register store.
+  ///              relief. The cumulative planner uses it only to price traffic;
+  ///              area uses coveredSlots and actual freed RegionSlot sites.
   /// Every candidate is priceable: a reload only ever restores a register the
-  /// reload point already needed, so placement cannot make a candidate unusable.
-  /// Admission is predictSpill's measured relief, not a placement predicate.
+  /// reload point already needed. Traffic cost is a deterministic tie-breaker;
+  /// cumulative oracle evaluation decides admission.
   struct SpillCost {
     unsigned Cost;
     unsigned Width;
   };
   SpillCost costOfSpilling(Register B, const TightRegion &R, LaneBitmask Lanes);
 
-  /// How to spill \p V (the \p Lanes that \p R holds of it) out of \p R, and how
-  /// expensive that is. ALL victim-kind routing (PHI web vs plain value) and every
-  /// gate live here, so the selection loop only compares ratios. \p Slots is R's
-  /// per-slot demand profile, from which the relief is predicted: a plain victim
-  /// that frees nothing over R is reported Infeasible, so no driver can emit a
-  /// store that buys nothing. Infeasible means "reject this candidate". Ratios are
-  /// comparable across kinds; lower is better.
-  struct SpillPlan {
-    enum KindTy { Infeasible, Plain, WebSpill };
-    KindTy Kind = Infeasible;
-    PhiWeb Web; // meaningful only when Kind == WebSpill
-    double Ratio = 0.0;
-    unsigned Relief = 0;  // over-limit demand this removes from R
-    unsigned NewPeak = 0; // peak R is left with; only to check the model in -debug
+  struct SpillCandidateInput {
+    Register V;
+    LaneBitmask Lanes;
+    bool CanRecolor = false;
   };
-  SpillPlan planSpill(Register V, const TightRegion &R, bool IsVGPRFile,
-                      LaneBitmask Lanes,
-                      ArrayRef<std::pair<SlotIndex, unsigned>> Slots);
 
-  /// What spilling \p Lanes of \p B out of \p R would do to \p R, computed from
-  /// its per-slot demand profile BEFORE any code is emitted. NewPeak is the peak
-  /// R would be left with; ExcessDrop is the over-limit demand the spill removes,
-  /// summed over R's slots. A zero ExcessDrop means the spill buys nothing, so it
-  /// must not be emitted — the driver used to find that out only by measuring
-  /// after the store was already in the function.
-  struct SpillEffect {
-    unsigned NewPeak = 0;
-    unsigned ExcessDrop = 0;
+  struct AreaSpillAction {
+    enum KindTy { Memory, Recolor };
+    Register V;
+    LaneBitmask Lanes;
+    KindTy Kind = Memory;
+    uint64_t Area = 0;
+    unsigned Cost = 0;
+    bool FootprintExact = false;
   };
-  SpillEffect predictSpill(Register B, LaneBitmask Lanes, const TightRegion &R,
-                           ArrayRef<std::pair<SlotIndex, unsigned>> Slots) const;
+
+  /// Build a cumulative non-emitting spill set over copies of \p Slots. Area
+  /// orders the search; demandDeficiency remeasurement is authoritative. PHI
+  /// webs are excluded until their multi-value footprint can be modeled as one
+  /// atomic unit. Returns false without actions unless the virtual set reaches
+  /// zero total deficiency.
+  bool planAreaSpillSet(const TightRegion &R, ArrayRef<RegionSlot> Slots,
+                        ArrayRef<SpillCandidateInput> Inputs,
+                        unsigned RecolorBudget,
+                        SmallVectorImpl<AreaSpillAction> &Actions,
+                        unsigned *RemainingShort = nullptr);
 
   /// [Stage 3] Region RP-reduction driver. While tight regions remain, service
   /// the worst (highest Peak) by spilling the cheapest feasible crosser ACROSS
@@ -596,30 +526,26 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// was performed (caller then re-colors from clean). Bounded by a round cap.
   bool reduceRegionPressure(MachineFunction &MF);
 
-  /// Self-split (self-split branch of the recovery classifier): \p Failed is
+  /// SelfSplit recovery strategy: \p Failed is
   /// a long liver with no through-lane AND no live-through blocker to spill around
   /// (spillCrossLiver found nothing). Chop Failed into segments, each
   /// short enough that one physreg is free across it, coloring each into that reg.
   /// Only valid when Failed is POINT-FEASIBLE (some PR free at every slot); aborts
   /// (returns false -> caller memory-spills) if any slot has zero free PRs.
-  /// \p FirstPR / \p FirstBound is the pick for the FIRST piece, supplied by the
-  /// FSM (RecoveryWindow::PeelPR). Pass an invalid \p FirstPR to have the handler
-  /// pick it, which is what the CrossLiver/Web fall-through entries do.
+  /// \p FirstPR / \p FirstBound may provide the pick for the first piece. Pass
+  /// an invalid \p FirstPR to have the strategy pick it from current state.
   RecoveryResult trySelfSplitColor(Register Failed, MCRegister FirstPR,
                                    SlotIndex FirstBound, Register &Remnant);
 
   /// Coloring-time recovery for one value \p Failed that color() could not place.
-  /// Classifier-driven (see Recursive_Recovery_Fix.md): collectRecoveryWindow
-  /// classifies the failure, then dispatch goes to the ONE branch whose
-  /// precondition holds (web / cross-liver / self-split), falling through to the
-  /// spill-self floor when no pattern matches. A fresh redef that cannot color is
-  /// NOT recursed on — it is re-queued to UncolorableVRegs and retried by the
-  /// caller's worklist fixpoint (no-progress terminal is the honest bottom).
-  /// Returns true if Failed was resolved (colored, or spilled with its reload
-  /// redefs placed).
+  /// Runs a mutation-aware fixpoint in priority order: Web, CrossFileHome,
+  /// CrossLiver, SelfSplit. Any irreversible interference change restarts at Web
+  /// with all predicates recomputed. A complete no-change iteration invokes the
+  /// memory floor exactly once.
   bool recoverUncolorable(Register Failed);
 
-  /// Honest terminal for the classifier's no-pattern floor. Counts the values of
+  /// Honest terminal for a memory floor that cannot place its reload. Counts
+  /// the values of
   /// \p R's register
   /// file live at \p R's def point and compares the total dword count to \p
   /// RPLimit, then report_fatal_error()s with the REAL NUMBERS: either genuine

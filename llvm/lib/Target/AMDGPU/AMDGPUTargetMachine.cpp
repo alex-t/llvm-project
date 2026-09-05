@@ -592,7 +592,6 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPURewriteAGPRCopyMFMALegacyPass(*PR);
   initializeAMDGPURewriteOutArgumentsPass(*PR);
   initializeAMDGPUNextUseAnalysisWrapperPass(*PR);
-  initializeAMDGPUSSARegisterSpillerPass(*PR);
   initializeAMDGPUSSARegisterAllocatorPass(*PR);
   initializeAMDGPUVerifyPhysRegLivenessPass(*PR);
   initializeAMDGPURebuildSSALegacyPass(*PR);

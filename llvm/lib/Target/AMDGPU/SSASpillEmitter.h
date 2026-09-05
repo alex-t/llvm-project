@@ -7,31 +7,31 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// \brief Exec-safe SSA spill/reload EMISSION mechanism, shared by the SSA
-/// spiller pass and the SSA register allocator (coloring).
+/// \brief Exec-safe SSA spill/reload EMISSION mechanism, used by the SSA
+/// register allocator.
 ///
-/// This is NOT a pass. It is the pure "how to spill a value safely" mechanism,
-/// factored out of AMDGPUSSARegisterSpiller so that BOTH the spiller (which
-/// decides what to spill up front, by pressure) AND coloring (which discovers a
-/// value with no free register during assignment) can emit a store-at-def +
-/// dominance-ordered reloads + inline SSA repair, with no EXEC drift.
+/// This is NOT a pass. It is the pure "how to spill a value safely" mechanism:
+/// a store-at-def plus dominance-ordered reloads plus inline SSA repair, with
+/// no EXEC drift. Both the up-front spill planner and coloring (which discovers
+/// a value with no free register during assignment) emit through it.
 ///
-/// Policy — *which* value to spill and *when* — stays with each caller (the
-/// spiller uses NextUseAnalysis + RP tracking; coloring uses a no-free-register
-/// signal). This class owns only the emission machinery and the per-value state
-/// it needs (stack slots, store-at-def memo, reload cache, the SSA updater).
+/// Policy — *which* value to spill and *when* — stays with the caller. This
+/// class owns only the emission machinery and the per-value state it needs
+/// (stack slots, store-at-def memo, reload cache, the SSA updater).
 ///
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_LIB_TARGET_AMDGPU_SSASPILLEMITTER_H
 #define LLVM_LIB_TARGET_AMDGPU_SSASPILLEMITTER_H
 
+#include "GCNRegPressure.h"
 #include "SIInstrInfo.h"
 #include "SIMachineFunctionInfo.h"
 #include "SIRegisterInfo.h"
 #include "VRegMaskPair.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -39,6 +39,7 @@
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include <functional>
 #include <memory>
 
 namespace llvm {
@@ -126,11 +127,27 @@ struct SpillInfo {
 };
 
 /// Exec-safe SSA spill/reload emitter. Construct once per function (it caches
-/// per-function state: stack slots, store-at-def memo). Both the spiller pass
-/// and coloring hold one and call spillOneVMP() to spill a value. Call
-/// beginPass() before each register-file pass to (re)create the SSA updater and
-/// select the file for reload-RP checks.
+/// per-function state: stack slots, store-at-def memo). The allocator holds one
+/// and calls spillOneVMP() to spill a value. Call
+/// beginPass() before each register-file pass to (re)create the SSA updater,
+/// select the file mechanics, and bind the demand oracle for the pool.
 class SSASpillEmitter {
+public:
+  /// The allocator's demand oracle for one register pool: given a live set,
+  /// how many of its values have no placement in that pool. Injected rather
+  /// than reimplemented so spill emission and spill planning share one
+  /// pressure model.
+  using DemandFn = std::function<unsigned(const GCNRPTracker::LiveRegSet &)>;
+
+  /// Pre-emission register residency at caller-supplied instruction sites.
+  /// Exact is false when dominance-sharing between reloads can only be decided
+  /// after earlier reload redefs have been inserted and LiveIntervals recomputed.
+  struct SpillFootprint {
+    SmallPtrSet<const MachineInstr *, 16> ResidentSites;
+    bool Exact = true;
+  };
+
+private:
   // Analyses / target info (borrowed, not owned).
   MachineFunction &MF;
   const SIRegisterInfo *TRI;
@@ -153,21 +170,26 @@ class SSASpillEmitter {
   // Per-spill caches (cleared at the start of each emitReloadsAndRepairSSA).
   DenseMap<std::pair<MachineBasicBlock *, VRegMaskPair>, Register>
       BlockReloadCache;                                // per-block reload dedup
-  DenseMap<MachineBasicBlock *, unsigned> MaxRPCache;  // reload-hoist RP cache
+  // reload-hoist deficiency cache
+  DenseMap<MachineBasicBlock *, unsigned> DeficiencyCache;
 
   // Reload redefs create fresh vregs; callers exclude these from their own spill
   // candidate sets (a reload must not be immediately re-spilled). Written by the
   // emitter, read by policy via reloadedRegs().
   VRegMaskPairSet ReloadedRegs;
 
-  // Current file being spilled (VGPR vs SGPR) — affects reload-RP checks. Set by
-  // beginPass().
+  // Current file being spilled: selects vector vs scalar spill MECHANICS (AGPR
+  // is a vector file, so it too sets this). NOT a pool selector — the pool
+  // lives in PoolDeficiency below. Set by beginPass().
   bool IsVGPRPass = false;
 
-  // RP ceiling for reload-hoist decisions in the current spill. Policy's budget
-  // for the current file, threaded in per spillOneVMP() call (not a member of
-  // this class's concern otherwise). Set at the top of spillOneVMP().
-  unsigned CurRPLimit = 0;
+  // The allocator's width-aware demand oracle, bound to the pool being spilled.
+  // Returns how many live values have no placement in that pool, so non-zero
+  // means a reload put there has nowhere to land. Reload-hoist decisions ask
+  // this instead of comparing a scalar count to a budget: the emitter must ask
+  // the same question the planner does, and its own count charged an AGPR value
+  // against the arch-VGPR total. Set by beginPass().
+  DemandFn PoolDeficiency;
 
   // Set transiently if a reload redef leaves SSA broken; inline repair clears it.
   bool SSAInvalidated = false;
@@ -209,16 +231,21 @@ class SSASpillEmitter {
   std::pair<MachineBasicBlock *, MachineInstr *>
   adjustReloadForLoop(MachineBasicBlock *ReloadBB, MachineInstr *InsertBeforeMI,
                       MachineBasicBlock *KillBB, Register SpilledReg);
-  unsigned getMaxRPForBlock(MachineBasicBlock *MBB);
-  unsigned getMaxRPInBlockDownTo(MachineBasicBlock *MBB, MachineInstr *StopMI);
-  // Max RP (current file) over the same-block span [DefMI, UseMI]; 0 if not same
-  // block. Decides whether a same-block reaching reload spans an RP-tight region.
-  unsigned maxRPBetween(MachineInstr *DefMI, MachineInstr *UseMI);
+  std::pair<MachineBasicBlock *, MachineInstr *>
+  reloadPlacementForUse(MachineInstr *UseMI, MachineBasicBlock *KillBB,
+                        Register SpilledReg);
+  unsigned maxDeficiencyForBlock(MachineBasicBlock *MBB);
+  unsigned maxDeficiencyInBlockDownTo(MachineBasicBlock *MBB,
+                                      MachineInstr *StopMI);
+  // Max deficiency over the same-block span [DefMI, UseMI]; 0 if not same
+  // block. Non-zero means a same-block reaching reload spans a point where the
+  // pool cannot place everything live.
+  unsigned maxDeficiencyBetween(MachineInstr *DefMI, MachineInstr *UseMI);
   // \p SpanLoop, when non-null, is a loop the hoisted reload stays live across
   // on every iteration; blocks inside it are measured in full rather than only
   // down to the first use.
   bool canHoistReloadTo(MachineBasicBlock *NCD, MachineInstr *InsertPoint,
-                        unsigned RPLimit, Register SpilledReg,
+                        Register SpilledReg,
                         const MachineLoop *SpanLoop = nullptr);
   bool walkPathsToUses(
       MachineBasicBlock *StartBB, Register SpilledReg,
@@ -229,11 +256,12 @@ public:
   SSASpillEmitter(MachineFunction &MF, LiveIntervals *LIS, SlotIndexes *Indexes,
                   MachineDominatorTree *DT, const MachineLoopInfo *MLI);
 
-  /// (Re)create the SSA updater and select the file (\p IsVGPR) for reload-RP
-  /// checks. Call before a fresh register-file pass. Does NOT clear the
-  /// store-at-def memo or stack-slot map (those persist per function) nor
-  /// ReloadedRegs (the caller controls that via clearReloadedRegs()).
-  void beginPass(bool IsVGPR);
+  /// (Re)create the SSA updater, select the file mechanics (\p IsVGPR: vector
+  /// vs scalar), and bind \p Demand as the oracle for the pool being spilled.
+  /// Call before a fresh register-file pass. Does NOT clear the store-at-def
+  /// memo or stack-slot map (those persist per function) nor ReloadedRegs (the
+  /// caller controls that via clearReloadedRegs()).
+  void beginPass(bool IsVGPR, DemandFn Demand);
 
   /// Attach the forensic reporter (observer; may be null). Records spill/reload
   /// facts (E14/E15) when set and enabled. Does not take ownership.
@@ -250,8 +278,17 @@ public:
   /// THE primitive both callers use. Spill \p VMP: store at its definition
   /// (EXEC-safe — all lanes captured while EXEC is full), free the register from
   /// \p KillIdx onward, place dominance-ordered reloads at the reachable uses,
-  /// and repair SSA inline. \p RPLimit bounds reload-hoist decisions.
-  void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx, unsigned RPLimit);
+  /// and repair SSA inline. Reload-hoist decisions consult the pool oracle
+  /// bound by beginPass().
+  void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx);
+
+  /// Model which of \p Sites still require register residency after spilling
+  /// \p VMP at \p KillIdx. Store-at-def, loop-adjusted reload placement, and PHI
+  /// predecessor-edge reloads use the same placement helpers as emission.
+  /// Dominance-sharing is conservatively over-approximated because its exact
+  /// frontier is created incrementally by emitted reload redefs.
+  SpillFootprint modelSpillFootprint(VRegMaskPair VMP, SlotIndex KillIdx,
+                                     ArrayRef<MachineInstr *> Sites);
 
   /// In-memory PHI-web coalescing of an ALREADY-CLOSED, feasible web \p Web
   /// (detection, the shared-slot soundness gate, AND the reload-feasibility gate
@@ -269,7 +306,7 @@ public:
   /// correct. No shared color is forced. A sub-register PHI operand is
   /// COPY-extracted to slot width first; that fresh short-lived vreg is colored via
   /// \p ColorFreshVReg (it lives only [copy, store], so a free reg always exists).
-  void spillPhiWeb(const PhiWeb &Web, unsigned RPLimit,
+  void spillPhiWeb(const PhiWeb &Web,
                    llvm::function_ref<void(Register)> ColorFreshVReg);
 
   /// Members erased by the last spillPhiWeb() (for the caller to prune ColorMap).
@@ -281,9 +318,9 @@ public:
   // reloadRPBeforeUse / reloadRPAtBlockEnd moved to the RA (feasibility policy).
 
   /// [Stage 2] Public forwarder to canHoistReloadTo: can \p B's shared reload
-  /// hoist to \p NCD (reload at NCD end) within \p RPLimit on every NCD->use path?
-  bool canHoistReload(MachineBasicBlock *NCD, unsigned RPLimit, Register B) {
-    return canHoistReloadTo(NCD, /*InsertPoint=*/nullptr, RPLimit, B);
+  /// hoist to \p NCD (reload at NCD end) with a placement on every NCD->use path?
+  bool canHoistReload(MachineBasicBlock *NCD, Register B) {
+    return canHoistReloadTo(NCD, /*InsertPoint=*/nullptr, B);
   }
 
   /// After a partial spill leaves \p WideVReg with only its \p RemnantMask lanes

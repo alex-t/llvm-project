@@ -187,7 +187,6 @@ add_llvm_target(AMDGPUCodeGen
   SIShrinkInstructions.cpp
   SIWholeQuadMode.cpp
   AMDGPUNextUseAnalysis.cpp
-  AMDGPUSSARegisterSpiller.cpp
   AMDGPUSSARegisterAllocator.cpp
   SSASpillEmitter.cpp
   SSAForensicReporter.cpp
