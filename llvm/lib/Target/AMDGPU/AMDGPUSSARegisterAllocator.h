@@ -191,7 +191,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// (should not happen for a width-1 reload — point pressure ≤ limit < file).
   bool colorOneInPlace(Register R);
   bool tiedAssignmentsValid() const;
-  void drainUncolorableWorklist(MachineFunction &MF);
+  bool drainUncolorableWorklist(MachineFunction &MF,
+                                bool ReportFailure = true);
 
   /// CSR(CS): the registers this allocation may use for \p RC that \p CallMI
   /// preserves. A call's regmask IS its preserved set, and ISel builds that mask
@@ -224,6 +225,27 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// left MIR, LIS, register classes, and ColorMap unchanged.
   enum class RecoveryResult { Resolved, Changed, NoChange };
 
+  enum class RecoveryState {
+    Entry,
+    Web,
+    CrossFileHome,
+    Blocker,
+    SelfSplit,
+    Floor
+  };
+
+  struct RecoveryFrame {
+    RecoveryState State = RecoveryState::Entry;
+    Register Value;
+    bool valid() const { return Value.isValid(); }
+  };
+
+  struct RecoveryTransition {
+    RecoveryFrame Next;
+    RecoveryFrame Resume;
+    bool valid() const { return Next.valid(); }
+  };
+
   /// Spill a colored blocker B (occupying a physreg P legal for \p Failed) to
   /// free P over \p Failed's range. Two candidate classes, both requiring B live
   /// at F's end with NO use strictly inside (FS,FE) (so B's reload lands past FE
@@ -235,8 +257,10 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   ///    back in \p Remnant -> Changed.
   /// Multi-candidate pick = COVERAGE: live-through (frees all of F) beats
   /// born-in-F; among born-in-F the earliest def frees the longest tail. Returns
-  /// NoChange if no clean candidate exists.
-  RecoveryResult spillBlocker(Register Failed, Register &Remnant);
+  /// an unchanged-state transition when a blocking PHI web must be processed by
+  /// the Web state first. Returns NoChange if no clean candidate exists.
+  RecoveryResult spillBlocker(Register Failed, Register &Remnant,
+                              RecoveryTransition &Transition);
 
   /// Close the PHI web seeded by \p Seed (a PHI result, or a PHI operand feeding
   /// one). Bidirectional closure over PHI operand/result edges, then the
@@ -511,8 +535,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// Build a cumulative non-emitting spill set over copies of \p Slots. Area
   /// orders the search; demandDeficiency remeasurement is authoritative. PHI
   /// webs are excluded until their multi-value footprint can be modeled as one
-  /// atomic unit. Returns false without actions unless the virtual set reaches
-  /// zero total deficiency.
+  /// atomic unit. Returns false when no candidate improves virtual deficiency.
+  /// Recovery-only experiments retain at most one candidate per region.
   bool planAreaSpillSet(const TightRegion &R, ArrayRef<RegionSlot> Slots,
                         ArrayRef<SpillCandidateInput> Inputs,
                         unsigned RecolorBudget,

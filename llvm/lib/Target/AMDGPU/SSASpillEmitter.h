@@ -31,6 +31,7 @@
 #include "VRegMaskPair.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/CodeGen/LiveIntervals.h"
@@ -143,7 +144,7 @@ public:
   /// Exact is false when dominance-sharing between reloads can only be decided
   /// after earlier reload redefs have been inserted and LiveIntervals recomputed.
   struct SpillFootprint {
-    SmallPtrSet<const MachineInstr *, 16> ResidentSites;
+    SmallBitVector ResidentSlots;
     bool Exact = true;
   };
 
@@ -167,11 +168,22 @@ private:
   DenseMap<VRegMaskPair, int> Virt2StackSlotMap;      // value -> stack slot
   DenseMap<VRegMaskPair, MachineInstr *> StoredAtDefinition; // store-at-def memo
 
+  struct FootprintUseAnalysis {
+    SmallVector<DomGroup, 4> Groups;
+    SmallVector<MachineInstr *, 4> PhiUses;
+  };
+  DenseMap<std::pair<MachineInstr *, VRegMaskPair>, FootprintUseAnalysis>
+      FootprintUseCache;
+
   // Per-spill caches (cleared at the start of each emitReloadsAndRepairSSA).
   DenseMap<std::pair<MachineBasicBlock *, VRegMaskPair>, Register>
       BlockReloadCache;                                // per-block reload dedup
   // reload-hoist deficiency cache
   DenseMap<MachineBasicBlock *, unsigned> DeficiencyCache;
+
+  void invalidateFootprintUseCache() { FootprintUseCache.clear(); }
+  const FootprintUseAnalysis &
+  getFootprintUseAnalysis(VRegMaskPair VMP, SlotIndex KillIdx);
 
   // Reload redefs create fresh vregs; callers exclude these from their own spill
   // candidate sets (a reload must not be immediately re-spilled). Written by the
@@ -190,6 +202,7 @@ private:
   // the same question the planner does, and its own count charged an AGPR value
   // against the arch-VGPR total. Set by beginPass().
   DemandFn PoolDeficiency;
+  bool ReloadEveryUse = false;
 
   // Set transiently if a reload redef leaves SSA broken; inline repair clears it.
   bool SSAInvalidated = false;
@@ -219,6 +232,8 @@ private:
   MachineInstr *spillAtDefinition(VRegMaskPair VMP);
   int assignVirt2StackSlot(VRegMaskPair VMP);
   int createSpillSlot(const TargetRegisterClass *RC);
+  void buildDomGroups(ArrayRef<MachineInstr *> Uses,
+                      SmallVectorImpl<DomGroup> &Groups);
   void buildDomGroupsForSpill(SpillInfo &Info);
   void emitReloadsAndRepairSSA(SpillInfo &Info);
   std::pair<Register, MachineInstr *>
@@ -247,6 +262,7 @@ private:
   bool canHoistReloadTo(MachineBasicBlock *NCD, MachineInstr *InsertPoint,
                         Register SpilledReg,
                         const MachineLoop *SpanLoop = nullptr);
+  bool ordinaryVALUUseIsExecSafe(MachineInstr *UseMI) const;
   bool walkPathsToUses(
       MachineBasicBlock *StartBB, Register SpilledReg,
       llvm::function_ref<bool(MachineBasicBlock *, MachineInstr *)> IsBad,
@@ -262,6 +278,7 @@ public:
   /// memo or stack-slot map (those persist per function) nor ReloadedRegs (the
   /// caller controls that via clearReloadedRegs()).
   void beginPass(bool IsVGPR, DemandFn Demand);
+  void setReloadEveryUse(bool Enable) { ReloadEveryUse = Enable; }
 
   /// Attach the forensic reporter (observer; may be null). Records spill/reload
   /// facts (E14/E15) when set and enabled. Does not take ownership.
@@ -275,6 +292,11 @@ public:
     return getEffectiveKillBB(SpillBB);
   }
 
+  /// Return true when the store-at-def and every ordinary reload-before-use
+  /// position are legal. PHI-edge reloads are exempt from the EXEC-stability
+  /// rule because each predecessor executes under that edge's lane mask.
+  bool canSpill(VRegMaskPair VMP) const;
+
   /// THE primitive both callers use. Spill \p VMP: store at its definition
   /// (EXEC-safe — all lanes captured while EXEC is full), free the register from
   /// \p KillIdx onward, place dominance-ordered reloads at the reachable uses,
@@ -282,12 +304,14 @@ public:
   /// bound by beginPass().
   void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx);
 
-  /// Model which of \p Sites still require register residency after spilling
-  /// \p VMP at \p KillIdx. Store-at-def, loop-adjusted reload placement, and PHI
-  /// predecessor-edge reloads use the same placement helpers as emission.
+  /// Model which of \p Sites in the block-local \p RegionBB still require
+  /// register residency after spilling \p VMP at \p KillIdx. Store-at-def,
+  /// loop-adjusted reload placement, and PHI predecessor-edge reloads use the
+  /// same placement helpers as emission.
   /// Dominance-sharing is conservatively over-approximated because its exact
   /// frontier is created incrementally by emitted reload redefs.
   SpillFootprint modelSpillFootprint(VRegMaskPair VMP, SlotIndex KillIdx,
+                                     MachineBasicBlock *RegionBB,
                                      ArrayRef<MachineInstr *> Sites);
 
   /// In-memory PHI-web coalescing of an ALREADY-CLOSED, feasible web \p Web
@@ -340,7 +364,8 @@ public:
   /// SplitPt, so coloring may place them in different physregs (reopening an
   /// aligned through-lane mid-life). Stays in SSA, so the interference graph
   /// stays chordal. Returns %new, or a null Register if nothing was redirected
-  /// (dead copy removed). \p SplitPt must be a non-PHI, mid-block position.
+  /// (dead copy removed). A prologue or terminator-sequence anchor is clamped to
+  /// the nearest legal block-body boundary.
   Register splitLiveRangeAt(Register V, MachineBasicBlock::iterator SplitPt);
 
   /// Reload vregs created so far (fresh names from SSA repair). Policy layers

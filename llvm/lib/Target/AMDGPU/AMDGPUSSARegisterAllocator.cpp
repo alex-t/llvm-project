@@ -8,6 +8,7 @@
 
 #include "AMDGPUSSARegisterAllocator.h"
 #include "AMDGPU.h"
+#include "AMDGPURegAllocInsertion.h"
 #include "GCNRegPressure.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
@@ -72,6 +73,11 @@ static cl::opt<bool> EnableBlockDemandDump(
              "class width and allocation stride, beside the lane-accurate "
              "pressure and the whole-block dword sum. Sizes the width-aware "
              "region gate; delete together with it."));
+
+static cl::opt<bool> RecoveryOnly(
+    "amdgpu-ssa-recovery-only", cl::Hidden, cl::init(false),
+    cl::desc("Run recovery first, then one cheap spill-planning pass for "
+             "remaining coloring failures"));
 
 // Step-0 PHI-copy metric (see PHI_Coalescer design section 9). Counted at the
 // copy-vs-fixed-point decision in lowerPHIs(); pure instrumentation, no MIR
@@ -1839,6 +1845,11 @@ bool AMDGPUSSARegisterAllocator::relieveTightRegion(
                         &VirtualShort))
     return false;
 
+  for (const AreaSpillAction &A : Actions)
+    if (A.Kind == AreaSpillAction::Memory &&
+        !Emitter->canSpill(VRegMaskPair(A.V, A.Lanes)))
+      return false;
+
   for (const AreaSpillAction &A : Actions) {
     if (A.Kind == AreaSpillAction::Recolor) {
       const TargetRegisterClass *AGPR =
@@ -1970,9 +1981,70 @@ bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
     AreaSpillAction Action;
     SmallVector<unsigned, 16> FreedSlots;
   };
+
+  DenseMap<Register, unsigned> DirectIndex;
+  SmallVector<SmallBitVector, 32> DirectLiveSlots;
+  SmallVector<SmallBitVector, 32> DirectResidentSlots;
+  if (RecoveryOnly) {
+    for (unsigned I = 0; I != Inputs.size(); ++I) {
+      DirectIndex.try_emplace(Inputs[I].V, I);
+      DirectLiveSlots.emplace_back(Slots.size());
+      DirectResidentSlots.emplace_back(Slots.size());
+    }
+
+    for (unsigned S = 0; S != Slots.size(); ++S) {
+      for (unsigned I = 0; I != Inputs.size(); ++I)
+        if (Slots[S].Live.count(Inputs[I].V.id()))
+          DirectLiveSlots[I].set(S);
+
+      for (const MachineOperand &MO : Slots[S].MI->operands()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        auto It = DirectIndex.find(MO.getReg());
+        if (It == DirectIndex.end())
+          continue;
+        if ((VRegMaskPair(MO, TRI, MRI).getLaneMask() &
+             Inputs[It->second].Lanes)
+                .any())
+          DirectResidentSlots[It->second].set(S);
+      }
+    }
+
+    auto FirstTerm = R.MBB->getFirstTerminator();
+    if (FirstTerm != R.MBB->end()) {
+      SmallBitVector PhiEdgeSlots(Slots.size());
+      SlotIndex FirstTermIdx =
+          LIS->getInstructionIndex(*FirstTerm).getRegSlot();
+      for (unsigned S = 0; S != Slots.size(); ++S)
+        if (LIS->getInstructionIndex(*Slots[S].MI).getRegSlot() >=
+            FirstTermIdx)
+          PhiEdgeSlots.set(S);
+
+      for (MachineBasicBlock *Succ : R.MBB->successors())
+        for (const MachineInstr &Phi : *Succ) {
+          if (!Phi.isPHI())
+            break;
+          for (unsigned I = 1, E = Phi.getNumOperands(); I + 1 < E; I += 2) {
+            const MachineOperand &Val = Phi.getOperand(I);
+            if (!Val.isReg() || !Val.getReg().isVirtual() ||
+                Phi.getOperand(I + 1).getMBB() != R.MBB)
+              continue;
+            auto It = DirectIndex.find(Val.getReg());
+            if (It == DirectIndex.end())
+              continue;
+            if ((VRegMaskPair(Val, TRI, MRI).getLaneMask() &
+                 Inputs[It->second].Lanes)
+                    .any())
+              DirectResidentSlots[It->second] |= PhiEdgeSlots;
+          }
+        }
+    }
+  }
+
   SmallVector<MachineInstr *, 32> Sites;
-  for (const RegionSlot &S : Slots)
-    Sites.push_back(S.MI);
+  if (!RecoveryOnly)
+    for (const RegionSlot &S : Slots)
+      Sites.push_back(S.MI);
 
   SmallVector<Candidate, 32> Candidates;
   for (const SpillCandidateInput &I : Inputs) {
@@ -1989,16 +2061,26 @@ bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
     Candidate C;
     C.Action.V = I.V;
     C.Action.Lanes = I.Lanes;
-    SpillCost SC = costOfSpilling(I.V, R, I.Lanes);
-    C.Action.Cost = SC.Cost;
-    SSASpillEmitter::SpillFootprint Footprint =
-        Emitter->modelSpillFootprint(VRegMaskPair(I.V, I.Lanes),
-                                     LIS->getInterval(I.V).beginIndex(), Sites);
-    C.Action.FootprintExact = Footprint.Exact;
-    for (unsigned S = 0; S != Slots.size(); ++S)
-      if (Slots[S].Live.count(I.V.id()) &&
-          !Footprint.ResidentSites.count(Slots[S].MI))
+    if (!RecoveryOnly)
+      C.Action.Cost = costOfSpilling(I.V, R, I.Lanes).Cost;
+    if (RecoveryOnly) {
+      unsigned INo = DirectIndex.lookup(I.V);
+      SmallBitVector Freed = DirectLiveSlots[INo];
+      Freed.reset(DirectResidentSlots[INo]);
+      for (int S = Freed.find_first(); S >= 0; S = Freed.find_next(S))
         C.FreedSlots.push_back(S);
+      C.Action.FootprintExact = true;
+    } else {
+      SSASpillEmitter::SpillFootprint Footprint =
+          Emitter->modelSpillFootprint(VRegMaskPair(I.V, I.Lanes),
+                                       LIS->getInterval(I.V).beginIndex(),
+                                       R.MBB, Sites);
+      C.Action.FootprintExact = Footprint.Exact;
+      for (unsigned S = 0; S != Slots.size(); ++S)
+        if (Slots[S].Live.count(I.V.id()) &&
+            !Footprint.ResidentSlots.test(S))
+          C.FreedSlots.push_back(S);
+    }
     C.Action.Area = uint64_t(Width) * C.FreedSlots.size();
     if (C.Action.Area)
       Candidates.push_back(std::move(C));
@@ -2089,6 +2171,8 @@ bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
                       << " footprint="
                       << (Cand.Action.FootprintExact ? "exact" : "conservative")
                       << "\n");
+    if (RecoveryOnly)
+      break;
   }
 
   Actions.resize(BestSize);
@@ -2208,6 +2292,13 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
                           &VirtualShort))
       continue;
 
+    bool Legal = llvm::all_of(Actions, [&](const AreaSpillAction &A) {
+      return A.Kind != AreaSpillAction::Memory ||
+             Emitter->canSpill(VRegMaskPair(A.V, A.Lanes));
+    });
+    if (!Legal)
+      continue;
+
     for (const AreaSpillAction &A : Actions) {
       assert(A.Kind == AreaSpillAction::Memory &&
              "post-color planner cannot recolor");
@@ -2310,6 +2401,22 @@ PhiWeb AMDGPUSSARegisterAllocator::closePhiWeb(Register Seed) const {
     return Web;
   }
 
+  // Every non-undef ground value must be storable after its definition without
+  // entering the block's terminator sequence. Decline before spillPhiWeb makes
+  // any mutation when a legal store position does not exist.
+  for (Register G : Web.GroundOps) {
+    MachineInstr *DefMI = MRI->getUniqueVRegDef(G);
+    if (DefMI && !DefMI->isImplicitDef() &&
+        !AMDGPURegAllocInsertion::legalAfter(*DefMI)) {
+      LLVM_DEBUG(dbgs() << "closePhiWeb(): DECLINE root "
+                        << printReg(Web.Root, TRI) << " — ground "
+                        << printReg(G, TRI)
+                        << " is defined in a terminator sequence\n");
+      Web.Root = Register();
+      return Web;
+    }
+  }
+
   // SOUNDNESS GATE (option 2): all ground ops of the web share ONE stack slot. That
   // is only correct if no two of them are ever SIMULTANEOUSLY LIVE — i.e. the PHIs
   // are copy-less control-flow merges where exactly one incoming value reaches the
@@ -2343,7 +2450,8 @@ PhiWeb AMDGPUSSARegisterAllocator::closePhiWeb(Register Seed) const {
 
 AMDGPUSSARegisterAllocator::RecoveryResult
 AMDGPUSSARegisterAllocator::spillBlocker(Register Failed,
-                                         Register &Remnant) {
+                                         Register &Remnant,
+                                         RecoveryTransition &Transition) {
   SSARA_TRACE();
   const TargetRegisterClass *RC = MRI->getRegClass(Failed);
   const LiveInterval &FI = LIS->getInterval(Failed);
@@ -2360,16 +2468,36 @@ AMDGPUSSARegisterAllocator::spillBlocker(Register Failed,
   BitVector OccupiedUnits;
   scanOverlappersForVI(FI, OccupiedUnits, &Overlappers);
 
+  PhiWeb WebBlocker;
   SmallVector<std::tuple<Register, MCRegister, bool>, 4> Cands; // (B, P, liveThru)
   unsigned NOverlap = 0, NClean = 0;
   for (const auto &[B, P] : Overlappers) {
     if (B == Failed || RecoverySpilledVRegs.count(B))
       continue;
+
+    const LiveInterval &BI = LIS->getInterval(B);
+
+    // A wider PHI-web tuple can block a narrower Failed value even though their
+    // register classes have no common subclass. Redirect a live-through web to
+    // the Web state when its tuple overlaps a register legal for Failed.
+    bool BlocksFailed = false;
+    for (MCRegister FP : RegClassInfo.getOrder(RC))
+      if (TRI->regsOverlap(P, FP)) {
+        BlocksFailed = true;
+        break;
+      }
+    if (BlocksFailed && BI.liveAt(FS) && BI.liveAt(FE.getPrevSlot())) {
+      PhiWeb Web = closePhiWeb(B);
+      if (Web.valid() &&
+          (!WebBlocker.valid() ||
+           Web.Root.id() < WebBlocker.Root.id()))
+        WebBlocker = std::move(Web);
+    }
+
     // Same file: freeing P must open a Failed-legal register.
     const TargetRegisterClass *PRC = TRI->getPhysRegBaseClass(P);
     if (!TRI->getCommonSubClass(RC, PRC))
       continue;
-    const LiveInterval &BI = LIS->getInterval(B);
     ++NOverlap;
     // Live at F's end covers BOTH classes (live-through: liveAt(FS)&&liveAt(FE);
     // born-in-F: B.end>FE => liveAt(FE.prev)).
@@ -2393,6 +2521,9 @@ AMDGPUSSARegisterAllocator::spillBlocker(Register Failed,
     }
     if (UsedInside)
       continue;
+    if (!Emitter->canSpill(
+            VRegMaskPair(B, MRI->getMaxLaneMaskForVReg(B))))
+      continue;
     ++NClean;
     Cands.emplace_back(B, P, BI.liveAt(FS));
   }
@@ -2401,6 +2532,14 @@ AMDGPUSSARegisterAllocator::spillBlocker(Register Failed,
                     << FS << "," << FE << ") candidates: overlap=" << NOverlap
                     << " clean=" << NClean << "\n");
 
+  if (Cands.empty() && WebBlocker.valid()) {
+    LLVM_DEBUG(dbgs() << "  spill-blocker: transition to Web for "
+                      << printReg(WebBlocker.Root, TRI) << ", then resume "
+                      << printReg(Failed, TRI) << "\n");
+    Transition.Next = {RecoveryState::Web, WebBlocker.Root};
+    Transition.Resume = {RecoveryState::Blocker, Failed};
+    return RecoveryResult::NoChange;
+  }
   if (Cands.empty())
     return RecoveryResult::NoChange;
 
@@ -2646,18 +2785,24 @@ bool AMDGPUSSARegisterAllocator::splitWouldRedirect(
   SSARA_TRACE();
   if (!LIS->hasInterval(V))
     return false;
+  MachineBasicBlock &MBB = *SplitMI->getParent();
+  auto LegalPos =
+      AMDGPURegAllocInsertion::legalBefore(MBB, SplitMI->getIterator());
+  if (LegalPos == MBB.end())
+    return false;
+  MachineInstr *LegalAnchor = &*LegalPos;
   const LiveInterval &LI = LIS->getInterval(V);
-  SlotIndex SplitSlot = LIS->getInstructionIndex(*SplitMI).getRegSlot();
+  SlotIndex SplitSlot = LIS->getInstructionIndex(*LegalAnchor).getRegSlot();
   VNInfo *SrcVNI = LI.getVNInfoBefore(SplitSlot);
   if (!SrcVNI)
     return false;
 
-  // Match SSASpillEmitter::splitLiveRangeAt exactly. Its COPY is inserted
-  // immediately before SplitMI, so SplitMI and the COPY dominate the same uses.
+  // Match SSASpillEmitter::splitLiveRangeAt exactly. A requested prologue or
+  // terminator-sequence position is first clamped into the legal block body.
   for (const MachineOperand &MO : MRI->use_operands(V)) {
     const MachineInstr *UseMI = MO.getParent();
     if (UseMI->isDebugInstr() || isSpillInstr(UseMI) ||
-        !MDT->dominates(SplitMI, UseMI))
+        !MDT->dominates(LegalAnchor, UseMI))
       continue;
     SlotIndex UseSlot = LIS->getInstructionIndex(*UseMI).getRegSlot();
     if (LI.getVNInfoBefore(UseSlot) == SrcVNI)
@@ -2883,6 +3028,14 @@ AMDGPUSSARegisterAllocator::tryCrossFileHome(Register R) {
         NeedsCopy.push_back(&MO);
     }
 
+    std::optional<MachineBasicBlock::iterator> SplitDefInsert;
+    if (SplitDef) {
+      SplitDefInsert =
+          AMDGPURegAllocInsertion::legalAfter(*SplitDef->getParent());
+      if (!SplitDefInsert)
+        return false;
+    }
+
     const TargetRegisterClass *SavedRC = RC;
     MRI->setRegClass(V, Home);
     if (!colorOneInPlace(V)) {
@@ -2895,7 +3048,7 @@ AMDGPUSSARegisterAllocator::tryCrossFileHome(Register R) {
       Register Tmp = MRI->createVirtualRegister(SavedRC);
       SplitDef->setReg(Tmp);
       MachineInstr *Copy =
-          BuildMI(*DefMI->getParent(), std::next(DefMI->getIterator()),
+          BuildMI(*DefMI->getParent(), *SplitDefInsert,
                   DefMI->getDebugLoc(), TII->get(TargetOpcode::COPY), V)
               .addReg(Tmp);
       LIS->InsertMachineInstrInMaps(*Copy);
@@ -2908,8 +3061,10 @@ AMDGPUSSARegisterAllocator::tryCrossFileHome(Register R) {
     for (MachineOperand *MO : NeedsCopy) {
       MachineInstr *MI = MO->getParent();
       Register Tmp = MRI->createVirtualRegister(SavedRC);
+      auto InsertPt = AMDGPURegAllocInsertion::legalBefore(
+          *MI->getParent(), MI->getIterator());
       MachineInstr *Copy =
-          BuildMI(*MI->getParent(), MI, MI->getDebugLoc(),
+          BuildMI(*MI->getParent(), InsertPt, MI->getDebugLoc(),
                   TII->get(TargetOpcode::COPY), Tmp)
               .addReg(V);
       LIS->InsertMachineInstrInMaps(*Copy);
@@ -3060,16 +3215,12 @@ void AMDGPUSSARegisterAllocator::reportPointOverPressure(Register R,
 
 bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
   SSARA_TRACE();
-  // Mutation-aware recovery fixpoint. Each irreversible interference change
-  // restarts at Web, so every later predicate observes current MIR/LIS/ColorMap.
+  // Explicit recovery FSM. Each irreversible interference change transitions
+  // back to Web so every later predicate observes current MIR/LIS/ColorMap.
   // Termination comes from monotone strategy-local measures: a web is erased
   // once, a value is re-homed at most once, a blocker is spilled at most once,
   // and SelfSplit hands back a strictly shorter remnant.
-  const TargetRegisterClass *RC = MRI->getRegClass(Failed);
-  bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
   const MachineFunction &MF = MRI->getMF();
-  unsigned RPLimit = allocatablePool(
-      const_cast<MachineFunction &>(MF), IsVGPR ? RegFile::VGPR : RegFile::SGPR);
 
   LLVM_DEBUG(dbgs() << "FALLBACK for " << printReg(Failed, TRI) << " ["
                     << LIS->getInterval(Failed).beginIndex() << ","
@@ -3091,14 +3242,38 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
                : 0u;
   };
 
-  Register Cur = Failed;
-  bool Changed = true;
-  while (Changed) {
-    Changed = false;
+  RecoveryFrame Current{RecoveryState::Entry, Failed};
+  SmallVector<RecoveryFrame, 2> Continuations;
+  auto CompleteCurrent = [&]() {
+    if (Continuations.empty())
+      return true;
+    Current = Continuations.pop_back_val();
+    return false;
+  };
+  auto Dispatch = [&](const RecoveryTransition &Transition) {
+    assert(Transition.valid() && "recovery transition requires a target");
+    if (Transition.Resume.valid())
+      Continuations.push_back(Transition.Resume);
+    Current = Transition.Next;
+  };
 
-    // 1. Web.
-    if (PhiWeb Web = closePhiWeb(Cur); Web.valid()) {
-      Emitter->beginPass(IsVGPR, demandFor(poolOf(MRI->getRegClass(Cur))));
+  while (true) {
+    Register Cur = Current.Value;
+    switch (Current.State) {
+    case RecoveryState::Entry:
+      Current.State = RecoveryState::Web;
+      [[fallthrough]];
+
+    case RecoveryState::Web: {
+      PhiWeb Web = closePhiWeb(Cur);
+      if (!Web.valid()) {
+        Current.State = RecoveryState::CrossFileHome;
+        continue;
+      }
+
+      const TargetRegisterClass *RC = MRI->getRegClass(Cur);
+      bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+      Emitter->beginPass(IsVGPR, demandFor(poolOf(RC)));
       auto CFV = [&](Register C) {
         if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
           colorOneInPlace(C);
@@ -3110,81 +3285,116 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
         ColorInPlace(G);
       for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
         ColorInPlace(VMP.getVReg());
-      return true;
-    }
-
-    // 2. Generalized, direction-neutral CrossFileHome.
-    RecoveryResult Home = tryCrossFileHome(Cur);
-    if (Home == RecoveryResult::Resolved)
-      return true;
-    if (Home == RecoveryResult::Changed) {
-      Changed = true;
+      if (CompleteCurrent())
+        return true;
       continue;
     }
-    assert(Home == RecoveryResult::NoChange);
 
-    // 3. CrossLiver/spillBlocker.
-    Register Remnant;
-    RecoveryResult Blocker = spillBlocker(Cur, Remnant);
-    if (Blocker == RecoveryResult::Resolved) {
-      if (SSAForensicReporter::enabled())
-        Reporter->transformation("spill-blocker", Cur.virtRegIndex());
-      return true;
-    }
-    if (Blocker == RecoveryResult::Changed) {
-      assert(Remnant && "changed blocker spill must return a remnant");
-      if (SSAForensicReporter::enabled())
-        Reporter->transformation("spill-blocker", Cur.virtRegIndex());
-      Cur = Remnant;
-      Changed = true;
+    case RecoveryState::CrossFileHome: {
+      RecoveryResult Home = tryCrossFileHome(Cur);
+      if (Home == RecoveryResult::Resolved) {
+        if (CompleteCurrent())
+          return true;
+        continue;
+      }
+      if (Home == RecoveryResult::Changed) {
+        Current.State = RecoveryState::Entry;
+        continue;
+      }
+      assert(Home == RecoveryResult::NoChange);
+      Current.State = RecoveryState::Blocker;
       continue;
     }
-    assert(Blocker == RecoveryResult::NoChange);
 
-    // 4. SelfSplit.
-    const unsigned LenBefore = CurLen(Cur);
-    Remnant = Register();
-    RecoveryResult Split =
-        trySelfSplitColor(Cur, MCRegister(), SlotIndex(), Remnant);
-    if (Split == RecoveryResult::Resolved) {
-      if (SSAForensicReporter::enabled())
-        Reporter->transformation("self-split", Cur.virtRegIndex());
-      return true;
-    }
-    if (Split == RecoveryResult::Changed) {
-      assert(Remnant && CurLen(Remnant) < LenBefore &&
-             "changed SelfSplit must return a strictly shorter remnant");
-      Cur = Remnant;
-      Changed = true;
+    case RecoveryState::Blocker: {
+      Register Remnant;
+      RecoveryTransition Transition;
+      RecoveryResult Blocker = spillBlocker(Cur, Remnant, Transition);
+      if (Transition.valid()) {
+        Dispatch(Transition);
+        continue;
+      }
+      if (Blocker == RecoveryResult::Resolved) {
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("spill-blocker", Cur.virtRegIndex());
+        if (CompleteCurrent())
+          return true;
+        continue;
+      }
+      if (Blocker == RecoveryResult::Changed) {
+        assert(Remnant && "changed blocker spill must return a remnant");
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("spill-blocker", Cur.virtRegIndex());
+        Current = {RecoveryState::Entry, Remnant};
+        continue;
+      }
+      assert(Blocker == RecoveryResult::NoChange);
+      Current.State = RecoveryState::SelfSplit;
       continue;
     }
-    assert(Split == RecoveryResult::NoChange);
+
+    case RecoveryState::SelfSplit: {
+      const unsigned LenBefore = CurLen(Cur);
+      Register Remnant;
+      RecoveryResult Split =
+          trySelfSplitColor(Cur, MCRegister(), SlotIndex(), Remnant);
+      if (Split == RecoveryResult::Resolved) {
+        if (SSAForensicReporter::enabled())
+          Reporter->transformation("self-split", Cur.virtRegIndex());
+        if (CompleteCurrent())
+          return true;
+        continue;
+      }
+      if (Split == RecoveryResult::Changed) {
+        assert(Remnant && CurLen(Remnant) < LenBefore &&
+               "changed SelfSplit must return a strictly shorter remnant");
+        Current = {RecoveryState::Entry, Remnant};
+        continue;
+      }
+      assert(Split == RecoveryResult::NoChange);
+      Current.State = RecoveryState::Floor;
+      continue;
+    }
+
+    case RecoveryState::Floor: {
+      const TargetRegisterClass *RC = MRI->getRegClass(Cur);
+      bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+      unsigned RPLimit = allocatablePool(
+          const_cast<MachineFunction &>(MF),
+          IsVGPR ? RegFile::VGPR : RegFile::SGPR);
+      VRegMaskPair SpillVMP(Cur, MRI->getMaxLaneMaskForVReg(Cur));
+      if (!Emitter->canSpill(SpillVMP)) {
+        LLVM_DEBUG(dbgs() << "  spill-self floor: no legal insertion plan for "
+                          << printReg(Cur, TRI) << "\n");
+        return false;
+      }
+      if (!RecoverySpilledVRegs.insert(Cur).second)
+        reportPointOverPressure(Cur, IsVGPR, RPLimit, "re-spill-blocked");
+
+      LLVM_DEBUG(dbgs() << "  spill-self floor\n");
+      Emitter->beginPass(IsVGPR, demandFor(poolOf(RC)));
+      MachineInstr *DefMI = MRI->getVRegDef(Cur);
+      assert(DefMI && "uncolorable value must have a def in SSA");
+      SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
+      if (SSAForensicReporter::enabled())
+        Reporter->transformation("memory-spill", Cur.virtRegIndex());
+      Emitter->spillOneVMP(SpillVMP, KillIdx);
+      SmallVector<Register, 8> Redefs;
+      for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
+        Redefs.push_back(VMP.getVReg());
+      ColorInPlace(Cur);
+      for (Register RD : Redefs)
+        ColorInPlace(RD);
+      if (CompleteCurrent())
+        return true;
+      continue;
+    }
+    }
   }
-
-  // MemoryFloor: exactly one invocation after a complete no-change iteration.
-  if (!RecoverySpilledVRegs.insert(Cur).second)
-    reportPointOverPressure(Cur, IsVGPR, RPLimit, "re-spill-blocked");
-
-  LLVM_DEBUG(dbgs() << "  spill-self floor\n");
-  Emitter->beginPass(IsVGPR, demandFor(poolOf(MRI->getRegClass(Cur))));
-  MachineInstr *DefMI = MRI->getVRegDef(Cur);
-  assert(DefMI && "uncolorable value must have a def in SSA");
-  SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
-  if (SSAForensicReporter::enabled())
-    Reporter->transformation("memory-spill", Cur.virtRegIndex());
-  Emitter->spillOneVMP(VRegMaskPair(Cur, MRI->getMaxLaneMaskForVReg(Cur)),
-                       KillIdx);
-  SmallVector<Register, 8> Redefs;
-  for (const VRegMaskPair &VMP : Emitter->reloadedRegs())
-    Redefs.push_back(VMP.getVReg());
-  ColorInPlace(Cur);
-  for (Register RD : Redefs)
-    ColorInPlace(RD);
-  return true;
 }
 
-void AMDGPUSSARegisterAllocator::drainUncolorableWorklist(
-    MachineFunction &MF) {
+bool AMDGPUSSARegisterAllocator::drainUncolorableWorklist(
+    MachineFunction &MF, bool ReportFailure) {
   SSARA_TRACE();
   auto Colored = [&](Register R) { return ColorMap.count(R) != 0; };
   auto Skip = [&](Register R) {
@@ -3199,6 +3409,8 @@ void AMDGPUSSARegisterAllocator::drainUncolorableWorklist(
     if (Colored(Failed)) {
       Progress = true;
     } else if (!Skip(Failed)) {
+      if (!ReportFailure && RecoverySpilledVRegs.count(Failed))
+        return false;
       recoverUncolorable(Failed);
       if (Colored(Failed))
         Progress = true;
@@ -3215,12 +3427,15 @@ void AMDGPUSSARegisterAllocator::drainUncolorableWorklist(
     Register R = UncolorableVRegs[I];
     if (Colored(R) || Skip(R))
       continue;
+    if (!ReportFailure)
+      return false;
     const TargetRegisterClass *RC = MRI->getRegClass(R);
     bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
     unsigned RPLimit =
         allocatablePool(MF, IsVGPR ? RegFile::VGPR : RegFile::SGPR);
     reportPointOverPressure(R, IsVGPR, RPLimit, "worklist-drained");
   }
+  return true;
 }
 
 // A call destroys a register unless its regmask preserves it and the call does
@@ -3416,10 +3631,15 @@ void AMDGPUSSARegisterAllocator::preassignValuesLiveAcrossCalls() {
         }
         LLVM_DEBUG(dbgs() << "  " << printReg(V, TRI) << " -> spill across\n");
         Emitter->beginPass(IsVGPR, demandFor(poolOf(MRI->getRegClass(V))));
+        VRegMaskPair SpillVMP(V, MRI->getMaxLaneMaskForVReg(V));
+        if (!Emitter->canSpill(SpillVMP)) {
+          LLVM_DEBUG(dbgs() << "  " << printReg(V, TRI)
+                            << " -> no legal spill insertion plan\n");
+          continue;
+        }
         if (SSAForensicReporter::enabled())
           Reporter->transformation("across-call-spill", V.virtRegIndex());
-        Emitter->spillOneVMP(VRegMaskPair(V, MRI->getMaxLaneMaskForVReg(V)),
-                             S.CS);
+        Emitter->spillOneVMP(SpillVMP, S.CS);
         Changed = true;
       }
     }
@@ -4295,6 +4515,7 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
   SSARA_TRACE();
   if (Copies.empty())
     return;
+  InsertPt = AMDGPURegAllocInsertion::legalBefore(MBB, InsertPt);
 
   // Decompose every copy wider than one dword into per-dword (src.subK ->
   // dst.subK) copies BEFORE building the dependence map. DstToSrc/SrcRefCount
@@ -4691,7 +4912,7 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
 
       LLVM_DEBUG(dbgs() << "  Edge " << printMBBReference(*InsertMBB) << " -> "
                         << printMBBReference(MBB) << ":\n");
-      auto InsertPt = InsertMBB->getFirstTerminator();
+      auto InsertPt = AMDGPURegAllocInsertion::bodyEnd(*InsertMBB);
       // Materialize undef edges (null source) as IMPLICIT_DEF of DstPhys and
       // drop them; the remainder are real copies handed to resolvePermutation.
       for (auto *It = Copies.begin(); It != Copies.end();) {
@@ -5414,6 +5635,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
   Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT, MLI);
   Emitter->setReporter(Reporter.get());
+  Emitter->setReloadEveryUse(RecoveryOnly);
 
   // Erase fully-DEAD IMPLICIT_DEFs (def-only vreg, zero uses) before coloring.
   // Such an instruction produces no value, but if left in it is still colored to a
@@ -5481,7 +5703,8 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // re-anchors it per block. No-op / not built unless the flag AND a forensic
   // sink are on.
   setupShadowTree();
-  preSpillToLimitWidthAware(MF);
+  if (!RecoveryOnly)
+    preSpillToLimitWidthAware(MF);
   color();
 
   // [Stage 3] Region RP-reduction: do our BEST-EFFORT spill-across to drop the
@@ -5501,7 +5724,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // sees RP > Limit at its range and spills a live-through across it. Loop until
   // no uncolorables remain, or a pass performs no spill (genuine residual for the
   // split path), guarded by a hard cap.
-  if (!UncolorableVRegs.empty()) {
+  if (!RecoveryOnly && !UncolorableVRegs.empty()) {
     // TEMPORARY / KNOWN-FLAWED termination (stopgap — see task #47 for the real
     // fix, an atomic region-relief transaction). The measure is the post-recolor
     // uncolorable COUNT: keep a round only if it strictly beats the previous
@@ -5605,8 +5828,26 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // mutated MIR from clean and run recovery again for any new failures. The
   // irreversible recovery sets are deliberately preserved across this loop.
   while (true) {
+    bool RecoveryComplete = true;
     if (!UncolorableVRegs.empty()) {
       NumTierSpills += UncolorableVRegs.size();
+      RecoveryComplete =
+          drainUncolorableWorklist(MF, /*ReportFailure=*/!RecoveryOnly);
+    }
+
+    if (RecoveryOnly && !RecoveryComplete) {
+      LLVM_DEBUG(dbgs() << "=== recovery-only: late cheap planner ===\n");
+      if (reduceRegionPressure(MF)) {
+        OccupiedRegUnits.clear();
+        OccupiedRegUnits.resize(TRI->getNumRegUnits());
+        ColorMap.clear();
+        MaxVGPRIdx = 0;
+        MaxSGPRIdx = 0;
+        MaxAGPRIdx = 0;
+        UncolorableVRegs.clear();
+        setupShadowTree();
+        color();
+      }
       drainUncolorableWorklist(MF);
     }
 
