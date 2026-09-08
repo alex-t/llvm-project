@@ -2827,11 +2827,13 @@ bool AMDGPUSSARegisterAllocator::pickPeelableRun(Register V, MCRegister &PR,
   BitVector Occ;
   scanOverlappersForVI(CI, Occ, &Overlappers);
 
-  // Pick the PR free at S that stays free the LONGEST (fewest future splits).
-  // getOrder(RC) already yields RC-width PRs; PR default-constructs to NoRegister
-  // (!PR tests it via MCRegister's unsigned conversion).
+  // Pick the available PR free at S that stays free the LONGEST (fewest future
+  // splits). availableOrder(RC) already yields RC-width PRs and excludes the
+  // tail reserved for downstream SGPR spill lowering and WWM allocation. PR
+  // default-constructs to NoRegister (!PR tests it via MCRegister's unsigned
+  // conversion).
   SlotIndex Best = S;
-  for (MCRegister P : RegClassInfo.getOrder(RC)) {
+  for (MCRegister P : availableOrder(RC)) {
     SlotIndex B = firstBlockAfter(P, S, E, Overlappers);
     if (B <= S)
       continue; // not free at S
