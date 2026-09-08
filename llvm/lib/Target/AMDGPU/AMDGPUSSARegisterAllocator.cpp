@@ -25,7 +25,6 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/MathExtras.h"
 #include "SSARATrace.h"
-#include <limits>
 
 using namespace llvm;
 
@@ -66,18 +65,6 @@ static cl::opt<bool> EnableLaneWasteDump(
     "amdgpu-ssa-lane-waste-dump", cl::Hidden, cl::init(false),
     cl::desc("Report per-function capacity held by dead lanes of partially "
              "live tuples: whole-tuple occupancy vs subrange occupancy."));
-
-static cl::opt<bool> EnableBlockDemandDump(
-    "amdgpu-ssa-block-demand-dump", cl::Hidden, cl::init(false),
-    cl::desc("TEMPORARY measurement: per slot, the live-value histogram by "
-             "class width and allocation stride, beside the lane-accurate "
-             "pressure and the whole-block dword sum. Sizes the width-aware "
-             "region gate; delete together with it."));
-
-static cl::opt<bool> RecoveryOnly(
-    "amdgpu-ssa-recovery-only", cl::Hidden, cl::init(false),
-    cl::desc("Run recovery first, then one cheap spill-planning pass for "
-             "remaining coloring failures"));
 
 // Step-0 PHI-copy metric (see PHI_Coalescer design section 9). Counted at the
 // copy-vs-fixed-point decision in lowerPHIs(); pure instrumentation, no MIR
@@ -1158,31 +1145,6 @@ AMDGPUSSARegisterAllocator::coveredSlots(const TargetRegisterClass *RC,
   return std::max(1u, SIRegisterInfo::getNumCoveredRegs(Lanes));
 }
 
-unsigned AMDGPUSSARegisterAllocator::spilledSlots(Register V,
-                                                  LaneBitmask Lanes) const {
-  SSARA_TRACE();
-  const TargetRegisterClass *RC = MRI->getRegClass(V);
-  // The store narrows to the subregister the mask NAMES. A mask naming none — an
-  // unnamed lane span corresponds to no subregister at all — falls back to storing
-  // the whole register (VRegMaskPair::getSubReg -> spillAtDefinition), so the
-  // traffic really is the full class. divideCeil, not /32: a 16-bit class occupies
-  // one 32-bit slot and must not truncate to zero.
-  if (VRegMaskPair(V, Lanes).getSubReg(MRI, TRI) == AMDGPU::NoRegister)
-    return divideCeil(TRI->getRegSizeInBits(*RC), 32);
-  return coveredSlots(RC, Lanes);
-}
-
-unsigned AMDGPUSSARegisterAllocator::reloadRPAtBlockEnd(const MachineBasicBlock *NCD,
-                                                        bool IsVGPR) const {
-  SSARA_TRACE();
-  GCNUpwardRPTracker Tracker(*LIS);
-  Tracker.reset(*NCD);
-  GCNRegPressure P = Tracker.getPressure();
-  if (!IsVGPR)
-    return P.getSGPRNum();
-  return P.getArchVGPRNum();
-}
-
 unsigned
 AMDGPUSSARegisterAllocator::allocStride(const TargetRegisterClass *RC) const {
   SSARA_TRACE();
@@ -1212,14 +1174,6 @@ AMDGPUSSARegisterAllocator::poolOf(const TargetRegisterClass *RC) const {
   if (TRI->isAGPRClass(RC))
     return RegFile::AGPR;
   return RegFile::VGPR;
-}
-
-SSASpillEmitter::DemandFn
-AMDGPUSSARegisterAllocator::demandFor(RegFile Pool) const {
-  return [this, Pool](const GCNRPTracker::LiveRegSet &Live) {
-    SmallVector<TierDemand, 8> Tiers;
-    return demandDeficiency(Live, Pool, Tiers);
-  };
 }
 
 unsigned AMDGPUSSARegisterAllocator::demandDeficiency(
@@ -1410,130 +1364,6 @@ void AMDGPUSSARegisterAllocator::reportLaneWaste(MachineFunction &MF) const {
   }
 }
 
-void AMDGPUSSARegisterAllocator::reportBlockDemand(MachineFunction &MF) const {
-  SSARA_TRACE();
-  // TEMPORARY MEASUREMENT — delete with the width-aware region gate it sizes.
-  //
-  // Prints FACTS, not a verdict. At each slot: the lane-accurate pressure the
-  // region gate uses today, the whole-block dword sum, and how many live values
-  // carry each (class width, allocation stride) pair. The block arithmetic —
-  // widest size first, leftovers of one size becoming the next size down — is
-  // done OFFLINE from these numbers, so no capacity model is baked in here and
-  // the numbers stay usable if the model turns out wrong.
-  //
-  // Stride comes from the real allocation order, not from a table: it is the
-  // smallest gap between the hardware indices of two entries, which is exactly
-  // the spacing of legal starts for the class (2 for 64-bit SGPRs, 4 for wider
-  // SGPRs, 1 or 2 for VGPR tuples depending on the subtarget).
-  for (RegFile File : {RegFile::SGPR, RegFile::VGPR, RegFile::AGPR}) {
-    const unsigned Limit = allocatablePool(MF, File);
-    const char *FN = File == RegFile::SGPR   ? "SGPR"
-                     : File == RegFile::AGPR ? "AGPR"
-                                             : "VGPR";
-    // Widest-slot fallback, so a function that trips no interest test still
-    // reports its worst point.
-    unsigned MaxWhole = 0;
-    std::string MaxLine;
-    unsigned Printed = 0;
-
-    for (MachineBasicBlock &MBB : MF) {
-      if (MBB.empty())
-        continue;
-      GCNUpwardRPTracker Tracker(*LIS);
-      Tracker.reset(MBB);
-      for (MachineInstr &MI : llvm::reverse(MBB)) {
-        if (MI.isDebugInstr())
-          continue;
-        Tracker.recede(MI);
-        if (MI.isPHI())
-          continue; // PHIs carry no real pressure (see findTightRegions)
-
-        struct Bucket {
-          unsigned W, S, N;
-          const TargetRegisterClass *RC;
-        };
-        SmallVector<Bucket, 8> Hist;
-        unsigned Whole = 0;
-        for (auto [RegNum, Mask] : Tracker.getLiveRegs()) {
-          Register Reg(RegNum);
-          const TargetRegisterClass *RC =
-              Reg.isVirtual() ? MRI->getRegClassOrNull(Reg) : nullptr;
-          if (!RC || poolOf(RC) != File)
-            continue;
-          unsigned W = divideCeil(TRI->getRegSizeInBits(*RC), 32);
-          unsigned S = allocStride(RC);
-          Whole += W;
-          auto *B = llvm::find_if(Hist, [&](const Bucket &X) {
-            return X.W == W && X.S == S;
-          });
-          if (B == Hist.end())
-            Hist.push_back({W, S, 1, RC});
-          else
-            B->N++;
-        }
-        if (Hist.empty())
-          continue;
-        llvm::sort(Hist, [](const Bucket &A, const Bucket &B) {
-          return std::tie(A.W, A.S) > std::tie(B.W, B.S);
-        });
-
-        // Same-file register operands of the instruction AT this slot. A peak
-        // sitting on an instruction that reads most of the live set cannot be
-        // relieved by spilling: every victim needs a reload right before it.
-        unsigned NUse = 0, NDef = 0;
-        for (const MachineOperand &MO : MI.operands()) {
-          if (!MO.isReg() || !MO.getReg().isVirtual())
-            continue;
-          const TargetRegisterClass *RC = MRI->getRegClassOrNull(MO.getReg());
-          if (!RC || poolOf(RC) != File)
-            continue;
-          MO.isDef() ? ++NDef : ++NUse;
-        }
-        unsigned Lane = pressureOf(Tracker.getPressure(), File);
-        std::string Line;
-        raw_string_ostream OS(Line);
-        OS << "ssara-block-demand: " << MF.getName() << " file=" << FN
-           << " pool=" << Limit << " @"
-           << LIS->getInstructionIndex(MI).getRegSlot() << " lane=" << Lane
-           << " whole=" << Whole << " mi=" << TII->getName(MI.getOpcode())
-           << " uses=" << NUse << " defs=" << NDef;
-        bool Interesting = Whole > Limit;
-        for (const Bucket &B : Hist) {
-          // disjoint = how many values of this width the pool could hold if it
-          // held nothing else; starts = legal first registers the order offers.
-          unsigned Disjoint = Limit / B.W;
-          OS << " | w" << B.W << "/s" << B.S << " n=" << B.N
-             << " disjoint=" << Disjoint
-             << " starts=" << availableOrder(B.RC).size();
-          if (B.W > 1 && B.N > Disjoint)
-            Interesting = true;
-        }
-        // Shadow the scalar figures with the oracle, so a slot where the two
-        // disagree is visible in the same line. Unsound disagreement is the
-        // oracle reporting no deficiency where coloring then failed.
-        SmallVector<TierDemand, 8> Tiers;
-        unsigned Shortfall =
-            demandDeficiency(Tracker.getLiveRegs(), File, Tiers);
-        OS << " || oracle short=" << Shortfall;
-        for (const TierDemand &T : Tiers)
-          OS << " w" << T.Width << " d=" << T.Demand << " p=" << T.Placed;
-        if (Shortfall)
-          Interesting = true;
-        if (Whole > MaxWhole) {
-          MaxWhole = Whole;
-          MaxLine = Line;
-        }
-        if (Interesting && Printed < 16) {
-          ++Printed;
-          errs() << Line << " OVER\n";
-        }
-      }
-    }
-    if (!MaxLine.empty())
-      errs() << MaxLine << " MAXWHOLE\n";
-  }
-}
-
 // Recovery helpers ------------------------------------------------------------
 
 AMDGPUSSARegisterAllocator::RegFile
@@ -1542,168 +1372,6 @@ AMDGPUSSARegisterAllocator::fileOf(const TargetRegisterClass *RC) const {
   // AGPR folds into VGPR so this matches pressureOf(VGPR)'s unified count; only
   // SGPR classes are the SGPR file.
   return TRI->isSGPRClass(RC) ? RegFile::SGPR : RegFile::VGPR;
-}
-
-AMDGPUSSARegisterAllocator::SpillCost
-AMDGPUSSARegisterAllocator::costOfSpilling(Register B, const TightRegion &R,
-                                           LaneBitmask Lanes) {
-  SSARA_TRACE();
-  // Traffic = what the spill MOVES. Usually \p Lanes, because the store narrows to
-  // their subregister and the slot is sized to it; when the lanes name no
-  // subregister it is the whole register. spilledSlots decides which, so the cost
-  // is never billed for lanes that are not stored, nor excused for lanes that are.
-  const unsigned Width = spilledSlots(B, Lanes);
-  // 2-way file (POC): AGPR folds into the VGPR pass like the rest of the emitter.
-  Emitter->beginPass(R.File != RegFile::SGPR, demandFor(R.File));
-
-  // Walk B's uses: fold the NCD of the non-PHI uses and collect what the reloads
-  // will cost. There is no placement gate: a reload only ever restores a register
-  // that its own reload point already required, so it cannot inflate any slot and
-  // cannot make a candidate infeasible. Whether the spill helps is decided by
-  // cumulative oracle remeasurement.
-  SmallVector<MachineInstr *, 8> Uses;
-  SmallPtrSet<MachineBasicBlock *, 8> PhiEdgeBlocks;
-  MachineBasicBlock *NCD = nullptr;
-  for (MachineInstr &UseMI : MRI->use_nodbg_instructions(B)) {
-    MachineBasicBlock *UBB = UseMI.getParent();
-
-    // A PHI reads its operand on the PREDECESSOR edge, so the emitter places the
-    // reload at the end of each incoming block that supplies B, not at the PHI's
-    // own slot. B is live out of that block either way, so the reload frees
-    // nothing there and costs nothing extra — but it IS traffic, one reload per
-    // supplying block (getOrCreateReloadInBlock caches per block), and the
-    // footprint model charges residency from the terminator to block end.
-    if (UseMI.isPHI()) {
-      for (unsigned I = 1, E = UseMI.getNumOperands(); I + 1 < E; I += 2) {
-        if (UseMI.getOperand(I).getReg() != B)
-          continue;
-        PhiEdgeBlocks.insert(UseMI.getOperand(I + 1).getMBB());
-      }
-      // Do not fold the PHI block into the NCD dominance merge: its use point is
-      // the predecessor edge, not the PHI's own block.
-      continue;
-    }
-
-    // A use inside R is NOT by itself a reason to reject. The reload lands at that
-    // use, so the victim keeps its register there — but across the slots where it
-    // is live and untouched its register really is freed, and those may be the
-    // over-limit ones. The footprint measures that per slot and frees nothing
-    // when the victim is held everywhere R is tight. The same holds for a use in R's
-    // loop: the reload restores the register at a point that reads B, so it adds
-    // nothing that was not already there.
-    NCD = NCD ? MDT->findNearestCommonDominator(NCD, UBB) : UBB;
-    Uses.push_back(&UseMI);
-  }
-
-  // Reload set + Test 2. Commonly dominated + hoistable (hoist itself must not
-  // cross R) -> ONE reload at NCD end; else one reload per use. Each reload's
-  // post-spill RP must stay <= R.Limit. canHoistReloadTo (InsertPoint==null)
-  // skips the NCD-block RP check, so reloadRPAtBlockEnd covers it here.
-  const bool HoistOK = NCD && NCD != R.MBB && !MDT->dominates(NCD, R.MBB) &&
-                       Emitter->canHoistReload(NCD, B);
-
-  // reloadRPBeforeUse/reloadRPAtBlockEnd already include the reloaded value
-  // present at the reload point (the -W+W cancel), so RP > Limit is the correct
-  // "no room for the reload" test — do NOT add Width (that double-counts).
-  // A SINGLE hoisted reload at the NCD block end is cheapest, but only legal if
-  // that point has room. When it does NOT (the hoisted reload would pile all uses'
-  // live-in at one over-pressure point — e.g. the 128-dword result block of a wide
-  // bitcast, where a hoisted reload sees RP=128>64), DO NOT give up: fall through
-  // to PER-USE reloads. A per-use reload lands right before each individual use and
-  // dies immediately after it, so its point pressure is the ROLLING-WINDOW demand
-  // (only a few reloads live at once), not the block's total throughput. This is
-  // exactly how Greedy spills the wide-bitcast result block: 81 reloads all in
-  // %end, but distributed through the sequential pack-4-bytes-and-store so no point
-  // exceeds the limit. Rejecting at the hoist test (the old behavior) was the
-  // deadlock: every crosser's shared reload piled in the 128-RP block -> all
-  // rejected -> nothing spilled.
-  // Reload traffic is LOOP-DEPTH WEIGHTED: a reload placed in a loop executes once
-  // per iteration, so it costs 2^loopdepth (same weight the PHI-coalescer uses for
-  // edges). A reload at depth 0 costs 1; at depth d costs 2^d. The cost is the SUM
-  // over the reloads B forces, each weighted by its placement block's depth, times
-  // Width (dwords moved per reload). The area planner uses this as a deterministic
-  // tie-breaker, so equal-area choices still prefer lower dynamic traffic.
-  auto depthWeight = [&](MachineBasicBlock *MBB) -> uint64_t {
-    unsigned D = MBB ? MLI->getLoopDepth(MBB) : 0;
-    // Saturate rather than shift past the width of the weight type.
-    constexpr unsigned MaxShift = std::numeric_limits<uint64_t>::digits - 1;
-    return D < MaxShift ? (uint64_t(1) << D) : ~uint64_t(0);
-  };
-  // One reload per predecessor supplying a PHI use, whichever way the non-PHI
-  // uses are served. Omitting these priced a victim whose uses are ALL PHIs at
-  // zero, which sorts it ahead of every real candidate.
-  uint64_t PhiEdgeWeight = 0;
-  for (MachineBasicBlock *PredBB : PhiEdgeBlocks)
-    PhiEdgeWeight += depthWeight(PredBB);
-  // An uncolored value is still a live virtual register, so the pressure trackers
-  // below already count it. Adding it again here inflated every measurement taken
-  // after coloring by the width of the uncolored values at that slot.
-  const bool WantVG = R.File != RegFile::SGPR;
-  uint64_t WeightedReloads;
-  bool UseHoist = HoistOK && reloadRPAtBlockEnd(NCD, WantVG) <= R.Limit;
-  if (UseHoist) {
-    // One shared reload at the NCD block end.
-    WeightedReloads = depthWeight(NCD) + PhiEdgeWeight;
-  } else {
-    LLVM_DEBUG(if (HoistOK) dbgs()
-               << "      cost " << printReg(B, TRI) << ": hoist infeasible (NCD-end RP "
-               << reloadRPAtBlockEnd(NCD, WantVG) << " > " << R.Limit
-               << ") -> trying per-use\n");
-    // Per-use reloads land at DISTINCT slots and die immediately, so they do not
-    // accumulate against one another. Nor is there anything to reject here: B is
-    // already live at its own use, so the reload restores a register that slot
-    // needed anyway and the pressure there is the same spilled or not. Comparing
-    // it against the limit says nothing about the spill, and inside a tight region
-    // it is over the limit by definition, so it rejected every candidate and
-    // nothing was ever spilled. The cumulative oracle decides whether the spill
-    // helps; this loop only prices the traffic.
-    uint64_t W = 0;
-    for (MachineInstr *UseMI : Uses)
-      W += depthWeight(UseMI->getParent());
-    WeightedReloads = W + PhiEdgeWeight;
-  }
-
-  // Cost = weighted reload traffic * dwords moved. Clamp to unsigned for the
-  // struct; deep loops saturate but stay ordered (huge => spilled last).
-  uint64_t C = WeightedReloads * Width;
-  unsigned Cost = C > ~0u ? ~0u : unsigned(C);
-  LLVM_DEBUG(dbgs() << "      cost " << printReg(B, TRI) << ": FEASIBLE cost="
-                    << Cost << " width=" << Width
-                    << " weightedReloads=" << WeightedReloads << "\n");
-  return {Cost, Width};
-}
-
-std::pair<SlotIndex, unsigned>
-AMDGPUSSARegisterAllocator::peakSlotForValueInRegion(const TightRegion &R,
-                                                     Register V) const {
-  SSARA_TRACE();
-  // Walk R's block bottom-to-top (same tracker as findTightRegions) and record
-  // the max-RP slot at which V is live. This is the slot recovery must relieve:
-  // spilling victims at R's GLOBAL peak is useless if V is dead there (a plateau
-  // region where V occupies only a sub-span).
-  const LiveInterval &VI = LIS->getInterval(V);
-  SlotIndex BestSlot;
-  unsigned BestRP = 0;
-  GCNUpwardRPTracker Tracker(*LIS);
-  Tracker.reset(*R.MBB);
-  for (MachineInstr &MI : llvm::reverse(*R.MBB)) {
-    if (MI.isDebugInstr())
-      continue;
-    Tracker.recede(MI);
-    if (MI.isPHI())
-      continue; // PHIs carry no real pressure (see findTightRegions)
-    SlotIndex SI = LIS->getInstructionIndex(MI).getRegSlot();
-    if (SI < R.Start || R.End <= SI)
-      continue; // outside the region span
-    if (!VI.liveAt(SI))
-      continue; // V not live here -> spilling here cannot relieve V
-    unsigned RP = pressureOf(Tracker.getPressure(), R.File);
-    if (RP > BestRP) {
-      BestRP = RP;
-      BestSlot = SI;
-    }
-  }
-  return {BestSlot, BestRP};
 }
 
 unsigned AMDGPUSSARegisterAllocator::measureRegionPeak(
@@ -1779,198 +1447,9 @@ unsigned AMDGPUSSARegisterAllocator::measureRegionPeak(
   return Peak;
 }
 
-void AMDGPUSSARegisterAllocator::dumpWorstSlotLiveSet(
-    ArrayRef<RegionSlot> Slots, const char *Tag) const {
-  LLVM_DEBUG({
-    const RegionSlot *Worst = nullptr;
-    for (const RegionSlot &S : Slots)
-      if (!Worst || S.Short > Worst->Short)
-        Worst = &S;
-    if (Worst) {
-      dbgs() << "    [WA] " << Tag << " worst@" << Worst->SI
-             << " short=" << Worst->Short << " live:";
-      SmallVector<std::pair<unsigned, unsigned>, 32> L; // (width, vreg index)
-      for (const auto &KV : Worst->Live) {
-        Register V(KV.first);
-        unsigned W = TRI->getRegSizeInBits(*MRI->getRegClass(V)) / 32;
-        L.push_back({W ? W : 1, V.virtRegIndex()});
-      }
-      llvm::sort(L, std::greater<std::pair<unsigned, unsigned>>());
-      for (const auto &P : L)
-        dbgs() << " %" << P.second << "(w" << P.first << ")";
-      dbgs() << "\n";
-    }
-  });
-}
-
-bool AMDGPUSSARegisterAllocator::relieveTightRegion(
-    const TightRegion &R, const SmallDenseSet<Register, 128> &Universe,
-    SmallDenseSet<Register, 64> &Spilled,
-    llvm::function_ref<bool(Register)> Eligible, unsigned *NumRecolored) {
-  SSARA_TRACE();
-  DenseMap<Register, RegionOccupancy> Occ;
-  SmallVector<RegionSlot, 32> Slots;
-  unsigned Peak = measureRegionPeak(R, &Occ, &Slots);
-  if (!Peak)
-    return false;
-  dumpWorstSlotLiveSet(Slots, "pre ");
-
-  SmallVector<SpillCandidateInput, 32> Inputs;
-  for (Register V : Universe) {
-    if (Spilled.count(V) || MRI->reg_nodbg_empty(V) || !LIS->hasInterval(V))
-      continue;
-    const TargetRegisterClass *RC = MRI->getRegClass(V);
-    auto It = Occ.find(V);
-    if (poolOf(RC) != R.File || It == Occ.end() || !Eligible(V))
-      continue;
-    bool CanRecolor =
-        ST->hasGFX90AInsts() && R.File == RegFile::VGPR &&
-        TRI->isVectorSuperClass(RC) && TRI->getEquivalentAGPRClass(RC);
-    Inputs.push_back({V, It->second.Lanes, CanRecolor});
-  }
-  llvm::sort(Inputs, [](const SpillCandidateInput &A,
-                        const SpillCandidateInput &B) {
-    return A.V.id() < B.V.id();
-  });
-
-  unsigned AGPRBudget = 0;
-  if (ST->hasGFX90AInsts() && R.File == RegFile::VGPR)
-    AGPRBudget = allocatablePool(
-        const_cast<MachineFunction &>(MRI->getMF()), RegFile::AGPR);
-
-  Emitter->beginPass(R.File != RegFile::SGPR, demandFor(R.File));
-  SmallVector<AreaSpillAction, 16> Actions;
-  unsigned VirtualShort = 0;
-  if (!planAreaSpillSet(R, Slots, Inputs, AGPRBudget, Actions,
-                        &VirtualShort))
-    return false;
-
-  for (const AreaSpillAction &A : Actions)
-    if (A.Kind == AreaSpillAction::Memory &&
-        !Emitter->canSpill(VRegMaskPair(A.V, A.Lanes)))
-      return false;
-
-  for (const AreaSpillAction &A : Actions) {
-    if (A.Kind == AreaSpillAction::Recolor) {
-      const TargetRegisterClass *AGPR =
-          TRI->getEquivalentAGPRClass(MRI->getRegClass(A.V));
-      assert(AGPR && "planned AGPR recolor lost its target class");
-      MRI->setRegClass(A.V, AGPR);
-      if (NumRecolored)
-        ++*NumRecolored;
-    } else {
-      Emitter->spillOneVMP(VRegMaskPair(A.V, A.Lanes),
-                           LIS->getInterval(A.V).beginIndex());
-    }
-    Spilled.insert(A.V);
-  }
-
-  Slots.clear();
-  unsigned Actual = measureRegionPeak(R, nullptr, &Slots);
-  LLVM_DEBUG(dbgs() << "    [AREA] committed set=" << Actions.size()
-                    << " virtual-short=" << VirtualShort
-                    << " actual-short=" << Actual << "\n");
-  dumpWorstSlotLiveSet(Slots, "post");
-  return true;
-}
-
-bool AMDGPUSSARegisterAllocator::preSpillToLimitWidthAware(MachineFunction &MF) {
-  SSARA_TRACE();
-  // WIDTH-AWARE up-front spiller. Runs BEFORE color(): at each tight region's
-  // peak it spills frozen victims (kill-at-def store, reload at use) until the
-  // peak fits the allocatable pool, so the coloring walk succeeds by
-  // construction. Two properties decide which regions it can relieve:
-  //   (1) the frozen victim UNIVERSE spans ALL widths, and
-  //   (2) victims are chosen WIDEST-FIRST and the region peak is decremented by
-  //       the victim's REAL dword width.
-  // Both are what reach a region dominated by wide tuples (vreg_64/128/... in
-  // either file), where nothing of width 1 is live at the peak at all. The
-  // SGPR-wide bookkeeping bug and the 128xfloat emergency-slot cases are exactly
-  // these: the pressure is carried by wide SGPR/VGPR tuples.
-  //
-  // THE GATE IS WHOLE-BLOCK DEMAND, not lane-accurate pressure: this allocator
-  // hands out whole tuples (markOccupied sets every unit of the assigned register),
-  // so a partially-live tuple costs its full width and the lane reading understates
-  // what the coloring walk needs. See wholeBlockDemand. The job ends there — the
-  // pre-spiller only guarantees that at every slot SOME assignment exists. It does
-  // not model fragmentation, which cannot exist before anything is coloured, and a
-  // value left with no legal run is a coloring failure for recovery to handle.
-  bool Any = false;
-  SmallDenseSet<Register, 64> Spilled; // never re-pick a spilled value
-  // FROZEN UNIVERSE (termination): every vreg that exists BEFORE any spilling, of
-  // ANY width. Reload redefs spillOneVMP creates are fresh vregs NOT in the set,
-  // so they can never become victims -> no rolling-wave regeneration. The
-  // spillable set strictly shrinks; the loop is bounded by |Universe|.
-  SmallDenseSet<Register, 128> Universe;
-  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
-    Register V = Register::index2VirtReg(I);
-    if (MRI->reg_nodbg_empty(V) || !LIS->hasInterval(V))
-      continue;
-    Universe.insert(V);
-  }
-  // TERMINATION + DO-NO-HARM, one progress metric, NO cap. The measure is the
-  // TOTAL deficiency = sum over tight regions of the runs they are short. A kept
-  // round must STRICTLY reduce it:
-  //  - relief (spill or AGPR-recolor) of any region lowers that region's excess,
-  //    reducing the sum — even when a DIFFERENT region still holds the max (the
-  //    reason a per-region-MAX metric wrongly stalled: it ignored progress made on
-  //    a non-max region);
-  //  - a memory spill whose reloads re-materialize pressure elsewhere (fresh vregs
-  //    outside the frozen universe, unspillable) fails to reduce the sum — the
-  //    rolling wave — and bails, leaving the residual to the colorer (do no harm).
-  // The sum is a non-negative integer strictly decreasing on every kept round, so
-  // the loop terminates in at most its initial value of rounds without a backstop.
-  // The vector stage owns two DISJOINT register sets. fileOf folds them so one
-  // coloring stage handles both, which is right for coloring and wrong for
-  // demand: enumerated as one pool an AGPR shortage is invisible, and an AGPR
-  // value inflates the arch-VGPR reading of a pool it will never occupy.
-  SmallVector<RegFile, 2> Pools;
-  if (StageFile == RegFile::SGPR)
-    Pools.push_back(RegFile::SGPR);
-  else {
-    Pools.push_back(RegFile::VGPR);
-    Pools.push_back(RegFile::AGPR);
-  }
-  long PrevTotal = -1; // total deficiency at the START of the last round
-  while (true) {
-    bool Changed = false;
-    long TotalThisRound = 0;
-    for (RegFile PF : Pools) {
-      SmallVector<TightRegion, 8> PR;
-      findTightRegions(MF, PF, PR);
-      for (const TightRegion &R : PR)
-        TotalThisRound += long(R.Deficiency);
-    }
-    if (TotalThisRound == 0)
-      break; // every point fits — done
-    if (PrevTotal >= 0 && TotalThisRound >= PrevTotal) {
-      LLVM_DEBUG(dbgs() << "    [WA] no progress (total excess " << PrevTotal
-                        << " -> " << TotalThisRound
-                        << "): rolling wave, hand residual to colorer\n");
-      break;
-    }
-    PrevTotal = TotalThisRound;
-    for (RegFile File : Pools) {
-      SmallVector<TightRegion, 8> Regions;
-      findTightRegions(MF, File, Regions);
-      if (Regions.empty())
-        continue;
-      Emitter->beginPass(File != RegFile::SGPR, demandFor(File));
-      for (const TightRegion &R : Regions) {
-        if (relieveTightRegion(R, Universe, Spilled,
-                               [](Register) { return true; }))
-          Any = Changed = true;
-      }
-    }
-    if (!Changed)
-      break; // fixpoint: every point <= Limit (or nothing left to spill)
-  }
-  return Any;
-}
-
 bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
     const TightRegion &R, ArrayRef<RegionSlot> Slots,
-    ArrayRef<SpillCandidateInput> Inputs, unsigned RecolorBudget,
+    ArrayRef<SpillCandidateInput> Inputs,
     SmallVectorImpl<AreaSpillAction> &Actions, unsigned *RemainingShort) {
   SSARA_TRACE();
   Actions.clear();
@@ -1985,66 +1464,58 @@ bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
   DenseMap<Register, unsigned> DirectIndex;
   SmallVector<SmallBitVector, 32> DirectLiveSlots;
   SmallVector<SmallBitVector, 32> DirectResidentSlots;
-  if (RecoveryOnly) {
-    for (unsigned I = 0; I != Inputs.size(); ++I) {
-      DirectIndex.try_emplace(Inputs[I].V, I);
-      DirectLiveSlots.emplace_back(Slots.size());
-      DirectResidentSlots.emplace_back(Slots.size());
-    }
+  for (unsigned I = 0; I != Inputs.size(); ++I) {
+    DirectIndex.try_emplace(Inputs[I].V, I);
+    DirectLiveSlots.emplace_back(Slots.size());
+    DirectResidentSlots.emplace_back(Slots.size());
+  }
 
-    for (unsigned S = 0; S != Slots.size(); ++S) {
-      for (unsigned I = 0; I != Inputs.size(); ++I)
-        if (Slots[S].Live.count(Inputs[I].V.id()))
-          DirectLiveSlots[I].set(S);
+  for (unsigned S = 0; S != Slots.size(); ++S) {
+    for (unsigned I = 0; I != Inputs.size(); ++I)
+      if (Slots[S].Live.count(Inputs[I].V.id()))
+        DirectLiveSlots[I].set(S);
 
-      for (const MachineOperand &MO : Slots[S].MI->operands()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual())
-          continue;
-        auto It = DirectIndex.find(MO.getReg());
-        if (It == DirectIndex.end())
-          continue;
-        if ((VRegMaskPair(MO, TRI, MRI).getLaneMask() &
-             Inputs[It->second].Lanes)
-                .any())
-          DirectResidentSlots[It->second].set(S);
-      }
-    }
-
-    auto FirstTerm = R.MBB->getFirstTerminator();
-    if (FirstTerm != R.MBB->end()) {
-      SmallBitVector PhiEdgeSlots(Slots.size());
-      SlotIndex FirstTermIdx =
-          LIS->getInstructionIndex(*FirstTerm).getRegSlot();
-      for (unsigned S = 0; S != Slots.size(); ++S)
-        if (LIS->getInstructionIndex(*Slots[S].MI).getRegSlot() >=
-            FirstTermIdx)
-          PhiEdgeSlots.set(S);
-
-      for (MachineBasicBlock *Succ : R.MBB->successors())
-        for (const MachineInstr &Phi : *Succ) {
-          if (!Phi.isPHI())
-            break;
-          for (unsigned I = 1, E = Phi.getNumOperands(); I + 1 < E; I += 2) {
-            const MachineOperand &Val = Phi.getOperand(I);
-            if (!Val.isReg() || !Val.getReg().isVirtual() ||
-                Phi.getOperand(I + 1).getMBB() != R.MBB)
-              continue;
-            auto It = DirectIndex.find(Val.getReg());
-            if (It == DirectIndex.end())
-              continue;
-            if ((VRegMaskPair(Val, TRI, MRI).getLaneMask() &
-                 Inputs[It->second].Lanes)
-                    .any())
-              DirectResidentSlots[It->second] |= PhiEdgeSlots;
-          }
-        }
+    for (const MachineOperand &MO : Slots[S].MI->operands()) {
+      if (!MO.isReg() || !MO.getReg().isVirtual())
+        continue;
+      auto It = DirectIndex.find(MO.getReg());
+      if (It == DirectIndex.end())
+        continue;
+      if ((VRegMaskPair(MO, TRI, MRI).getLaneMask() &
+           Inputs[It->second].Lanes)
+              .any())
+        DirectResidentSlots[It->second].set(S);
     }
   }
 
-  SmallVector<MachineInstr *, 32> Sites;
-  if (!RecoveryOnly)
-    for (const RegionSlot &S : Slots)
-      Sites.push_back(S.MI);
+  auto FirstTerm = R.MBB->getFirstTerminator();
+  if (FirstTerm != R.MBB->end()) {
+    SmallBitVector PhiEdgeSlots(Slots.size());
+    SlotIndex FirstTermIdx =
+        LIS->getInstructionIndex(*FirstTerm).getRegSlot();
+    for (unsigned S = 0; S != Slots.size(); ++S)
+      if (LIS->getInstructionIndex(*Slots[S].MI).getRegSlot() >= FirstTermIdx)
+        PhiEdgeSlots.set(S);
+
+    for (MachineBasicBlock *Succ : R.MBB->successors())
+      for (const MachineInstr &Phi : *Succ) {
+        if (!Phi.isPHI())
+          break;
+        for (unsigned I = 1, E = Phi.getNumOperands(); I + 1 < E; I += 2) {
+          const MachineOperand &Val = Phi.getOperand(I);
+          if (!Val.isReg() || !Val.getReg().isVirtual() ||
+              Phi.getOperand(I + 1).getMBB() != R.MBB)
+            continue;
+          auto It = DirectIndex.find(Val.getReg());
+          if (It == DirectIndex.end())
+            continue;
+          if ((VRegMaskPair(Val, TRI, MRI).getLaneMask() &
+               Inputs[It->second].Lanes)
+                  .any())
+            DirectResidentSlots[It->second] |= PhiEdgeSlots;
+        }
+      }
+  }
 
   SmallVector<Candidate, 32> Candidates;
   for (const SpillCandidateInput &I : Inputs) {
@@ -2061,57 +1532,23 @@ bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
     Candidate C;
     C.Action.V = I.V;
     C.Action.Lanes = I.Lanes;
-    if (!RecoveryOnly)
-      C.Action.Cost = costOfSpilling(I.V, R, I.Lanes).Cost;
-    if (RecoveryOnly) {
-      unsigned INo = DirectIndex.lookup(I.V);
-      SmallBitVector Freed = DirectLiveSlots[INo];
-      Freed.reset(DirectResidentSlots[INo]);
-      for (int S = Freed.find_first(); S >= 0; S = Freed.find_next(S))
-        C.FreedSlots.push_back(S);
-      C.Action.FootprintExact = true;
-    } else {
-      SSASpillEmitter::SpillFootprint Footprint =
-          Emitter->modelSpillFootprint(VRegMaskPair(I.V, I.Lanes),
-                                       LIS->getInterval(I.V).beginIndex(),
-                                       R.MBB, Sites);
-      C.Action.FootprintExact = Footprint.Exact;
-      for (unsigned S = 0; S != Slots.size(); ++S)
-        if (Slots[S].Live.count(I.V.id()) &&
-            !Footprint.ResidentSlots.test(S))
-          C.FreedSlots.push_back(S);
-    }
+    unsigned INo = DirectIndex.lookup(I.V);
+    SmallBitVector Freed = DirectLiveSlots[INo];
+    Freed.reset(DirectResidentSlots[INo]);
+    for (int S = Freed.find_first(); S >= 0; S = Freed.find_next(S))
+      C.FreedSlots.push_back(S);
     C.Action.Area = uint64_t(Width) * C.FreedSlots.size();
     if (C.Action.Area)
       Candidates.push_back(std::move(C));
-
-    if (I.CanRecolor && Width <= RecolorBudget) {
-      Candidate Recolor;
-      Recolor.Action.V = I.V;
-      Recolor.Action.Lanes = I.Lanes;
-      Recolor.Action.Kind = AreaSpillAction::Recolor;
-      Recolor.Action.FootprintExact = true;
-      for (unsigned S = 0; S != Slots.size(); ++S)
-        if (Slots[S].Live.count(I.V.id()))
-          Recolor.FreedSlots.push_back(S);
-      Recolor.Action.Area = uint64_t(Width) * Recolor.FreedSlots.size();
-      if (Recolor.Action.Area)
-        Candidates.push_back(std::move(Recolor));
-    }
   }
 
   llvm::sort(Candidates, [](const Candidate &A, const Candidate &B) {
     if (A.Action.Area != B.Action.Area)
       return A.Action.Area > B.Action.Area;
-    if (A.Action.Cost != B.Action.Cost)
-      return A.Action.Cost < B.Action.Cost;
     return A.Action.V.id() < B.Action.V.id();
   });
 
   SmallVector<RegionSlot, 32> Virtual(Slots.begin(), Slots.end());
-  SmallBitVector Selected(Candidates.size());
-  SmallDenseSet<Register, 16> SelectedRegs;
-  unsigned BudgetLeft = RecolorBudget;
   auto totalShort = [&]() {
     unsigned Total = 0;
     for (const RegionSlot &S : Virtual)
@@ -2121,61 +1558,31 @@ bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
 
   const unsigned InitialShort = totalShort();
   unsigned BestShort = InitialShort;
-  unsigned BestSize = 0;
 
-  while (totalShort()) {
-    int Pick = -1;
-    for (unsigned C = 0; C != Candidates.size(); ++C) {
-      if (Selected.test(C))
-        continue;
-      const Candidate &Cand = Candidates[C];
-      if (SelectedRegs.count(Cand.Action.V))
-        continue;
-      if (Cand.Action.Kind == AreaSpillAction::Recolor) {
-        unsigned W = coveredSlots(MRI->getRegClass(Cand.Action.V),
-                                  Cand.Action.Lanes);
-        if (W > BudgetLeft)
-          continue;
-      }
-      if (llvm::any_of(Cand.FreedSlots,
-                       [&](unsigned S) { return Virtual[S].Short != 0; })) {
-        Pick = C;
-        break;
-      }
-    }
-    if (Pick < 0)
-      break;
-
-    Candidate &Cand = Candidates[Pick];
-    Selected.set(Pick);
-    SelectedRegs.insert(Cand.Action.V);
-    if (Cand.Action.Kind == AreaSpillAction::Recolor)
-      BudgetLeft -= coveredSlots(MRI->getRegClass(Cand.Action.V),
-                                 Cand.Action.Lanes);
+  for (Candidate &Cand : Candidates) {
+    if (!llvm::any_of(Cand.FreedSlots,
+                      [&](unsigned S) { return Virtual[S].Short != 0; }))
+      continue;
     for (unsigned S : Cand.FreedSlots)
       Virtual[S].Live.erase(Cand.Action.V.id());
     for (RegionSlot &S : Virtual) {
       SmallVector<TierDemand, 8> Tiers;
       S.Short = demandDeficiency(S.Live, R.File, Tiers);
     }
-    Actions.push_back(Cand.Action);
     unsigned CurrentShort = totalShort();
-    if (CurrentShort < BestShort) {
+    if (CurrentShort < InitialShort) {
       BestShort = CurrentShort;
-      BestSize = Actions.size();
+      Actions.push_back(Cand.Action);
     }
     LLVM_DEBUG(dbgs() << "    [AREA] choose "
                       << printReg(Cand.Action.V, TRI)
                       << " area=" << Cand.Action.Area
                       << " remaining-short=" << CurrentShort
-                      << " footprint="
-                      << (Cand.Action.FootprintExact ? "exact" : "conservative")
+                      << " footprint=direct"
                       << "\n");
-    if (RecoveryOnly)
-      break;
+    break;
   }
 
-  Actions.resize(BestSize);
   if (RemainingShort)
     *RemainingShort = BestShort;
   if (Actions.empty()) {
@@ -2183,8 +1590,8 @@ bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
     Actions.clear();
     return false;
   }
-  LLVM_DEBUG(dbgs() << "    [AREA] retain improving prefix=" << BestSize
-                    << " short=" << InitialShort << "->" << BestShort
+  LLVM_DEBUG(dbgs() << "    [AREA] retain one direct candidate short="
+                    << InitialShort << "->" << BestShort
                     << "; defer residual to coloring and recovery\n");
   return !Actions.empty();
 }
@@ -2199,10 +1606,9 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
   // axis, so a single "region" could cover several blocks and SUM mutually
   // exclusive divergent paths.
   //
-  // Per region: construct one complete cumulative set over copied live snapshots,
-  // emit it only if virtual deficiency reaches zero, then remeasure actual state.
-  // The caller does not recolor-iterate; it recolors once and hands any model
-  // discrepancy to the split path. Returns true if any spill was performed.
+  // Per region: select at most one candidate whose direct reload footprint
+  // improves copied deficiency. The caller recolors once and runs recovery again.
+  // Returns true if any spill was performed.
   bool AnySpill = false;
   SmallDenseSet<Register, 32> Spilled; // never re-pick within this pass
 
@@ -2236,7 +1642,7 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
 
   for (const TightRegion &R : Regions) {
     // ONE walk of R yields its current deficiency, its occupants, and the
-    // per-slot live sets that the cumulative set planner evaluates.
+    // per-slot live sets that the direct planner evaluates.
     // Re-measuring matters: regions were enumerated up front, so spills made for
     // an earlier region may already have relieved this one (R.Deficiency is then
     // stale).
@@ -2283,29 +1689,25 @@ bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
     SmallVector<SpillCandidateInput, 32> Inputs;
     for (const Cand &C : Cands)
       if (!Spilled.count(C.VReg))
-        Inputs.push_back({C.VReg, C.Lanes, false});
+        Inputs.push_back({C.VReg, C.Lanes});
 
-    Emitter->beginPass(IsVectorFile, demandFor(R.File));
+    Emitter->beginPass(IsVectorFile);
     SmallVector<AreaSpillAction, 16> Actions;
     unsigned VirtualShort = 0;
-    if (!planAreaSpillSet(R, Slots, Inputs, /*RecolorBudget=*/0, Actions,
-                          &VirtualShort))
+    if (!planAreaSpillSet(R, Slots, Inputs, Actions, &VirtualShort))
       continue;
 
     bool Legal = llvm::all_of(Actions, [&](const AreaSpillAction &A) {
-      return A.Kind != AreaSpillAction::Memory ||
-             Emitter->canSpill(VRegMaskPair(A.V, A.Lanes));
+      return Emitter->canSpill(VRegMaskPair(A.V, A.Lanes));
     });
     if (!Legal)
       continue;
 
     for (const AreaSpillAction &A : Actions) {
-      assert(A.Kind == AreaSpillAction::Memory &&
-             "post-color planner cannot recolor");
       assert(LIS->hasInterval(A.V) && !LIS->getInterval(A.V).empty() &&
              "planned victim lost its interval before set emission");
       LLVM_DEBUG(dbgs() << "    [AREA] spill " << printReg(A.V, TRI)
-                        << " area=" << A.Area << " cost=" << A.Cost
+                        << " area=" << A.Area
                         << " lanes=" << PrintLaneMask(A.Lanes) << "\n");
       Emitter->spillOneVMP(VRegMaskPair(A.V, A.Lanes),
                            LIS->getInterval(A.V).beginIndex());
@@ -2604,7 +2006,7 @@ AMDGPUSSARegisterAllocator::spillBlocker(Register Failed,
     // redefs; recolor each surviving piece (forcing P onto a narrow reload is
     // unsound for a wide B). Freeing B's units opens the lane for Failed.
     RecoverySpilledVRegs.insert(B);
-    Emitter->beginPass(IsVGPR, demandFor(poolOf(MRI->getRegClass(B))));
+    Emitter->beginPass(IsVGPR);
     ColorMap.erase(B);
     Emitter->spillOneVMP(VRegMaskPair(B, MRI->getMaxLaneMaskForVReg(B)), FS);
     // The erase and the spill are COMMITTED to LIS and MIR — there is no
@@ -2680,7 +2082,7 @@ AMDGPUSSARegisterAllocator::spillBlocker(Register Failed,
   Register Tail = Emitter->splitLiveRangeAt(Failed, BDef->getIterator());
   assert(Tail && "split preflight must guarantee a redirected use");
   RecoverySpilledVRegs.insert(B);
-  Emitter->beginPass(IsVGPR, demandFor(poolOf(MRI->getRegClass(B))));
+  Emitter->beginPass(IsVGPR);
   ColorMap.erase(B);
   Emitter->spillOneVMP(VRegMaskPair(B, MRI->getMaxLaneMaskForVReg(B)),
                        LIS->getInterval(B).beginIndex());
@@ -3275,7 +2677,7 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
 
       const TargetRegisterClass *RC = MRI->getRegClass(Cur);
       bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
-      Emitter->beginPass(IsVGPR, demandFor(poolOf(RC)));
+      Emitter->beginPass(IsVGPR);
       auto CFV = [&](Register C) {
         if (C.isVirtual() && LIS->hasInterval(C) && !ColorMap.count(C))
           colorOneInPlace(C);
@@ -3374,7 +2776,7 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
         reportPointOverPressure(Cur, IsVGPR, RPLimit, "re-spill-blocked");
 
       LLVM_DEBUG(dbgs() << "  spill-self floor\n");
-      Emitter->beginPass(IsVGPR, demandFor(poolOf(RC)));
+      Emitter->beginPass(IsVGPR);
       MachineInstr *DefMI = MRI->getVRegDef(Cur);
       assert(DefMI && "uncolorable value must have a def in SSA");
       SlotIndex KillIdx = LIS->getInstructionIndex(*DefMI).getRegSlot();
@@ -3632,7 +3034,7 @@ void AMDGPUSSARegisterAllocator::preassignValuesLiveAcrossCalls() {
           continue;
         }
         LLVM_DEBUG(dbgs() << "  " << printReg(V, TRI) << " -> spill across\n");
-        Emitter->beginPass(IsVGPR, demandFor(poolOf(MRI->getRegClass(V))));
+        Emitter->beginPass(IsVGPR);
         VRegMaskPair SpillVMP(V, MRI->getMaxLaneMaskForVReg(V));
         if (!Emitter->canSpill(SpillVMP)) {
           LLVM_DEBUG(dbgs() << "  " << printReg(V, TRI)
@@ -3650,9 +3052,9 @@ void AMDGPUSSARegisterAllocator::preassignValuesLiveAcrossCalls() {
 
 void AMDGPUSSARegisterAllocator::color() {
   SSARA_TRACE();
-  // The vreg set has moved since the up-front classification: the earlier
-  // stage's spills and the pre-spill work added values. Rebuild the width tiers
-  // for this stage before anything consults them.
+  // The vreg set may have moved since the earlier classification: recovery in
+  // the preceding allocation stage can add reload values. Rebuild the width
+  // tiers for this stage before anything consults them.
   classifyVRegs();
 
   PendingTies.clear();
@@ -4752,7 +4154,7 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
     // register file: VGPR -> V_SWAP_B32 (GFX9+) or a V_XOR triplet; SGPR -> an
     // S_XOR triplet (only reached when SCC is dead, per the UseScratch decision
     // above, since S_XOR writes SCC). Collect the full cycle, then emit n-1
-    // swaps from tail to head.
+    // swaps from head to tail.
     LLVM_DEBUG(
         dbgs() << "    cycle via "
                << (!IsVGPR ? "S_XOR" : (ST->hasSwap() ? "V_SWAP_B32" : "V_XOR"))
@@ -4765,7 +4167,7 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
       DstToSrc.erase(Cur);
       Cur = Next;
     }
-    for (int I = Cycle.size() - 1; I > 0; --I) {
+    for (unsigned I = 1; I < Cycle.size(); ++I) {
       emitSwap(MBB, InsertPt, Cycle[I - 1], Cycle[I]);
       LLVM_DEBUG(dbgs() << "      swap " << TRI->getName(Cycle[I - 1])
                         << " <-> " << TRI->getName(Cycle[I]) << "\n");
@@ -4795,8 +4197,7 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
     if (MBB.empty() || !MBB.front().isPHI())
       continue;
 
-    DenseMap<MachineBasicBlock *,
-             SmallVector<std::pair<MCRegister, MCRegister>>>
+    DenseMap<unsigned, SmallVector<std::pair<MCRegister, MCRegister>>>
         PredCopies;
 
     for (MachineInstr &MI : MBB) {
@@ -4820,6 +4221,9 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
       for (unsigned I = 1, E = MI.getNumOperands(); I < E; I += 2) {
         MachineOperand &SrcMO = MI.getOperand(I);
         MachineBasicBlock *Pred = MI.getOperand(I + 1).getMBB();
+        int PredNumber = Pred->getNumber();
+        assert(PredNumber >= 0 && "PHI predecessor must have a block number");
+        auto &Copies = PredCopies[static_cast<unsigned>(PredNumber)];
         ++NumPhiOperands;
 
         // An undef incoming value needs no copy, but DstPhys must still be
@@ -4828,7 +4232,7 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
         // IMPLICIT_DEF of DstPhys during copy insertion below (as generic
         // PHIElimination does for undef PHI operands).
         if (SrcMO.isUndef()) {
-          PredCopies[Pred].push_back({MCRegister(), DstPhys});
+          Copies.push_back({MCRegister(), DstPhys});
           ++NumPhiUndefEdges;
           ++FnUndef;
           continue;
@@ -4846,7 +4250,7 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
         }
 
         if (SrcPhys != DstPhys) {
-          PredCopies[Pred].push_back({SrcPhys, DstPhys});
+          Copies.push_back({SrcPhys, DstPhys});
           // Not a fixed point: a copy will be emitted on this edge. Weight it
           // by 2^loopdepth(Pred) so loop-carried copies dominate the cost, per
           // the paper's cost_f (eq.1).
@@ -4900,7 +4304,16 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
     }
     MBB.sortUniqueLiveIns();
 
-    for (auto &[Pred, Copies] : PredCopies) {
+    SmallVector<unsigned> PredNumbers;
+    PredNumbers.reserve(PredCopies.size());
+    for (const auto &Entry : PredCopies)
+      PredNumbers.push_back(Entry.first);
+    llvm::sort(PredNumbers);
+
+    for (unsigned PredNumber : PredNumbers) {
+      MachineBasicBlock *Pred = MF.getBlockNumbered(PredNumber);
+      assert(Pred && "PHI predecessor block number must resolve");
+      auto &Copies = PredCopies.find(PredNumber)->second;
       MachineBasicBlock *InsertMBB = Pred;
       // The split decision covers null-source (IMPLICIT_DEF) entries too:
       // edgeCopiesNeedSplit only inspects the destination of each pair.
@@ -5637,7 +5050,6 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
   Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT, MLI);
   Emitter->setReporter(Reporter.get());
-  Emitter->setReloadEveryUse(RecoveryOnly);
 
   // Erase fully-DEAD IMPLICIT_DEFs (def-only vreg, zero uses) before coloring.
   // Such an instruction produces no value, but if left in it is still colored to a
@@ -5665,15 +5077,13 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
 
   if (EnableLaneWasteDump)
     reportLaneWaste(MF);
-  if (EnableBlockDemandDump)
-    reportBlockDemand(MF);
 
   // TWO INDEPENDENT ALLOCATION STAGES: SGPR first, then VGPR/AGPR. The SGPR
   // stage may spill SGPRs; those spills lower (downstream) to VGPR lanes needing
   // WWM scratch. Between stages we reserve ceil(spilledSGPRlanes / wavesize)
   // VGPRs (VGPRReserve, withheld by allocatablePool) so the VGPR stage does not
   // consume the whole file. Each stage colors, recovers, and rewrites ONLY its
-  // file's vregs (StageFile filters color()/preSpill/region-rp/rewriteStage);
+  // file's vregs (StageFile filters color()/recovery/rewriteStage);
   // the files are disjoint register sets, so this only reorders within a file.
   Emitter->clearSGPRSpillLanes();
   for (RegFile Stage : {RegFile::SGPR, RegFile::VGPR}) {
@@ -5705,89 +5115,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // re-anchors it per block. No-op / not built unless the flag AND a forensic
   // sink are on.
   setupShadowTree();
-  if (!RecoveryOnly)
-    preSpillToLimitWidthAware(MF);
   color();
-
-  // [Stage 3] Region RP-reduction: do our BEST-EFFORT spill-across to drop the
-  // point-pressure below Limit in the tight regions, then RECOLOR ONCE from clean.
-  // We do NOT iterate to convergence — spill-across only relieves genuine RP
-  // over-pressure; whatever remains uncolorable after one relieved recolor is the
-  // range-interference/fragmentation residual, which the SPLIT path below handles.
-  // (Iterating recolor here fought the split path and churned; one pass + hand off
-  // to split is the design.)
-  // Iterate spill-across + recolor to CONVERGENCE. A single pass is not enough:
-  // recoloring from clean after the first round's spills can repack colored
-  // values so that a value which WAS colorable now sits at a fresh over-pressure
-  // point (measured Case B: colored point-RP == Limit over the value's own tiny
-  // range, over by exactly its width). That new failure was not visible to the
-  // first sweep (the value was still colored then). On the NEXT pass the now-
-  // uncolorable value enters the sweep as an uncolored crosser, so the profile
-  // sees RP > Limit at its range and spills a live-through across it. Loop until
-  // no uncolorables remain, or a pass performs no spill (genuine residual for the
-  // split path), guarded by a hard cap.
-  if (!RecoveryOnly && !UncolorableVRegs.empty()) {
-    // TEMPORARY / KNOWN-FLAWED termination (stopgap — see task #47 for the real
-    // fix, an atomic region-relief transaction). The measure is the post-recolor
-    // uncolorable COUNT: keep a round only if it strictly beats the previous
-    // round's count. PrevCount starts at ~0u so round 0 is always kept.
-    //
-    // WHY IT'S FLAWED: the count is NOT a sound monotone measure. A round can
-    // spill the failing value (count -1) while its reload remnant [reload,use] is
-    // itself uncolorable (count +1) -> net equal -> this bails on a round that
-    // actually made structural progress. And reload redefs are re-admitted as
-    // candidates next round (unlike the pre-spiller's frozen universe), so without
-    // this coarse break the loop can rolling-wave. The count break only bounds it;
-    // it does not cleanly separate progress from churn. The real solution collects
-    // the whole feasible spill+split+self-spill set for the region and commits it
-    // atomically (task #47), making per-round convergence bookkeeping unnecessary.
-    // Kept as-is only to unblock corpus measurement of the AGPR/dead-def work.
-    unsigned PrevCount = ~0u;
-    for (unsigned Round = 0; !UncolorableVRegs.empty(); ++Round) {
-      LLVM_DEBUG(dbgs() << "=== region-rp round " << Round << ": "
-                        << UncolorableVRegs.size()
-                        << " uncolorable -> spill-across pass ===\n");
-      // E2 RoundStarted.
-      uint64_t RoundID = Reporter->roundStarted(Round, UncolorableVRegs.size());
-      if (!reduceRegionPressure(MF)) {
-        // E3 RoundCompleted (no spill -> residual for the split path).
-        Reporter->roundCompleted(Round, UncolorableVRegs.size(),
-                                 /*Spilled=*/false, RoundID);
-        break; // nothing spilled this round -> residual is split-path work
-      }
-      OccupiedRegUnits.clear();
-      OccupiedRegUnits.resize(TRI->getNumRegUnits());
-      ColorMap.clear();
-      MaxVGPRIdx = 0;
-      MaxSGPRIdx = 0;
-      MaxAGPRIdx = 0;
-      UncolorableVRegs.clear();
-      setupShadowTree(); // rebuild the shadow tree for the fresh recolor
-      color();
-      LLVM_DEBUG(dbgs() << "=== region-rp round " << Round << ": after recolor, "
-                        << UncolorableVRegs.size() << " uncolorable remain ===\n");
-      // E3 RoundCompleted (a spill happened this round).
-      Reporter->roundCompleted(Round, UncolorableVRegs.size(),
-                               /*Spilled=*/true, RoundID);
-      // PROGRESS = strict decrease of the uncolorable count. This round spilled
-      // (reduceRegionPressure returned true) and recolored from clean; if that did
-      // not reduce how many values remain uncolorable, spill-across cannot relieve
-      // the residual (e.g. diamond values used inside every crossing region), so
-      // further rounds would only churn. Bail to the per-value split path. This is
-      // the sole termination condition — the measure strictly decreases every kept
-      // round and is bounded below by 0.
-      unsigned CurCount = UncolorableVRegs.size();
-      if (CurCount >= PrevCount) { // PrevCount==~0u on the first round -> kept
-        LLVM_DEBUG(dbgs() << "=== region-rp: no progress (" << PrevCount << " -> "
-                          << CurCount << " uncolorable) -> stop ===\n");
-        break;
-      }
-      PrevCount = CurCount;
-    }
-    LLVM_DEBUG(dbgs() << "=== region-rp: converged with "
-                      << UncolorableVRegs.size()
-                      << " uncolorable remain -> split path ===\n");
-  }
 
   // Spill-on-coloring-failure (approach A). A pure Hack coloring can fail on
   // AMDGPU even at RP ≤ limit (the %1072/%560 long-liver-through-tuple-churn
@@ -5834,11 +5162,11 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
     if (!UncolorableVRegs.empty()) {
       NumTierSpills += UncolorableVRegs.size();
       RecoveryComplete =
-          drainUncolorableWorklist(MF, /*ReportFailure=*/!RecoveryOnly);
+          drainUncolorableWorklist(MF, /*ReportFailure=*/false);
     }
 
-    if (RecoveryOnly && !RecoveryComplete) {
-      LLVM_DEBUG(dbgs() << "=== recovery-only: late cheap planner ===\n");
+    if (!RecoveryComplete) {
+      LLVM_DEBUG(dbgs() << "=== recovery: late direct planner ===\n");
       if (reduceRegionPressure(MF)) {
         OccupiedRegUnits.clear();
         OccupiedRegUnits.resize(TRI->getNumRegUnits());

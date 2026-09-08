@@ -278,7 +278,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
 
   // The register file the current allocation stage owns. Allocation runs in two
   // independent stages — SGPR first, then VGPR (fileOf maps AGPR to VGPR, so the
-  // vector stage handles VGPR+AGPR). color()/preSpill/region-rp process only
+  // vector stage handles VGPR+AGPR). color()/recovery process only
   // values of StageFile; the driver sets it before each stage.
   RegFile StageFile = RegFile::SGPR;
 
@@ -350,12 +350,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
                             RegFile Pool,
                             SmallVectorImpl<TierDemand> &Out) const;
 
-  /// The oracle bound to \p Pool, for the spill emitter's reload-placement
-  /// queries. The emitter must ask the same question spill planning does: its
-  /// own scalar count read getVGPRNum(), so for an AGPR value it compared a
-  /// pool of AGPRs against a total of arch VGPRs.
-  SSASpillEmitter::DemandFn demandFor(RegFile Pool) const;
-
   /// One in-region slot: the live set there and its deficiency. Carrying the SET
   /// rather than a number is what lets a candidate be priced by MEASUREMENT —
   /// re-query the oracle without the victim — instead of subtracting its width
@@ -378,27 +372,10 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// width, whenever a value's demand is compared against a region peak.
   unsigned coveredSlots(const TargetRegisterClass *RC, LaneBitmask Lanes) const;
 
-  /// 32-bit slots a spill of \p Lanes of \p V actually MOVES. Normally
-  /// coveredSlots, because the store narrows to the subregister the mask names and
-  /// the stack slot is sized to it; but a mask naming NO subregister falls back to
-  /// storing the whole register, and then the traffic is the full class.
-  unsigned spilledSlots(Register V, LaneBitmask Lanes) const;
-
-  /// Post-spill RP at the END of \p NCD (shared hoisted-reload site). Valid for an
-  /// empty NCD.
-  unsigned reloadRPAtBlockEnd(const MachineBasicBlock *NCD, bool IsVGPR) const;
-
   /// [Stage 1] Enumerate tight regions for \p File: per block, maximal contiguous
   /// slot spans where all-live RP (GCNUpwardRPTracker) > allocatablePool(File).
   void findTightRegions(MachineFunction &MF, RegFile File,
                         SmallVectorImpl<TightRegion> &Out) const;
-
-  /// Within tight region \p R, find the peak-RP slot at which \p V is LIVE (not
-  /// R's global peak, which may fall outside V's range). Returns {slot, RP}; RP is
-  /// 0 if V is live at no in-region slot. Same GCNUpwardRPTracker + pressureOf
-  /// machinery as findTightRegions, so the RP is bit-identical.
-  std::pair<SlotIndex, unsigned>
-  peakSlotForValueInRegion(const TightRegion &R, Register V) const;
 
   /// What a region holds of one virtual register: the UNION of the lane masks the
   /// tracker reported live at in-region slots, and how many such slots. The mask is
@@ -413,8 +390,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// oracle, so it is directly comparable to R.Deficiency. With \p Occupants the
   /// same walk also reports every virtual register live inside R — which IS the
   /// overlap test, hole-accurate by construction. With \p Slots it reports each
-  /// in-region slot's instruction, live set, and deficiency, which the cumulative
-  /// set planner copies and re-evaluates. With \p PeakTiers it reports which
+  /// in-region slot's instruction, live set, and deficiency, which the direct
+  /// planner copies and re-evaluates. With \p PeakTiers it reports which
   /// (pool, width) tiers were short at the worst slot.
   /// Returns 0 if the region packs, or if R's first instruction no longer exists.
   unsigned measureRegionPeak(
@@ -423,54 +400,10 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
       SmallVectorImpl<RegionSlot> *Slots = nullptr,
       SmallVectorImpl<TierDemand> *PeakTiers = nullptr) const;
 
-  /// Print the values live at the worst slot in \p Slots with their widths, so a
-  /// relief prediction that did not come true can be compared against what
-  /// actually stayed resident. Debug output only.
-  void dumpWorstSlotLiveSet(ArrayRef<RegionSlot> Slots, const char *Tag) const;
-
   /// Diagnostic (-amdgpu-ssa-lane-waste-dump): per function and file, report the
   /// peak whole-tuple occupancy this allocator charges against the subrange
   /// occupancy LiveRegMatrix would charge. Mutates no allocator state.
   void reportLaneWaste(MachineFunction &MF) const;
-
-  /// TEMPORARY diagnostic (-amdgpu-ssa-block-demand-dump): per slot, how many
-  /// live values carry each (class width, allocation stride) pair, beside the
-  /// lane-accurate pressure and the whole-block dword sum. Measurement input for
-  /// the width-aware region gate; delete together with it. Mutates no state.
-  void reportBlockDemand(MachineFunction &MF) const;
-
-  /// Spill a complete area-planned set for one tight region. Candidates are
-  /// frozen-\p Universe occupants admitted by \p Eligible. No source mutation is
-  /// performed unless virtual oracle evaluation reaches zero deficiency.
-  /// Spilled victims are added to \p Spilled.
-  ///
-  /// TEMPORARY: this borrows reduceRegionPressure's planner and measured-relief
-  /// rule but remains a SECOND victim-selection loop over the same regions. The
-  /// intended end state is one shared per-region loop parameterized by candidate
-  /// admission; see the note at the top of the definition.
-  /// The width-aware pre-spiller passes Eligible = always; other callers may
-  /// restrict which frozen candidates participate in area planning.
-  /// If \p NumRecolored is non-null, it is incremented by the number of victims
-  /// relieved by AGPR RECOLOR (not memory spill) — a MONOTONE action (AGPR budget
-  /// and the frozen universe both strictly shrink), so a round that recolored is
-  /// always real progress and the caller must NOT apply its rolling-wave guard.
-  bool relieveTightRegion(const TightRegion &R,
-                          const SmallDenseSet<Register, 128> &Universe,
-                          SmallDenseSet<Register, 64> &Spilled,
-                          llvm::function_ref<bool(Register)> Eligible,
-                          unsigned *NumRecolored = nullptr);
-
-  /// Width-aware up-front pre-spiller. At each tight region's peak, spills frozen
-  /// victims (kill-at-def store, reload at use) until the peak fits the allocatable
-  /// pool; runs BEFORE color() so the coloring walk succeeds by construction. The
-  /// victim universe spans ALL widths and victims are chosen WIDEST-FIRST,
-  /// decrementing the region peak by each victim's real dword width, which is what
-  /// lets it relieve regions dominated by wide tuples (SGPR/VGPR vreg_64/128/...).
-  /// Models per-width availability honestly (pool/W aligned tuples per class) but
-  /// does NOT claim to resolve aligned-tuple fragmentation (chi>omega): pool-fit is
-  /// necessary, not always sufficient; placement residuals still flow to color()'s
-  /// recovery. Returns true if anything was spilled.
-  bool preSpillToLimitWidthAware(MachineFunction &MF);
 
   /// [Recovery classifier, Stage 1] Register file of a class for the recovery
   /// window. AGPR folds into VGPR so the file matches pressureOf(VGPR)'s unified
@@ -500,54 +433,28 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// reclamation for a temporarily uncolored crosser.
   RecoveryResult tryCrossFileHome(Register R);
 
-  /// [Stage 2] Cost of spilling candidate \p B to relieve region \p R.
-  ///   Cost     : NReloads * Width. NReloads = 1 when B's uses are commonly
-  ///              dominated and the shared reload hoists to their NCD; else one
-  ///              reload per use, plus one per predecessor supplying a PHI use.
-  ///   Width    : dwords the spill of \p Lanes MOVES (spilledSlots) — traffic, not
-  ///              relief. The cumulative planner uses it only to price traffic;
-  ///              area uses coveredSlots and actual freed RegionSlot sites.
-  /// Every candidate is priceable: a reload only ever restores a register the
-  /// reload point already needed. Traffic cost is a deterministic tie-breaker;
-  /// cumulative oracle evaluation decides admission.
-  struct SpillCost {
-    unsigned Cost;
-    unsigned Width;
-  };
-  SpillCost costOfSpilling(Register B, const TightRegion &R, LaneBitmask Lanes);
-
   struct SpillCandidateInput {
     Register V;
     LaneBitmask Lanes;
-    bool CanRecolor = false;
   };
 
   struct AreaSpillAction {
-    enum KindTy { Memory, Recolor };
     Register V;
     LaneBitmask Lanes;
-    KindTy Kind = Memory;
     uint64_t Area = 0;
-    unsigned Cost = 0;
-    bool FootprintExact = false;
   };
 
-  /// Build a cumulative non-emitting spill set over copies of \p Slots. Area
-  /// orders the search; demandDeficiency remeasurement is authoritative. PHI
-  /// webs are excluded until their multi-value footprint can be modeled as one
-  /// atomic unit. Returns false when no candidate improves virtual deficiency.
-  /// Recovery-only experiments retain at most one candidate per region.
+  /// Select one direct-placement spill candidate that improves the copied
+  /// region deficiency. PHI webs are excluded until their multi-value footprint
+  /// can be modeled as one atomic unit.
   bool planAreaSpillSet(const TightRegion &R, ArrayRef<RegionSlot> Slots,
                         ArrayRef<SpillCandidateInput> Inputs,
-                        unsigned RecolorBudget,
                         SmallVectorImpl<AreaSpillAction> &Actions,
                         unsigned *RemainingShort = nullptr);
 
-  /// [Stage 3] Region RP-reduction driver. While tight regions remain, service
-  /// the worst (highest Peak) by spilling the cheapest feasible crosser ACROSS
-  /// that region (kill at R.Start so its register frees over R and the reload
-  /// lands after R), then recompute regions globally. Returns true if any spill
-  /// was performed (caller then re-colors from clean). Bounded by a round cap.
+  /// Late direct-placement spill planner for failures that recovery could not
+  /// resolve. Select at most one candidate per tight region; the caller then
+  /// recolors once and performs a final recovery drain.
   bool reduceRegionPressure(MachineFunction &MF);
 
   /// SelfSplit recovery strategy: \p Failed is

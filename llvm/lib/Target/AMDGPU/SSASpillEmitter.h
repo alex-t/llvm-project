@@ -11,28 +11,23 @@
 /// register allocator.
 ///
 /// This is NOT a pass. It is the pure "how to spill a value safely" mechanism:
-/// a store-at-def plus dominance-ordered reloads plus inline SSA repair, with
-/// no EXEC drift. Both the up-front spill planner and coloring (which discovers
-/// a value with no free register during assignment) emit through it.
+/// a store-at-def plus reload-before-use placement and inline SSA repair, with
+/// no EXEC drift. Coloring recovery and the late direct planner emit through it.
 ///
 /// Policy — *which* value to spill and *when* — stays with the caller. This
 /// class owns only the emission machinery and the per-value state it needs
-/// (stack slots, store-at-def memo, reload cache, the SSA updater).
+/// (stack slots, store-at-def memo, the SSA updater).
 ///
 //===----------------------------------------------------------------------===//
 
 #ifndef LLVM_LIB_TARGET_AMDGPU_SSASPILLEMITTER_H
 #define LLVM_LIB_TARGET_AMDGPU_SSASPILLEMITTER_H
 
-#include "GCNRegPressure.h"
 #include "SIInstrInfo.h"
-#include "SIMachineFunctionInfo.h"
 #include "SIRegisterInfo.h"
 #include "VRegMaskPair.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallBitVector.h"
-#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -40,7 +35,6 @@
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
-#include <functional>
 #include <memory>
 
 namespace llvm {
@@ -67,26 +61,6 @@ inline bool isReloadInstr(const MachineInstr *MI) {
 /// spiller's marker path and the emitter's reload placement.
 bool usesSpilledVMP(const MachineInstr *MI, VRegMaskPair SpilledVMP,
                     const SIRegisterInfo *TRI, const MachineRegisterInfo *MRI);
-
-/// Dom-group: head instruction dominates a list of other uses. (Moved here with
-/// the reload machinery that builds and consumes it.)
-class DomGroup {
-  MachineInstr *Head;
-  SmallVector<MachineInstr *, 4> DominatedUses;
-
-public:
-  DomGroup(MachineInstr *MI) : Head(MI) {}
-  MachineInstr *getHead() const { return Head; }
-  const SmallVector<MachineInstr *, 4> &getDominatedUses() const {
-    return DominatedUses;
-  }
-  void addDominatedUse(MachineInstr *MI) { DominatedUses.push_back(MI); }
-  void promoteHead(MachineInstr *NewHead) {
-    DominatedUses.push_back(Head);
-    Head = NewHead;
-  }
-  size_t size() const { return 1 + DominatedUses.size(); }
-};
 
 /// One ground (non-PHI) operand of a PHI web, on a specific PHI incoming edge.
 /// The store + color-pinning COPY belongs at THAT predecessor's end (the classic
@@ -115,39 +89,12 @@ struct PhiWeb {
   bool valid() const { return Root.isValid() && !GroundOps.empty(); }
 };
 
-/// SpillInfo: one value's spill decision with pre-built dom-groups.
-struct SpillInfo {
-  VRegMaskPair SpilledVMP;
-  SlotIndex KillIdx;
-  int FrameIndex;
-  SmallVector<DomGroup, 4> DomGroups;
-  // PHI uses of the spilled value, kept out of the dominance-merged DomGroups
-  // (a PHI reads on the predecessor edge, not at its own slot). Reloaded via
-  // insertReloadForUse's per-predecessor path.
-  SmallVector<MachineInstr *, 4> PhiUses;
-};
-
 /// Exec-safe SSA spill/reload emitter. Construct once per function (it caches
 /// per-function state: stack slots, store-at-def memo). The allocator holds one
 /// and calls spillOneVMP() to spill a value. Call
 /// beginPass() before each register-file pass to (re)create the SSA updater,
-/// select the file mechanics, and bind the demand oracle for the pool.
+/// and select the file mechanics.
 class SSASpillEmitter {
-public:
-  /// The allocator's demand oracle for one register pool: given a live set,
-  /// how many of its values have no placement in that pool. Injected rather
-  /// than reimplemented so spill emission and spill planning share one
-  /// pressure model.
-  using DemandFn = std::function<unsigned(const GCNRPTracker::LiveRegSet &)>;
-
-  /// Pre-emission register residency at caller-supplied instruction sites.
-  /// Exact is false when dominance-sharing between reloads can only be decided
-  /// after earlier reload redefs have been inserted and LiveIntervals recomputed.
-  struct SpillFootprint {
-    SmallBitVector ResidentSlots;
-    bool Exact = true;
-  };
-
 private:
   // Analyses / target info (borrowed, not owned).
   MachineFunction &MF;
@@ -168,41 +115,14 @@ private:
   DenseMap<VRegMaskPair, int> Virt2StackSlotMap;      // value -> stack slot
   DenseMap<VRegMaskPair, MachineInstr *> StoredAtDefinition; // store-at-def memo
 
-  struct FootprintUseAnalysis {
-    SmallVector<DomGroup, 4> Groups;
-    SmallVector<MachineInstr *, 4> PhiUses;
-  };
-  DenseMap<std::pair<MachineInstr *, VRegMaskPair>, FootprintUseAnalysis>
-      FootprintUseCache;
-
-  // Per-spill caches (cleared at the start of each emitReloadsAndRepairSSA).
-  DenseMap<std::pair<MachineBasicBlock *, VRegMaskPair>, Register>
-      BlockReloadCache;                                // per-block reload dedup
-  // reload-hoist deficiency cache
-  DenseMap<MachineBasicBlock *, unsigned> DeficiencyCache;
-
-  void invalidateFootprintUseCache() { FootprintUseCache.clear(); }
-  const FootprintUseAnalysis &
-  getFootprintUseAnalysis(VRegMaskPair VMP, SlotIndex KillIdx);
-
   // Reload redefs create fresh vregs; callers exclude these from their own spill
   // candidate sets (a reload must not be immediately re-spilled). Written by the
   // emitter, read by policy via reloadedRegs().
   VRegMaskPairSet ReloadedRegs;
 
-  // Current file being spilled: selects vector vs scalar spill MECHANICS (AGPR
-  // is a vector file, so it too sets this). NOT a pool selector — the pool
-  // lives in PoolDeficiency below. Set by beginPass().
+  // Current file being spilled: selects vector vs scalar spill MECHANICS.
+  // AGPR is a vector file, so it too sets this. Set by beginPass().
   bool IsVGPRPass = false;
-
-  // The allocator's width-aware demand oracle, bound to the pool being spilled.
-  // Returns how many live values have no placement in that pool, so non-zero
-  // means a reload put there has nowhere to land. Reload-hoist decisions ask
-  // this instead of comparing a scalar count to a budget: the emitter must ask
-  // the same question the planner does, and its own count charged an AGPR value
-  // against the arch-VGPR total. Set by beginPass().
-  DemandFn PoolDeficiency;
-  bool ReloadEveryUse = false;
 
   // Set transiently if a reload redef leaves SSA broken; inline repair clears it.
   bool SSAInvalidated = false;
@@ -232,53 +152,25 @@ private:
   MachineInstr *spillAtDefinition(VRegMaskPair VMP);
   int assignVirt2StackSlot(VRegMaskPair VMP);
   int createSpillSlot(const TargetRegisterClass *RC);
-  void buildDomGroups(ArrayRef<MachineInstr *> Uses,
-                      SmallVectorImpl<DomGroup> &Groups);
-  void buildDomGroupsForSpill(SpillInfo &Info);
-  void emitReloadsAndRepairSSA(SpillInfo &Info);
+  void emitReloadsAndRepairSSA(VRegMaskPair SpilledVMP, SlotIndex KillIdx);
   std::pair<Register, MachineInstr *>
   getOrCreateReloadInBlock(MachineBasicBlock *BB, VRegMaskPair SpilledVMP,
                            MachineInstr *InsertBefore = nullptr,
                            LaneBitmask ReloadMask = LaneBitmask::getAll());
-  bool insertReloadForUse(MachineInstr *UseMI, VRegMaskPair SpilledVMP,
-                          MachineBasicBlock *KillBB);
+  bool insertReloadForUse(MachineInstr *UseMI, VRegMaskPair SpilledVMP);
   MachineBasicBlock *getEffectiveKillBB(MachineBasicBlock *SpillBB) const;
-  std::pair<MachineBasicBlock *, MachineInstr *>
-  adjustReloadForLoop(MachineBasicBlock *ReloadBB, MachineInstr *InsertBeforeMI,
-                      MachineBasicBlock *KillBB, Register SpilledReg);
-  std::pair<MachineBasicBlock *, MachineInstr *>
-  reloadPlacementForUse(MachineInstr *UseMI, MachineBasicBlock *KillBB,
-                        Register SpilledReg);
-  unsigned maxDeficiencyForBlock(MachineBasicBlock *MBB);
-  unsigned maxDeficiencyInBlockDownTo(MachineBasicBlock *MBB,
-                                      MachineInstr *StopMI);
-  // Max deficiency over the same-block span [DefMI, UseMI]; 0 if not same
-  // block. Non-zero means a same-block reaching reload spans a point where the
-  // pool cannot place everything live.
-  unsigned maxDeficiencyBetween(MachineInstr *DefMI, MachineInstr *UseMI);
-  // \p SpanLoop, when non-null, is a loop the hoisted reload stays live across
-  // on every iteration; blocks inside it are measured in full rather than only
-  // down to the first use.
-  bool canHoistReloadTo(MachineBasicBlock *NCD, MachineInstr *InsertPoint,
-                        Register SpilledReg,
-                        const MachineLoop *SpanLoop = nullptr);
   bool ordinaryVALUUseIsExecSafe(MachineInstr *UseMI) const;
-  bool walkPathsToUses(
-      MachineBasicBlock *StartBB, Register SpilledReg,
-      llvm::function_ref<bool(MachineBasicBlock *, MachineInstr *)> IsBad,
-      bool StopOnBad = true) const;
 
 public:
   SSASpillEmitter(MachineFunction &MF, LiveIntervals *LIS, SlotIndexes *Indexes,
                   MachineDominatorTree *DT, const MachineLoopInfo *MLI);
 
-  /// (Re)create the SSA updater, select the file mechanics (\p IsVGPR: vector
-  /// vs scalar), and bind \p Demand as the oracle for the pool being spilled.
+  /// (Re)create the SSA updater and select the file mechanics
+  /// (\p IsVGPR: vector vs scalar).
   /// Call before a fresh register-file pass. Does NOT clear the store-at-def
   /// memo or stack-slot map (those persist per function) nor ReloadedRegs (the
   /// caller controls that via clearReloadedRegs()).
-  void beginPass(bool IsVGPR, DemandFn Demand);
-  void setReloadEveryUse(bool Enable) { ReloadEveryUse = Enable; }
+  void beginPass(bool IsVGPR);
 
   /// Attach the forensic reporter (observer; may be null). Records spill/reload
   /// facts (E14/E15) when set and enabled. Does not take ownership.
@@ -299,20 +191,9 @@ public:
 
   /// THE primitive both callers use. Spill \p VMP: store at its definition
   /// (EXEC-safe — all lanes captured while EXEC is full), free the register from
-  /// \p KillIdx onward, place dominance-ordered reloads at the reachable uses,
-  /// and repair SSA inline. Reload-hoist decisions consult the pool oracle
-  /// bound by beginPass().
+  /// \p KillIdx onward, place a reload directly before each reachable use, and
+  /// repair SSA inline.
   void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx);
-
-  /// Model which of \p Sites in the block-local \p RegionBB still require
-  /// register residency after spilling \p VMP at \p KillIdx. Store-at-def,
-  /// loop-adjusted reload placement, and PHI predecessor-edge reloads use the
-  /// same placement helpers as emission.
-  /// Dominance-sharing is conservatively over-approximated because its exact
-  /// frontier is created incrementally by emitted reload redefs.
-  SpillFootprint modelSpillFootprint(VRegMaskPair VMP, SlotIndex KillIdx,
-                                     MachineBasicBlock *RegionBB,
-                                     ArrayRef<MachineInstr *> Sites);
 
   /// In-memory PHI-web coalescing of an ALREADY-CLOSED, feasible web \p Web
   /// (detection, the shared-slot soundness gate, AND the reload-feasibility gate
@@ -338,14 +219,6 @@ public:
 
   /// Ground operands stored by the last spillPhiWeb() (driver marks them Spilled).
   ArrayRef<Register> lastWebGround() const { return LastWebGround; }
-
-  // reloadRPBeforeUse / reloadRPAtBlockEnd moved to the RA (feasibility policy).
-
-  /// [Stage 2] Public forwarder to canHoistReloadTo: can \p B's shared reload
-  /// hoist to \p NCD (reload at NCD end) with a placement on every NCD->use path?
-  bool canHoistReload(MachineBasicBlock *NCD, Register B) {
-    return canHoistReloadTo(NCD, /*InsertPoint=*/nullptr, B);
-  }
 
   /// After a partial spill leaves \p WideVReg with only its \p RemnantMask lanes
   /// live (a contiguous sub-register named by \p SubIdx), extract that remnant

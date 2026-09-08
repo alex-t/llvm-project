@@ -8,8 +8,7 @@
 ///
 /// \file
 /// \brief Exec-safe SSA spill/reload emission mechanism (see SSASpillEmitter.h).
-/// Reload-placement decisions query the pool demand oracle bound by beginPass,
-/// so emission and spill planning share one pressure model.
+/// Reloads are placed directly before reachable uses.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -17,7 +16,6 @@
 #include "SSAForensicReporter.h"
 #include "AMDGPU.h"
 #include "AMDGPURegAllocInsertion.h"
-#include "GCNRegPressure.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIRegisterInfo.h"
@@ -72,13 +70,9 @@ SSASpillEmitter::SSASpillEmitter(MachineFunction &MF, LiveIntervals *LIS,
   FrameInfo = &MF.getFrameInfo();
 }
 
-void SSASpillEmitter::beginPass(bool IsVGPR, DemandFn Demand) {
+void SSASpillEmitter::beginPass(bool IsVGPR) {
   SSARA_TRACE();
-  if (IsVGPRPass != IsVGPR)
-    invalidateFootprintUseCache();
   IsVGPRPass = IsVGPR;
-  PoolDeficiency = std::move(Demand);
-  assert(PoolDeficiency && "spill emission needs the pool demand oracle");
   // Fresh SSA updater per pass (caches IDF computations per run).
   SSAUpdater = std::make_unique<MachineLaneSSAUpdater>(MF, *LIS, *DT, *TRI);
 }
@@ -145,7 +139,6 @@ int SSASpillEmitter::createSpillSlot(const TargetRegisterClass *RC) {
 void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx) {
   SSARA_TRACE();
   assert(canSpill(VMP) && "spill has no legal, EXEC-safe insertion plan");
-  invalidateFootprintUseCache();
 
   LLVM_DEBUG({
     Register VReg = VMP.getVReg();
@@ -170,23 +163,16 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx) {
   (void)DefStoreMI;
 
   // Step 2c: Get stack slot for reload phase
-  int FI = assignVirt2StackSlot(VMP);
+  assignVirt2StackSlot(VMP);
 
-  // Step 2d: Build SpillInfo with dom-groups and emit reloads. Reloads are
-  // placed at uses reachable from KillIdx (dominance-ordered), so uses above
-  // KillIdx keep the original register and are not reloaded.
-  SpillInfo Info;
-  Info.SpilledVMP = VMP;
-  Info.KillIdx = KillIdx;
-  Info.FrameIndex = FI;
-  buildDomGroupsForSpill(Info);
-  emitReloadsAndRepairSSA(Info);
+  // Step 2d: Place reloads at uses reachable from KillIdx, so uses above KillIdx
+  // keep the original register and are not reloaded.
+  emitReloadsAndRepairSSA(VMP, KillIdx);
 }
 
 void SSASpillEmitter::spillPhiWeb(
     const PhiWeb &Web, llvm::function_ref<void(Register)> ColorFreshVReg) {
   SSARA_TRACE();
-  invalidateFootprintUseCache();
   LastWebErased.clear();
   LastWebGround.clear();
   // Detection, the shared-slot soundness gate, AND the reload-feasibility gate all
@@ -282,17 +268,13 @@ void SSASpillEmitter::spillPhiWeb(
       continue;
     VRegMaskPair VMP(M, MRI->getMaxLaneMaskForVReg(M));
     Virt2StackSlotMap[VMP] = FI;
-    SpillInfo Info;
-    Info.SpilledVMP = VMP;
-    Info.KillIdx = LIS->getInstructionIndex(*MDef).getRegSlot();
-    Info.FrameIndex = FI;
-    buildDomGroupsForSpill(Info);
-    emitReloadsAndRepairSSA(Info);
+    emitReloadsAndRepairSSA(VMP,
+                            LIS->getInstructionIndex(*MDef).getRegSlot());
   }
 
   for (Register M : PhiMembers) {
-    // A member already spilled up-front (by the pre-spiller) owns a store-at-def
-    // to its OWN slot. The web supersedes that spill: the ground ops write the
+    // A member already spilled as a plain value owns a store-at-def to its OWN
+    // slot. The web supersedes that spill: the ground ops write the
     // shared web slot FI, and any external uses of M were reloaded from FI by the
     // loop above (it repointed M via Virt2StackSlotMap[VMP] = FI). So M's old
     // store-at-def is now dead — nothing reads its slot — and erasing M's PHI def
@@ -329,7 +311,6 @@ void SSASpillEmitter::spillPhiWeb(
 bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
                                             LaneBitmask RemnantMask) {
   SSARA_TRACE();
-  invalidateFootprintUseCache();
   MachineInstr *DefMI = MRI->getVRegDef(WideVReg);
   if (!DefMI)
     return false;
@@ -423,7 +404,6 @@ bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
 Register SSASpillEmitter::splitLiveRangeAt(Register V,
                                            MachineBasicBlock::iterator SplitPt) {
   SSARA_TRACE();
-  invalidateFootprintUseCache();
   if (!LIS->hasInterval(V))
     return Register();
   MachineBasicBlock &MBB = *SplitPt->getParent();
@@ -610,94 +590,6 @@ MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
   return &StoreMI;
 }
 
-// ===========================================================================
-// IDF-First PHI Insertion Strategy
-// ===========================================================================
-
-void SSASpillEmitter::buildDomGroups(
-    ArrayRef<MachineInstr *> Uses, SmallVectorImpl<DomGroup> &Groups) {
-  SmallVector<MachineInstr *, 8> OrderedUses(Uses.begin(), Uses.end());
-
-  llvm::sort(OrderedUses, [this](MachineInstr *A, MachineInstr *B) {
-    if (DT->dominates(A, B))
-      return true;
-    if (DT->dominates(B, A))
-      return false;
-    return Indexes->getInstructionIndex(*A) <
-           Indexes->getInstructionIndex(*B);
-  });
-
-  Groups.clear();
-  for (MachineInstr *UseMI : OrderedUses) {
-    bool Merged = false;
-    for (DomGroup &G : Groups) {
-      if (DT->dominates(G.getHead(), UseMI)) {
-        G.addDominatedUse(UseMI);
-        Merged = true;
-        break;
-      }
-      if (DT->dominates(UseMI, G.getHead())) {
-        G.promoteHead(UseMI);
-        Merged = true;
-        break;
-      }
-    }
-    if (!Merged)
-      Groups.emplace_back(UseMI);
-  }
-}
-
-void SSASpillEmitter::buildDomGroupsForSpill(SpillInfo &Info) {
-  SSARA_TRACE();
-  Register SpilledReg = Info.SpilledVMP.getVReg();
-  MachineInstr *KillMI = Indexes->getInstructionFromIndex(Info.KillIdx);
-
-  LLVM_DEBUG(dbgs() << "buildDomGroupsForSpill for "
-                    << printReg(SpilledReg, TRI) << "\n");
-
-  // Collect all uses into a vector for sorting. PHI uses are collected
-  // SEPARATELY (Info.PhiUses): a PHI reads its operand on the PREDECESSOR edge,
-  // not at the PHI's own slot, so it cannot take part in the dominance-merge
-  // grouping below (which reasons about the use instruction's position) and its
-  // reload belongs in the predecessor. emitReloadsAndRepairSSA routes PHI uses
-  // straight to insertReloadForUse, which already places a per-predecessor
-  // reload. Skipping them entirely (the old behavior) left a PHI-only-used value
-  // with a store but NO reload, so its live range never shrank and it was
-  // re-spilled forever.
-  SmallVector<MachineInstr *, 8> AllUses;
-  for (MachineInstr &UseMI : MRI->use_nodbg_instructions(SpilledReg)) {
-    if (isSpillInstr(&UseMI))
-      continue;
-
-    MachineOperand *UseOp =
-        UseMI.findRegisterUseOperand(SpilledReg, TRI, /*isKill=*/false);
-    if (!UseOp)
-      continue;
-
-    VRegMaskPair UseVMP(*UseOp, TRI, MRI);
-    if (!UseVMP.overlaps(Info.SpilledVMP))
-      continue;
-
-    if (UseMI.isPHI()) {
-      // Reachability for a PHI is per-edge (each operand's incoming block);
-      // insertReloadForUse re-checks each operand, so collect unconditionally.
-      Info.PhiUses.push_back(&UseMI);
-      continue;
-    }
-
-    // Only consider uses reachable from KillMI
-    if (!DT->dominates(KillMI, &UseMI) &&
-        !SSAUpdater->isUseReachableFromDef(KillMI, &UseMI, SpilledReg))
-      continue;
-
-    AllUses.push_back(&UseMI);
-  }
-
-  buildDomGroups(AllUses, Info.DomGroups);
-
-  LLVM_DEBUG(dbgs() << "  Built " << Info.DomGroups.size() << " dom-groups\n");
-}
-
 std::pair<Register, MachineInstr *>
 SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
                                           VRegMaskPair SpilledVMP,
@@ -713,20 +605,6 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
   LaneBitmask Slice = ReloadMask & SpilledVMP.getLaneMask();
   if (Slice.none())
     Slice = SpilledVMP.getLaneMask();
-  VRegMaskPair ReloadVMP(OrigVReg, Slice);
-
-  auto Key = std::make_pair(BB, ReloadVMP);
-
-  // Only use cache for block-end reloads (InsertBefore == nullptr)
-  if (!InsertBefore && !ReloadEveryUse) {
-    auto It = BlockReloadCache.find(Key);
-    if (It != BlockReloadCache.end()) {
-      LLVM_DEBUG(dbgs() << "    Reusing cached reload in "
-                        << printMBBReference(*BB) << ": "
-                        << printReg(It->second, TRI) << "\n");
-      return {It->second, nullptr}; // Cached - no new instruction
-    }
-  }
 
   // The reload REDEFINES OrigVReg[.sub] (a transient SSA violation) that the
   // spiller repairs inline via reaching-VNI reconstruction (see
@@ -864,10 +742,6 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
   // The reloaded value is tracked after inline repair renames it to a fresh
   // vreg (see emitReloadsAndRepairSSA).
 
-  // Cache only block-end reloads
-  if (!InsertBefore && !ReloadEveryUse)
-    BlockReloadCache[Key] = OrigVReg;
-
   LLVM_DEBUG(dbgs() << "    Created reload (redef) in "
                     << printMBBReference(*BB)
                     << (InsertBefore ? " before use" : " at block end") << ": "
@@ -881,8 +755,7 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
 }
 
 bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
-                                         VRegMaskPair SpilledVMP,
-                                         MachineBasicBlock *KillBB) {
+                                         VRegMaskPair SpilledVMP) {
   SSARA_TRACE();
   Register SpilledReg = SpilledVMP.getVReg();
   LaneBitmask SpilledMask = SpilledVMP.getLaneMask();
@@ -903,14 +776,6 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
         continue;
 
       MachineBasicBlock *PredBB = BBOp.getMBB();
-
-      // Check the predecessor has room for the reload
-      if (unsigned PredShort = maxDeficiencyForBlock(PredBB)) {
-        LLVM_DEBUG(dbgs() << "    WARNING: Predecessor "
-                          << printMBBReference(*PredBB) << " is short "
-                          << PredShort
-                          << " value(s), but must insert reload for PHI use\n");
-      }
 
       // Place the reload redef; SSA is repaired inline after all reloads.
       // Reload only the lanes this PHI operand reads.
@@ -933,250 +798,16 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
       UseMask |= VRegMaskPair(MO, TRI, MRI).getLaneMask();
   UseMask &= SpilledMask;
 
-  if (ReloadEveryUse) {
-    getOrCreateReloadInBlock(UseMI->getParent(), SpilledVMP, UseMI, UseMask);
-    return true;
-  }
-
-  // Non-PHI use: insert before use with loop adjustment
-  auto Adjusted = reloadPlacementForUse(UseMI, KillBB, SpilledReg);
-  MachineInstr *InsertBeforeUse =
-      (Adjusted.first == UseMI->getParent()) ? UseMI : nullptr;
-  // Place the reload redef; SSA is repaired inline after all reloads.
-  getOrCreateReloadInBlock(Adjusted.first, SpilledVMP, InsertBeforeUse, UseMask);
+  getOrCreateReloadInBlock(UseMI->getParent(), SpilledVMP, UseMI, UseMask);
   return true;
 }
 
-std::pair<MachineBasicBlock *, MachineInstr *>
-SSASpillEmitter::reloadPlacementForUse(MachineInstr *UseMI,
-                                       MachineBasicBlock *KillBB,
-                                       Register SpilledReg) {
-  return adjustReloadForLoop(UseMI->getParent(), UseMI, KillBB, SpilledReg);
-}
-
-const SSASpillEmitter::FootprintUseAnalysis &
-SSASpillEmitter::getFootprintUseAnalysis(VRegMaskPair VMP,
-                                         SlotIndex KillIdx) {
-  Register V = VMP.getVReg();
-  MachineInstr *KillMI = Indexes->getInstructionFromIndex(KillIdx);
-  assert(KillMI && "footprint kill must name an instruction");
-
-  auto Key = std::make_pair(KillMI, VMP);
-  auto Cached = FootprintUseCache.find(Key);
-  if (Cached != FootprintUseCache.end())
-    return Cached->second;
-
-  FootprintUseAnalysis Analysis;
-  FrozenInterval Frozen = SSAUpdater->freezeInterval(V);
-  LiveInterval &Cut = *Frozen.LI;
-  SlotIndex KillSlot = KillIdx.getRegSlot();
-  SmallVector<SlotIndex, 8> Ends;
-  if (Cut.hasSubRanges()) {
-    for (LiveInterval::SubRange &S : Cut.subranges())
-      if ((S.LaneMask & VMP.getLaneMask()).any() &&
-          S.getVNInfoAt(KillSlot))
-        LIS->pruneValue(S, KillSlot, &Ends);
-  } else if (Cut.getVNInfoAt(KillSlot)) {
-    LIS->pruneValue(static_cast<LiveRange &>(Cut), KillSlot, &Ends);
-  }
-
-  auto LaneNeedsReload = [&](LiveRange &Range, MachineInstr *Use) {
-    MachineBasicBlock *UseBB = Use->getParent();
-    SlotIndex UseIdx = LIS->getInstructionIndex(*Use).getRegSlot();
-    VNInfo *AtUse = Range.getVNInfoBefore(UseIdx);
-    if (!AtUse)
-      return true;
-
-    if (MachineInstr *DefMI = LIS->getInstructionFromIndex(AtUse->def))
-      if (DefMI->getParent() == UseBB)
-        return false;
-
-    for (MachineBasicBlock *Pred : UseBB->predecessors())
-      if (!Range.getVNInfoBefore(LIS->getMBBEndIdx(Pred)))
-        return true;
-    return false;
-  };
-
-  auto UseNeedsReload = [&](MachineInstr *Use) {
-    LaneBitmask UseMask = LaneBitmask::getNone();
-    for (const MachineOperand &MO : Use->uses())
-      if (MO.isReg() && MO.getReg() == V)
-        UseMask |= VRegMaskPair(MO, TRI, MRI).getLaneMask();
-    UseMask &= VMP.getLaneMask();
-
-    if (!Cut.hasSubRanges())
-      return UseMask.any() &&
-             LaneNeedsReload(static_cast<LiveRange &>(Cut), Use);
-
-    LaneBitmask Covered = LaneBitmask::getNone();
-    for (LiveInterval::SubRange &S : Cut.subranges()) {
-      LaneBitmask Lanes = S.LaneMask & UseMask;
-      if (Lanes.none())
-        continue;
-      Covered |= Lanes;
-      if (LaneNeedsReload(S, Use))
-        return true;
-    }
-    return (UseMask & ~Covered).any();
-  };
-
-  SmallVector<MachineInstr *, 8> RelevantUses;
-  for (MachineInstr &Use : MRI->use_nodbg_instructions(V)) {
-    if (isSpillInstr(&Use) || !usesSpilledVMP(&Use, VMP, TRI, MRI))
-      continue;
-    if (Use.isPHI()) {
-      Analysis.PhiUses.push_back(&Use);
-      continue;
-    }
-    if (UseNeedsReload(&Use))
-      RelevantUses.push_back(&Use);
-  }
-  buildDomGroups(RelevantUses, Analysis.Groups);
-
-  auto Inserted = FootprintUseCache.try_emplace(Key, std::move(Analysis));
-  return Inserted.first->second;
-}
-
-SSASpillEmitter::SpillFootprint
-SSASpillEmitter::modelSpillFootprint(VRegMaskPair VMP, SlotIndex KillIdx,
-                                     MachineBasicBlock *RegionBB,
-                                     ArrayRef<MachineInstr *> Sites) {
+void SSASpillEmitter::emitReloadsAndRepairSSA(VRegMaskPair SpilledVMP,
+                                              SlotIndex KillIdx) {
   SSARA_TRACE();
-  SpillFootprint Result;
-  if (Sites.empty())
-    return Result;
-  Result.ResidentSlots.resize(Sites.size());
-
-  Register V = VMP.getVReg();
-  MachineInstr *KillMI = Indexes->getInstructionFromIndex(KillIdx);
-  if (!KillMI)
-    return Result;
-  MachineBasicBlock *KillBB = KillMI->getParent();
-
-  DenseMap<const MachineInstr *, unsigned> SiteNumbers;
-  for (unsigned I = 0; I != Sites.size(); ++I)
-    SiteNumbers[Sites[I]] = I;
-
-  auto MarkSite = [&](const MachineInstr *MI) {
-    auto I = SiteNumbers.find(MI);
-    if (I != SiteNumbers.end())
-      Result.ResidentSlots.set(I->second);
-  };
-
-  // Sites arrive in descending SlotIndex order from measureRegionPeak.
-  auto MarkFrom = [&](MachineBasicBlock *StartBB, MachineInstr *StartMI) {
-    if (StartBB != RegionBB) {
-      if (DT->dominates(StartBB, RegionBB))
-        Result.ResidentSlots.set(0, Sites.size());
-      return;
-    }
-
-    // A block-end reload is inserted after every region instruction.
-    if (!StartMI)
-      return;
-
-    SlotIndex StartIdx = LIS->getInstructionIndex(*StartMI).getRegSlot();
-    const auto *End = llvm::partition_point(Sites, [&](MachineInstr *Site) {
-      return LIS->getInstructionIndex(*Site).getRegSlot() >= StartIdx;
-    });
-    Result.ResidentSlots.set(0, std::distance(Sites.begin(), End));
-  };
-
-  if (MachineInstr *DefMI = MRI->getVRegDef(V))
-    MarkSite(DefMI);
-
-  const FootprintUseAnalysis &Analysis =
-      getFootprintUseAnalysis(VMP, KillIdx);
-
-  // PHI operands are edge uses. Mark the intersection of the predecessor's
-  // terminator tail and the current region as one bit range.
-  for (MachineInstr *Phi : Analysis.PhiUses)
-    for (unsigned I = 1, E = Phi->getNumOperands(); I + 1 < E; I += 2) {
-      MachineOperand &Val = Phi->getOperand(I);
-      if (Val.getReg() != V ||
-          (VRegMaskPair(Val, TRI, MRI).getLaneMask() & VMP.getLaneMask())
-              .none())
-        continue;
-      MachineBasicBlock *Pred = Phi->getOperand(I + 1).getMBB();
-      if (Pred != RegionBB)
-        continue;
-      auto FirstTerm = Pred->getFirstTerminator();
-      if (FirstTerm != Pred->end())
-        MarkFrom(Pred, &*FirstTerm);
-    }
-
-  if (Analysis.Groups.empty())
-    return Result;
-  Result.Exact = false;
-
-  struct PlacementPoint {
-    MachineBasicBlock *BB;
-    MachineInstr *MI; // null means block end
-  };
-  auto GetPlacement = [&](MachineInstr *Use) {
-    auto Placement = reloadPlacementForUse(Use, KillBB, V);
-    if (Placement.second)
-      return PlacementPoint{Placement.first, Placement.second};
-    auto FirstTerm = Placement.first->getFirstTerminator();
-    return PlacementPoint{
-        Placement.first,
-        FirstTerm == Placement.first->end() ? nullptr : &*FirstTerm};
-  };
-  auto Dominates = [&](const PlacementPoint &A, const PlacementPoint &B) {
-    if (A.BB != B.BB)
-      return DT->dominates(A.BB, B.BB);
-    if (!A.MI)
-      return !B.MI;
-    if (!B.MI)
-      return true;
-    return DT->dominates(A.MI, B.MI);
-  };
-
-  for (const DomGroup &Group : Analysis.Groups) {
-    SmallVector<MachineInstr *, 8> Uses;
-    Uses.push_back(Group.getHead());
-    Uses.append(Group.getDominatedUses());
-
-    SmallVector<PlacementPoint, 4> Starts;
-    for (MachineInstr *Use : Uses) {
-      PlacementPoint Start = GetPlacement(Use);
-      bool Covered = false;
-      for (auto *I = Starts.begin(); I != Starts.end();) {
-        if (Dominates(*I, Start)) {
-          Covered = true;
-          break;
-        }
-        if (Dominates(Start, *I))
-          I = Starts.erase(I);
-        else
-          ++I;
-      }
-      if (!Covered)
-        Starts.push_back(Start);
-    }
-
-    if (Group.size() == 1 && Starts.size() == 1 &&
-        Starts.front().MI == Group.getHead()) {
-      MarkSite(Group.getHead());
-      continue;
-    }
-
-    for (PlacementPoint Start : Starts)
-      MarkFrom(Start.BB, Start.MI);
-  }
-
-  return Result;
-}
-
-void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
-  SSARA_TRACE();
-  VRegMaskPair SpilledVMP = Info.SpilledVMP;
   Register SpilledReg = SpilledVMP.getVReg();
 
-  DeficiencyCache.clear();
-  BlockReloadCache.clear();
-
-  MachineInstr *KillMI = Indexes->getInstructionFromIndex(Info.KillIdx);
+  MachineInstr *KillMI = Indexes->getInstructionFromIndex(KillIdx);
   assert(KillMI && "KillIdx must correspond to an instruction");
   MachineBasicBlock *KillBB = KillMI->getParent();
 
@@ -1184,27 +815,28 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
     dbgs() << "\n=== emitReloadsAndRepairSSA() [Option 3: redef-only] ===\n";
     dbgs() << "Spilled: " << printReg(SpilledReg, TRI) << " mask "
            << PrintLaneMask(SpilledVMP.getLaneMask()) << "\n";
-    dbgs() << "DomGroups: " << Info.DomGroups.size() << "\n";
   });
 
-  // Dominance-ordered reload-on-demand (see Reload_join_phi_coalescing.md).
-  // Conceptually we cut OrigVReg's live range at the kill: a use in the freed
-  // region then reaches no original value and needs a reload, while a use
-  // outside it still reaches the original. We realize the cut without surgery
-  // -- reloads are redefs, so once the frontier reloads are placed the
-  // recomputed interval already merges them as isPHIDef VNInfos and keeps the
-  // original on non-kill paths; the existing reconstruction turns those into
-  // PHIs/reuses. Here we only pick the frontier: a freed-region use whose
-  // spilled lanes still reach the ORIGINAL def (not a reload and not an
-  // isPHIDef merge) gets a reload; everything else is left to reconstruction.
-  // No reload optimizer: processing dominators first makes a dominating reload
-  // visible to dominated uses (query sees it), so intra-chain sharing is
-  // automatic.
+  // Collect ordinary uses reachable from the kill and PHI edge uses. Direct
+  // placement intentionally emits one reload at every such use; a post-color
+  // coalescer may merge redundant reloads after physical assignments are known.
   SmallVector<MachineInstr *, 8> Uses;
-  for (DomGroup &G : Info.DomGroups) {
-    Uses.push_back(G.getHead());
-    for (MachineInstr *U : G.getDominatedUses())
-      Uses.push_back(U);
+  SmallVector<MachineInstr *, 4> PhiUses;
+  for (MachineInstr &UseMI : MRI->use_nodbg_instructions(SpilledReg)) {
+    if (isSpillInstr(&UseMI))
+      continue;
+    MachineOperand *UseOp =
+        UseMI.findRegisterUseOperand(SpilledReg, TRI, /*isKill=*/false);
+    if (!UseOp || !VRegMaskPair(*UseOp, TRI, MRI).overlaps(SpilledVMP))
+      continue;
+    if (UseMI.isPHI()) {
+      PhiUses.push_back(&UseMI);
+      continue;
+    }
+    if (!DT->dominates(KillMI, &UseMI) &&
+        !SSAUpdater->isUseReachableFromDef(KillMI, &UseMI, SpilledReg))
+      continue;
+    Uses.push_back(&UseMI);
   }
   llvm::sort(Uses, [this](MachineInstr *A, MachineInstr *B) {
     if (A == B)
@@ -1216,100 +848,16 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
     return LIS->getInstructionIndex(*A) < LIS->getInstructionIndex(*B);
   });
 
-  const LaneBitmask SpillMask = SpilledVMP.getLaneMask();
-  const SlotIndex KillSlot = Info.KillIdx.getRegSlot();
-
-  // Decide whether use U needs a reload. Atomic-process invariant: we must
-  // NEVER prune the live LIS interval -- the RPTracker (canHoistReloadTo /
-  // adjustReloadForLoop) reads it, and removing OrigVReg's liveness there would
-  // corrupt pressure and the hoist decision. Instead we recompute the live
-  // interval (RP-safe: a reload is a redef of OrigVReg with the same one-reg
-  // footprint, and per the reload-analysis invariant OrigVReg stays counted as
-  // live), DEEP-COPY it, and CUT the COPY at the kill. On the copy the original
-  // is pruned from the kill onward (surviving only on kill-free paths) while
-  // reload values are untouched; the live LIS the RPTracker reads is intact.
-  auto NeedsReload = [&](MachineInstr *U) -> bool {
-    if (LIS->hasInterval(SpilledReg))
-      LIS->removeInterval(SpilledReg);
-    LiveInterval &Live = LIS->createAndComputeVirtRegInterval(SpilledReg);
-
-    // Deep copy (allocator declared first so the copy destructs before it).
-    VNInfo::Allocator CutAlloc;
-    LiveInterval Cut(SpilledReg, 0.0f);
-    Cut.assign(Live, CutAlloc);
-    for (const LiveInterval::SubRange &S : Live.subranges())
-      Cut.createSubRangeFrom(CutAlloc, S.LaneMask, S);
-
-    // Cut the COPY at the kill (never the live interval).
-    SmallVector<SlotIndex, 8> Ends;
-    if (Cut.hasSubRanges()) {
-      for (LiveInterval::SubRange &S : Cut.subranges())
-        if ((S.LaneMask & SpillMask).any() && S.getVNInfoAt(KillSlot))
-          LIS->pruneValue(S, KillSlot, &Ends);
-    } else if (Cut.getVNInfoAt(KillSlot)) {
-      LIS->pruneValue(static_cast<LiveRange &>(Cut), KillSlot, &Ends);
-    }
-
-    // Per-edge availability on the cut copy: reload iff some spilled lane is
-    // not available on every incoming path. No value reaches the use, or the
-    // reaching value is live-in but a predecessor edge carries no value (a
-    // freed edge) -> reload. A value defined in U's own block (a local reload)
-    // dominates U and covers it. A live-in value on ALL predecessors is a
-    // genuine merge -> reconstruction inserts a PHI, no reload here.
-    MachineBasicBlock *B = U->getParent();
-    SlotIndex UIdx = LIS->getInstructionIndex(*U).getRegSlot();
-    auto LaneNeedsReload = [&](LiveRange &LR) -> bool {
-      VNInfo *AtUse = LR.getVNInfoBefore(UIdx);
-      if (!AtUse)
-        return true;
-      if (MachineInstr *DMI = LIS->getInstructionFromIndex(AtUse->def))
-        if (DMI->getParent() == B) {
-          // A same-block reaching def normally covers U with no new reload. But
-          // if the reaching value's live range [DMI, U] SPANS an RP-tight region
-          // (max RP between them exceeds the limit), reusing it keeps a register
-          // pinned across that region — the exact C1 pathology (a reload live
-          // across a high-pressure INLINEASM etc. that never lowers RP there and
-          // makes coloring fail). Force a fresh reload right before U instead, so
-          // the reaching value's range ends before the tight point.
-          if (maxDeficiencyBetween(DMI, U))
-            return true;
-          return false;
-        }
-      for (MachineBasicBlock *P : B->predecessors())
-        if (!LR.getVNInfoBefore(LIS->getMBBEndIdx(P)))
-          return true;
-      return false;
-    };
-    if (Cut.hasSubRanges()) {
-      for (LiveInterval::SubRange &S : Cut.subranges())
-        if ((S.LaneMask & SpillMask).any() && LaneNeedsReload(S))
-          return true;
-      return false;
-    }
-    return LaneNeedsReload(Cut);
-  };
-
-  // Dominators-first: a reload placed for a dominator/sibling is visible to
-  // later uses, so intra-chain sharing and join PHIs fall out with no reload
-  // optimizer.
   for (MachineInstr *U : Uses) {
     if (!usesSpilledVMP(U, SpilledVMP, TRI, MRI))
       continue;
-    if (ReloadEveryUse || NeedsReload(U))
-      insertReloadForUse(U, SpilledVMP, KillBB);
+    insertReloadForUse(U, SpilledVMP);
   }
 
-  // PHI uses: reload on the predecessor edge(s). These bypass the NeedsReload
-  // gate above — that gate reasons about the use instruction's own block/slot,
-  // which is meaningless for a PHI (its operand lives on the incoming edge, not
-  // at the PHI). insertReloadForUse's PHI branch places a reload in each
-  // predecessor that supplies the spilled reg, which is exactly the cut that
-  // frees the value across the def→PHI span. Without this a PHI-only-used value
-  // keeps the original live to the PHI and never sheds pressure.
-  for (MachineInstr *U : Info.PhiUses) {
+  for (MachineInstr *U : PhiUses) {
     if (!usesSpilledVMP(U, SpilledVMP, TRI, MRI))
       continue;
-    insertReloadForUse(U, SpilledVMP, KillBB);
+    insertReloadForUse(U, SpilledVMP);
   }
 
   // Final recompute (reflects all reloads) for the reconstruction. Correct
@@ -1367,148 +915,6 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(SpillInfo &Info) {
   LLVM_DEBUG(dbgs() << "\nemitReloadsAndRepairSSA() complete\n");
 }
 
-// ============================================================================
-// Reload Optimizer
-// ============================================================================
-
-// TODO: Investigate profitability/possibility of early return when RP > Limit.
-// Callers only care whether RP exceeds the limit, not by how much.
-// Optimization: if we find RP > Limit at any point, return early and cache
-// that value - no need to compute the actual maximum.
-unsigned SSASpillEmitter::maxDeficiencyForBlock(MachineBasicBlock *MBB) {
-  SSARA_TRACE();
-  auto It = DeficiencyCache.find(MBB);
-  if (It != DeficiencyCache.end())
-    return It->second;
-
-  // Compute max deficiency by tracking backwards through the block
-  GCNUpwardRPTracker Tracker(*LIS);
-  Tracker.reset(*MBB);
-
-  // Include the live-out set at block end
-  unsigned Max = PoolDeficiency(Tracker.getLiveRegs());
-
-  for (MachineInstr &MI : reverse(*MBB)) {
-    if (MI.isDebugInstr())
-      continue;
-    Tracker.recede(MI);
-    Max = std::max(Max, PoolDeficiency(Tracker.getLiveRegs()));
-  }
-
-  DeficiencyCache[MBB] = Max;
-  return Max;
-}
-
-// reloadRPBeforeUse / reloadRPAtBlockEnd moved to the RA (feasibility POLICY;
-// the Emitter is pure spill/reload/SSA-repair mechanics). See
-// AMDGPUSSARegisterAllocator::reloadRPBeforeUse / reloadRPAtBlockEnd.
-
-unsigned SSASpillEmitter::maxDeficiencyBetween(MachineInstr *DefMI,
-                                               MachineInstr *UseMI) {
-  SSARA_TRACE();
-  // Max deficiency of the current pool at the program points strictly between
-  // DefMI and UseMI in the same block, inclusive of the span the reaching value
-  // would occupy. Used to decide whether a same-block reaching reload SPANS a
-  // tight region: if so, the shared reload must not be reused across it — a
-  // fresh reload is forced right before UseMI so the span ends before the tight
-  // point (C1: a reload live across a pressure region does not lower RP there).
-  MachineBasicBlock *MBB = UseMI->getParent();
-  if (!DefMI || DefMI->getParent() != MBB)
-    return 0;
-  GCNUpwardRPTracker Tracker(*LIS);
-  Tracker.reset(*UseMI);
-  unsigned Max = 0;
-  for (auto It = UseMI->getReverseIterator(); It != MBB->rend(); ++It) {
-    MachineInstr &MI = *It;
-    if (MI.isDebugInstr())
-      continue;
-    Tracker.recede(MI);
-    Max = std::max(Max, PoolDeficiency(Tracker.getLiveRegs()));
-    if (&MI == DefMI)
-      break; // reached the reaching def; span is [DefMI, UseMI]
-  }
-  return Max;
-}
-
-unsigned SSASpillEmitter::maxDeficiencyInBlockDownTo(MachineBasicBlock *MBB,
-                                                    MachineInstr *StopMI) {
-  SSARA_TRACE();
-  if (!StopMI || StopMI->getParent() != MBB)
-    return maxDeficiencyForBlock(MBB);
-
-  // Compute max deficiency from block start up to (not including) StopMI
-  GCNUpwardRPTracker Tracker(*LIS);
-
-  // Start from StopMI and track backwards to block start
-  Tracker.reset(*StopMI);
-
-  unsigned Max = 0;
-
-  for (auto It = StopMI->getReverseIterator(); It != MBB->rend(); ++It) {
-    MachineInstr &MI = *It;
-    if (MI.isDebugInstr())
-      continue;
-    Tracker.recede(MI);
-    Max = std::max(Max, PoolDeficiency(Tracker.getLiveRegs()));
-  }
-
-  return Max;
-}
-
-bool SSASpillEmitter::canHoistReloadTo(MachineBasicBlock *NCD,
-                                       MachineInstr *InsertPoint,
-                                       Register SpilledReg,
-                                       const MachineLoop *SpanLoop) {
-  SSARA_TRACE();
-  const TargetRegisterClass *RC = MRI->getRegClass(SpilledReg);
-  const bool IsVALU = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
-  // The spilled register is already counted as live, so a non-zero deficiency
-  // means the pool has no room for the reload (no +1 needed).
-
-  // Check NCD block only if reload is placed inside NCD (InsertPoint set).
-  // If InsertPoint is nullptr, reload goes at NCD end - skip the NCD check,
-  // walkPathsToUses will check paths from NCD to uses.
-  if (InsertPoint && maxDeficiencyInBlockDownTo(NCD, InsertPoint))
-    return false;
-  // A hoisted ordinary VALU reload is inserted at the end of NCD's legal body.
-  // It must survive the terminator sequence without EXEC changing before the
-  // value reaches a successor. PHI-edge reloads do not use this hoist path.
-  if (IsVALU &&
-      !AMDGPURegAllocInsertion::registerStable(
-          AMDGPURegAllocInsertion::bodyEnd(*NCD), NCD->end(), AMDGPU::EXEC,
-          TRI))
-    return false;
-
-  auto IsHighRP = [&](MachineBasicBlock *BB, MachineInstr *UseMI) -> bool {
-    // Measuring down to the first use models a reload that dies at that use.
-    // A reload placed in SpanLoop's preheader instead occupies a register for
-    // all of BB on every iteration, so pressure arising after the first use
-    // still competes with it and must be counted.
-    bool SpansBlock = SpanLoop && SpanLoop->contains(BB);
-    unsigned Short = (UseMI && !SpansBlock)
-                         ? maxDeficiencyInBlockDownTo(BB, UseMI)
-                         : maxDeficiencyForBlock(BB);
-    bool ExecUnsafe = false;
-    if (IsVALU && (!UseMI || !UseMI->isPHI())) {
-      auto Stop = (UseMI && !SpansBlock) ? UseMI->getIterator() : BB->end();
-      ExecUnsafe = !AMDGPURegAllocInsertion::registerStable(
-          AMDGPURegAllocInsertion::bodyBegin(*BB), Stop, AMDGPU::EXEC, TRI);
-    }
-    LLVM_DEBUG(dbgs() << "    hoist-gate: " << printMBBReference(*BB)
-                      << " spansBlock=" << SpansBlock
-                      << " use=" << (UseMI ? "yes" : "no") << " short=" << Short
-                      << " exec-unsafe=" << ExecUnsafe
-                      << "\n");
-    return Short != 0 || ExecUnsafe;
-  };
-
-  return walkPathsToUses(NCD, SpilledReg, IsHighRP);
-}
-
-// ============================================================================
-// Loop-Aware Spilling Helpers
-// ============================================================================
-
 MachineBasicBlock *
 SSASpillEmitter::getEffectiveKillBB(MachineBasicBlock *SpillBB) const {
   SSARA_TRACE();
@@ -1536,123 +942,3 @@ SSASpillEmitter::getEffectiveKillBB(MachineBasicBlock *SpillBB) const {
   return SpillBB;
 }
 
-std::pair<MachineBasicBlock *, MachineInstr *>
-SSASpillEmitter::adjustReloadForLoop(MachineBasicBlock *ReloadBB,
-                                     MachineInstr *InsertBeforeMI,
-                                     MachineBasicBlock *KillBB,
-                                     Register SpilledReg) {
-  SSARA_TRACE();
-  MachineLoop *ReloadLoop = MLI->getLoopFor(ReloadBB);
-  if (ReloadLoop && !ReloadLoop->contains(KillBB)) {
-    // Do NOT hoist the reload to the preheader if the loop body contains a call
-    // that clobbers this value's file: hoisting makes the value live across the
-    // whole loop, hence across that in-loop call — but a value live across a
-    // call may occupy only registers the call preserves. A cross-call value
-    // hoisted here would be un-colorable (Failed to find free physreg). Keep the
-    // reload inside the loop (at the use, after the call), accepting a per-
-    // iteration reload — correctness outranks the reload-count optimization.
-    bool LoopHasClobberingCall = false;
-    for (MachineBasicBlock *LB : ReloadLoop->blocks()) {
-      for (MachineInstr &LMI : *LB) {
-        if (!LMI.isCall())
-          continue;
-        for (const MachineOperand &MO : LMI.operands())
-          if (MO.isRegMask() &&
-              MO.clobbersPhysReg(
-                  (IsVGPRPass ? AMDGPU::VGPR0 : AMDGPU::SGPR0))) {
-            LoopHasClobberingCall = true;
-            break;
-          }
-        if (LoopHasClobberingCall)
-          break;
-      }
-      if (LoopHasClobberingCall)
-        break;
-    }
-    if (LoopHasClobberingCall) {
-      LLVM_DEBUG(dbgs() << "  Not hoisting reload: loop contains a call that "
-                           "clobbers this file; keeping reload inside loop\n");
-      return {ReloadBB, InsertBeforeMI};
-    }
-
-    // Use in loop, spill outside - consider hoisting reload to preheader
-    MachineBasicBlock *Preheader = ReloadLoop->getLoopPreheader();
-    if (Preheader) {
-      MachineInstr *InsertPoint = nullptr;
-      auto TermIt = Preheader->getFirstTerminator();
-      if (TermIt != Preheader->end())
-        InsertPoint = &*TermIt;
-
-      bool CanHoist =
-          canHoistReloadTo(Preheader, InsertPoint, SpilledReg, ReloadLoop);
-
-      if (!CanHoist) {
-        LLVM_DEBUG(
-            dbgs() << "  Cannot hoist reload to preheader: "
-                   << "no placement on some path, keeping reload inside loop\n");
-        return {ReloadBB,
-                InsertBeforeMI}; // Don't hoist - accept reload in loop
-      }
-
-      LLVM_DEBUG(dbgs() << "  Hoisting reload from "
-                        << printMBBReference(*ReloadBB) << " to preheader "
-                        << printMBBReference(*Preheader) << "\n");
-      return {Preheader, nullptr}; // Insert at end of preheader
-    }
-  }
-  return {ReloadBB, InsertBeforeMI};
-}
-
-// ============================================================================
-// Divergent Path Optimization Helpers
-// ============================================================================
-
-bool SSASpillEmitter::walkPathsToUses(
-    MachineBasicBlock *StartBB, Register SpilledReg,
-    llvm::function_ref<bool(MachineBasicBlock *, MachineInstr *)> IsBad,
-    bool StopOnBad) const {
-  SSARA_TRACE();
-
-  const LiveInterval &LI = LIS->getInterval(SpilledReg);
-
-  SmallPtrSet<MachineBasicBlock *, 8> Visited;
-  SmallVector<MachineBasicBlock *, 8> Worklist(StartBB->successors());
-  bool FoundBad = false;
-
-  while (!Worklist.empty()) {
-    MachineBasicBlock *BB = Worklist.pop_back_val();
-    if (!Visited.insert(BB).second)
-      continue;
-
-    // Skip blocks where spilled register is not live
-    SlotIndex BBStart = Indexes->getMBBStartIdx(BB);
-    if (!LI.liveAt(BBStart)) {
-      LLVM_DEBUG(dbgs() << "    walkPaths: skip " << printMBBReference(*BB)
-                        << " (spilled reg not live at block start)\n");
-      continue;
-    }
-
-    // Find first use of SpilledReg in this block (if any)
-    MachineInstr *FirstUseMI = nullptr;
-    for (MachineInstr &MI : *BB) {
-      if (MI.readsRegister(SpilledReg, TRI)) {
-        FirstUseMI = &MI;
-        break;
-      }
-    }
-
-    // Check predicate
-    if (IsBad(BB, FirstUseMI)) {
-      if (StopOnBad)
-        return false;
-      FoundBad = true;
-    }
-
-    // Continue to successors
-    for (MachineBasicBlock *Succ : BB->successors())
-      if (!Visited.count(Succ))
-        Worklist.push_back(Succ);
-  }
-
-  return !FoundBad;
-}
