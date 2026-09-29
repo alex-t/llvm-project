@@ -48,6 +48,12 @@ static cl::opt<bool> VerifyValueFlowFatal(
     "amdgpu-ssa-verify-value-flow-fatal", cl::Hidden, cl::init(false),
     cl::desc("Abort on a value-flow violation (default: warn to stderr)"));
 
+static cl::opt<bool> EnableVerifyPlacementProfile(
+    "amdgpu-ssa-verify-placement-profile", cl::Hidden, cl::init(false),
+    cl::desc("Compare the legacy peelable-run decision with the placement-"
+             "profile consumer and abort on disagreement; the legacy decision "
+             "remains authoritative"));
+
 // Shadow register-tree oracle (SSARegisterTree). When on AND the forensic sink
 // is active, a shadow SSARegisterTree mirrors the VGPR_32 occupancy the
 // allocator maintains and, at each real VGPR_32 pick, LOGS what the tree would
@@ -2182,6 +2188,78 @@ SlotIndex AMDGPUSSARegisterAllocator::firstBlockAfter(
   return Best;
 }
 
+void AMDGPUSSARegisterAllocator::buildLegacyPlacementProfile(
+    Register Subject, PlacementProfile &Out) const {
+  SSARA_TRACE();
+  Out = PlacementProfile();
+  Out.Subject = Subject;
+  Out.RC = MRI->getRegClass(Subject);
+  Out.Homes.append(availableOrder(Out.RC).begin(),
+                   availableOrder(Out.RC).end());
+
+  if (!LIS->hasInterval(Subject) || LIS->getInterval(Subject).empty())
+    return;
+
+  const LiveInterval &SubjectLI = LIS->getInterval(Subject);
+  Out.Region = {SubjectLI.beginIndex(), SubjectLI.endIndex()};
+
+  auto PhysRegsOverlap = [&](MCRegister A, MCRegister B) {
+    for (MCRegUnit AU : TRI->regunits(A))
+      for (MCRegUnit BU : TRI->regunits(B))
+        if (AU == BU)
+          return true;
+    return false;
+  };
+
+  for (const auto &[Blocker, BlockerHome] : ColorMap) {
+    if (!LIS->hasInterval(Blocker))
+      continue;
+    const LiveInterval &BlockerLI = LIS->getInterval(Blocker);
+    if (BlockerLI.empty() || !BlockerLI.overlaps(SubjectLI))
+      continue;
+
+    SmallBitVector BlockedHomes(Out.Homes.size());
+    for (PlacementProfile::HomeID Home = 0; Home != Out.Homes.size(); ++Home)
+      if (PhysRegsOverlap(BlockerHome, Out.Homes[Home]))
+        BlockedHomes.set(Home);
+    if (BlockedHomes.none())
+      continue;
+
+    for (const LiveRange::Segment &Segment : BlockerLI.segments) {
+      SlotIndex Start = Segment.start < Out.Region.Start ? Out.Region.Start
+                                                         : Segment.start;
+      SlotIndex End = Out.Region.End < Segment.end ? Out.Region.End
+                                                    : Segment.end;
+      if (Start < End)
+        Out.Blockers.push_back(
+            {Blocker, {Start, End}, BlockedHomes});
+    }
+  }
+
+  // Preserve firstBlockAfter's current open-boundary rule: only clobbers in
+  // (Region.Start, Region.End) terminate a run.
+  for (const auto &[CallIdx, CallMI] : CallSites) {
+    if (CallIdx <= Out.Region.Start || Out.Region.End <= CallIdx)
+      continue;
+
+    SmallBitVector CutHomes(Out.Homes.size());
+    for (PlacementProfile::HomeID Home = 0; Home != Out.Homes.size(); ++Home) {
+      MCRegister PR = Out.Homes[Home];
+      bool Clobbered = CallMI->modifiesRegister(PR, TRI);
+      if (!Clobbered)
+        for (const MachineOperand &MO : CallMI->operands())
+          if (MO.isRegMask() && MO.clobbersPhysReg(PR)) {
+            Clobbered = true;
+            break;
+          }
+      if (Clobbered)
+        CutHomes.set(Home);
+    }
+    if (CutHomes.any())
+      Out.Cuts.push_back({CallIdx, std::move(CutHomes)});
+  }
+}
+
 bool AMDGPUSSARegisterAllocator::splitWouldRedirect(
     Register V, MachineInstr *SplitMI) const {
   SSARA_TRACE();
@@ -2216,6 +2294,47 @@ bool AMDGPUSSARegisterAllocator::splitWouldRedirect(
 bool AMDGPUSSARegisterAllocator::pickPeelableRun(Register V, MCRegister &PR,
                                                  SlotIndex &Bound) const {
   SSARA_TRACE();
+
+  PlacementProfile Profile;
+  buildLegacyPlacementProfile(V, Profile);
+
+  MCRegister ProfilePR;
+  SlotIndex ProfileBound;
+  bool ProfileResult = selectPeelableRun(Profile, ProfilePR, ProfileBound);
+
+  // Iteration 3 transfers authority to the profile consumer while the
+  // profile itself is still populated from the legacy allocator facts.
+  PR = ProfilePR;
+  Bound = ProfileBound;
+
+  if (!EnableVerifyPlacementProfile)
+    return ProfileResult;
+
+  MCRegister LegacyPR;
+  SlotIndex LegacyBound;
+  bool LegacyResult = pickPeelableRunLegacy(V, LegacyPR, LegacyBound);
+
+  bool Equivalent = LegacyResult == ProfileResult &&
+                    (!LegacyResult || (LegacyPR == ProfilePR &&
+                                       LegacyBound == ProfileBound));
+  if (!Equivalent) {
+    std::string Msg;
+    raw_string_ostream OS(Msg);
+    OS << "SSARA placement-profile mismatch for " << printReg(V, TRI)
+       << ": legacy=" << LegacyResult;
+    if (LegacyResult)
+      OS << " " << TRI->getName(LegacyPR) << " bound " << LegacyBound;
+    OS << ", profile=" << ProfileResult;
+    if (ProfileResult)
+      OS << " " << TRI->getName(ProfilePR) << " bound " << ProfileBound;
+    report_fatal_error(StringRef(Msg));
+  }
+
+  return ProfileResult;
+}
+
+bool AMDGPUSSARegisterAllocator::pickPeelableRunLegacy(
+    Register V, MCRegister &PR, SlotIndex &Bound) const {
   // THE single split-across policy; see the header for why both callers share it.
   PR = MCRegister();
   Bound = SlotIndex();
@@ -2254,12 +2373,7 @@ bool AMDGPUSSARegisterAllocator::pickPeelableRun(Register V, MCRegister &PR,
   // not fragmentation — peeling there would grind the region into use-less
   // confetti. A run covering all of V needs no such check.
   if (Best < E) {
-    SlotIndex FirstUse;
-    for (MachineInstr &U : MRI->use_nodbg_instructions(V)) {
-      SlotIndex US = LIS->getInstructionIndex(U).getRegSlot();
-      if (US > S && (!FirstUse.isValid() || US < FirstUse))
-        FirstUse = US;
-    }
+    SlotIndex FirstUse = firstUseAfter(V, S);
     if (FirstUse.isValid() && Best <= FirstUse) {
       LLVM_DEBUG(dbgs() << "  peelable-run: " << printReg(V, TRI)
                         << " NONE (run [" << S << "," << Best
@@ -2271,6 +2385,61 @@ bool AMDGPUSSARegisterAllocator::pickPeelableRun(Register V, MCRegister &PR,
   Bound = Best;
   LLVM_DEBUG(dbgs() << "  peelable-run: " << printReg(V, TRI) << " -> "
                     << TRI->getName(PR) << " [" << S << "," << Bound << ")\n");
+  return true;
+}
+
+SlotIndex AMDGPUSSARegisterAllocator::firstUseAfter(Register V,
+                                                    SlotIndex Start) const {
+  SlotIndex FirstUse;
+  for (MachineInstr &U : MRI->use_nodbg_instructions(V)) {
+    SlotIndex Use = LIS->getInstructionIndex(U).getRegSlot();
+    if (Start < Use && (!FirstUse.isValid() || Use < FirstUse))
+      FirstUse = Use;
+  }
+  return FirstUse;
+}
+
+bool AMDGPUSSARegisterAllocator::selectPeelableRun(
+    const PlacementProfile &Profile, MCRegister &PR, SlotIndex &Bound) const {
+  PR = MCRegister();
+  Bound = SlotIndex();
+
+  if (!Profile.Subject.isVirtual() || !Profile.Region.Start.isValid() ||
+      !Profile.Region.End.isValid() ||
+      !(Profile.Region.Start < Profile.Region.End))
+    return false;
+
+  const SlotIndex S = Profile.Region.Start;
+  const SlotIndex E = Profile.Region.End;
+
+  SmallVector<PlacementFreeRun, 32> FreeRuns;
+  getFreeRuns(Profile, FreeRuns);
+
+  // FreeRuns is grouped in target home order. Updating only for a strictly
+  // longer run therefore preserves the legacy first-home tie-break.
+  SlotIndex Best = S;
+  for (const PlacementFreeRun &Run : FreeRuns) {
+    if (Run.Range.Start != S)
+      continue;
+    if (!PR || Best < Run.Range.End) {
+      PR = Run.PhysReg;
+      Best = Run.Range.End;
+    }
+  }
+  if (!PR)
+    return false;
+
+  // Compatibility only: the final solver will model mandatory in-register
+  // occurrences directly and delete this heuristic gate.
+  if (Best < E) {
+    SlotIndex FirstUse = firstUseAfter(Profile.Subject, S);
+    if (FirstUse.isValid() && Best <= FirstUse) {
+      PR = MCRegister();
+      return false;
+    }
+  }
+
+  Bound = Best;
   return true;
 }
 

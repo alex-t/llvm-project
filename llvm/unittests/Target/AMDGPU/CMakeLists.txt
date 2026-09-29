@@ -19,6 +19,7 @@ set(LLVM_LINK_COMPONENTS
   )
 
 add_llvm_target_unittest(AMDGPUTests
+  PARTIAL_SOURCES_INTENDED
   AMDGPUUnitTests.cpp
   CSETest.cpp
   DwarfRegMappings.cpp
@@ -28,4 +29,11 @@ add_llvm_target_unittest(AMDGPUTests
   PALMetadata.cpp
   SSARegisterTreeTest.cpp
   VRegMaskPairTest.cpp
+  )
+
+# Keep the placement-profile unit isolated from unrelated AMDGPU test sources:
+# it exercises a pure fact representation and needs no target fixture.
+add_llvm_target_unittest(SSAPlacementProfileTests
+  PARTIAL_SOURCES_INTENDED
+  SSAPlacementProfileTest.cpp
   )

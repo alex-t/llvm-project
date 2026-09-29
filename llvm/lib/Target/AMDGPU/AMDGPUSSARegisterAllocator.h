@@ -31,6 +31,7 @@
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "SSASpillEmitter.h"
 #include "SSAForensicReporter.h"
+#include "SSAPlacementProfile.h"
 #include "SSARegisterTree.h"
 #include <memory>
 #include <set>
@@ -418,6 +419,28 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// of V). This is the single split-across policy used by SelfSplit. Const —
   /// reads LIS/MRI/ColorMap.
   bool pickPeelableRun(Register V, MCRegister &PR, SlotIndex &Bound) const;
+
+  /// Previous direct split-across implementation. Kept as the opt-in
+  /// differential oracle for the authoritative profile consumer.
+  bool pickPeelableRunLegacy(Register V, MCRegister &PR,
+                             SlotIndex &Bound) const;
+
+  /// Authoritative application of the current longest-run and first-use policy
+  /// to already collected placement facts. This method does not inspect
+  /// ColorMap or CallSites and does not mutate allocator state.
+  bool selectPeelableRun(const PlacementProfile &Profile, MCRegister &PR,
+                         SlotIndex &Bound) const;
+
+  /// Earliest non-debug use strictly after Start, or an invalid index if none.
+  /// Temporary compatibility helper shared by the profile consumer and its
+  /// legacy differential oracle.
+  SlotIndex firstUseAfter(Register V, SlotIndex Start) const;
+
+  /// Populate the authoritative recovery placement mediator from the current
+  /// legacy facts. A later iteration will replace this producer with the
+  /// register forest without changing the consumer contract.
+  void buildLegacyPlacementProfile(Register Subject,
+                                   PlacementProfile &Out) const;
 
   /// True iff splitLiveRangeAt(V, SplitMI) will redirect at least one real use.
   /// The emitter creates its result vreg before discovering an empty split, so

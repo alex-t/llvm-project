@@ -190,6 +190,7 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPUSSARegisterAllocator.cpp
   SSASpillEmitter.cpp
   SSAForensicReporter.cpp
+  SSAPlacementProfile.cpp
   AMDGPUVerifyPhysRegLiveness.cpp
   AMDGPURebuildSSA.cpp
   AMDGPUPHISimplifier.cpp
