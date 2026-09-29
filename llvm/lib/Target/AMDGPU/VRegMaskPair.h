@@ -21,6 +21,7 @@
 #ifndef LLVM_LIB_TARGET_VREGMASKPAIR_H
 #define LLVM_LIB_TARGET_VREGMASKPAIR_H
 
+#include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/MachineOperand.h"
@@ -46,7 +47,8 @@ public:
   VRegMaskPair(Register VReg, LaneBitmask LaneMask)
       : VReg(VReg), LaneMask(LaneMask) {}
 
-  VRegMaskPair() : VReg(AMDGPU::NoRegister), LaneMask(LaneBitmask::getNone()) {}
+  VRegMaskPair()
+      : VReg(MCRegister::NoRegister), LaneMask(LaneBitmask::getNone()) {}
   VRegMaskPair(const VRegMaskPair &Other) = default;
   VRegMaskPair(VRegMaskPair &&Other) = default;
   VRegMaskPair &operator=(const VRegMaskPair &Other) = default;
@@ -68,7 +70,7 @@ public:
                      const SIRegisterInfo *TRI) const {
     LaneBitmask Mask = MRI->getMaxLaneMaskForVReg(VReg);
     if (LaneMask == Mask)
-      return AMDGPU::NoRegister;
+      return AMDGPU::NoSubRegister;
     return TRI->getSubRegIndexForLaneMask(LaneMask);
   }
 
