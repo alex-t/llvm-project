@@ -8,6 +8,7 @@
 
 #include "SSARegisterForest.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <limits>
@@ -67,6 +68,184 @@ SSARegisterForest::nodeLevel(unsigned NodeWidth) const {
   if (!validNodeWidth(NodeWidth))
     return {};
   return NodeLevelRange(this, NodeWidth, NumLeaves / NodeWidth);
+}
+
+std::size_t
+SSARegisterForest::NodeState::firstEndingAfter(SlotIndex Point) const {
+  auto It = std::upper_bound(OwnedHere.begin(), OwnedHere.end(), Point,
+                             [](SlotIndex Point, const Ownership &Owned) {
+                               return Point < Owned.End;
+                             });
+  return It - OwnedHere.begin();
+}
+
+std::optional<Register>
+SSARegisterForest::NodeState::ownerAt(SlotIndex At) const {
+  const std::size_t Position = firstEndingAfter(At);
+  if (Position == OwnedHere.size() || At < OwnedHere[Position].Start)
+    return std::nullopt;
+  return OwnedHere[Position].Owner;
+}
+
+bool SSARegisterForest::NodeState::interferes(SlotIndex Start,
+                                              SlotIndex End) const {
+  const std::size_t Position = firstEndingAfter(Start);
+  return Position != OwnedHere.size() && OwnedHere[Position].Start < End;
+}
+
+void SSARegisterForest::NodeState::insert(Ownership Owned) {
+  const std::size_t Position = firstEndingAfter(Owned.Start);
+  assert((Position == OwnedHere.size() ||
+          Owned.End <= OwnedHere[Position].Start) &&
+         "overlapping temporal ownership");
+  OwnedHere.insert(OwnedHere.begin() + Position, Owned);
+}
+
+bool SSARegisterForest::NodeState::erase(Ownership Owned) {
+  const std::size_t Position = firstEndingAfter(Owned.Start);
+  if (Position == OwnedHere.size() || !(OwnedHere[Position] == Owned))
+    return false;
+  OwnedHere.erase(OwnedHere.begin() + Position);
+  return true;
+}
+
+bool SSARegisterForest::validOwnership(NodeIndex MemoryIndex, SlotIndex Start,
+                                       SlotIndex End, Register Owner) const {
+  return MemoryIndex < NumNodes && Start.isValid() && End.isValid() &&
+         Start < End && Owner.isVirtual();
+}
+
+void SSARegisterForest::initializeTree(NodeIndex Root, unsigned LeafWidth) {
+  assert(Root < NumNodes && LeafWidth != 0 && "invalid forest node geometry");
+  Nodes[Root] = NodeState(LeafWidth);
+  if (LeafWidth == 1)
+    return;
+
+  const unsigned ChildWidth = LeafWidth / 2;
+  initializeTree(Root + 1, ChildWidth);
+  initializeTree(Root + LeafWidth, ChildWidth);
+}
+
+SSARegisterForest::NodeIndex
+SSARegisterForest::treeRootIndex(NodeIndex MemoryIndex) const {
+  assert(MemoryIndex < NumNodes && "invalid forest node");
+  return MemoryIndex - MemoryIndex % TreeStride;
+}
+
+SSARegisterForest::NodeIndex
+SSARegisterForest::parentIndex(NodeIndex Child) const {
+  assert(Child < NumNodes && "invalid forest node");
+  assert(Child != treeRootIndex(Child) && "tree root has no parent");
+
+  const unsigned ParentWidth = 2 * Nodes[Child].leafWidth();
+  const NodeIndex LeftParentCandidate = Child - 1;
+  if (Nodes[LeftParentCandidate].leafWidth() == ParentWidth)
+    return LeftParentCandidate;
+
+  assert(Child >= ParentWidth && "invalid right-child coordinate");
+  const NodeIndex Parent = Child - ParentWidth;
+  assert(Parent >= treeRootIndex(Child) &&
+         Nodes[Parent].leafWidth() == ParentWidth && "invalid parent geometry");
+  return Parent;
+}
+
+iota_range<SSARegisterForest::NodeIndex>
+SSARegisterForest::subtree(NodeIndex Root) const {
+  assert(Root < NumNodes && "invalid forest node");
+  const unsigned Width = Nodes[Root].leafWidth();
+  const NodeIndex SubtreeEnd = Root + Width + (Width - 1);
+  const NodeIndex TreeEnd = treeRootIndex(Root) + TreeStride;
+  assert(SubtreeEnd <= TreeEnd &&
+         "subtree crosses a hardware-tree boundary");
+  return seq(Root, SubtreeEnd);
+}
+
+SSARegisterForest::AncestorRange
+SSARegisterForest::ancestors(NodeIndex Descendant) const {
+  assert(Descendant < NumNodes && "invalid forest node");
+  return AncestorRange(this, Descendant);
+}
+
+SSARegisterForest::NodeIndex
+SSARegisterForest::AncestorIterator::operator*() const {
+  assert(!AtEnd && "cannot dereference the end ancestor iterator");
+  return Current;
+}
+
+SSARegisterForest::AncestorIterator &
+SSARegisterForest::AncestorIterator::operator++() {
+  assert(!AtEnd && "cannot increment the end ancestor iterator");
+  if (Current == Forest->treeRootIndex(Current))
+    AtEnd = true;
+  else
+    Current = Forest->parentIndex(Current);
+  return *this;
+}
+
+SSARegisterForest::AncestorIterator
+SSARegisterForest::AncestorIterator::operator++(int) {
+  AncestorIterator Previous = *this;
+  ++*this;
+  return Previous;
+}
+
+bool SSARegisterForest::AncestorIterator::operator==(
+    const AncestorIterator &Other) const {
+  if (Forest != Other.Forest || AtEnd != Other.AtEnd)
+    return false;
+  return AtEnd || Current == Other.Current;
+}
+
+SSARegisterForest::AncestorIterator
+SSARegisterForest::AncestorRange::begin() const {
+  if (Descendant == Forest->treeRootIndex(Descendant))
+    return end();
+  return {Forest, Forest->parentIndex(Descendant), false};
+}
+
+bool SSARegisterForest::subtreeOrAncestorInterference(NodeIndex MemoryIndex,
+                                                      SlotIndex Start,
+                                                      SlotIndex End) const {
+  for (NodeIndex I : subtree(MemoryIndex))
+    if (Nodes[I].interferes(Start, End))
+      return true;
+
+  for (NodeIndex I : ancestors(MemoryIndex))
+    if (Nodes[I].interferes(Start, End))
+      return true;
+  return false;
+}
+
+std::optional<Register> SSARegisterForest::ownerAt(NodeIndex MemoryIndex,
+                                                   SlotIndex At) const {
+  if (MemoryIndex >= NumNodes || !At.isValid())
+    return std::nullopt;
+  return Nodes[MemoryIndex].ownerAt(At);
+}
+
+bool SSARegisterForest::isFree(NodeIndex MemoryIndex, SlotIndex Start,
+                               SlotIndex End) const {
+  if (MemoryIndex >= NumNodes || !Start.isValid() || !End.isValid() ||
+      !(Start < End))
+    return false;
+  return !subtreeOrAncestorInterference(MemoryIndex, Start, End);
+}
+
+bool SSARegisterForest::assign(NodeIndex MemoryIndex, SlotIndex Start,
+                               SlotIndex End, Register Owner) {
+  if (!validOwnership(MemoryIndex, Start, End, Owner) ||
+      !isFree(MemoryIndex, Start, End))
+    return false;
+
+  Nodes[MemoryIndex].insert({Start, End, Owner});
+  return true;
+}
+
+bool SSARegisterForest::release(NodeIndex MemoryIndex, SlotIndex Start,
+                                SlotIndex End, Register Owner) {
+  if (!validOwnership(MemoryIndex, Start, End, Owner))
+    return false;
+  return Nodes[MemoryIndex].erase({Start, End, Owner});
 }
 
 SSARegisterForest::NodeIndex

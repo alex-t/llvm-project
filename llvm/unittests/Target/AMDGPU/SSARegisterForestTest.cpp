@@ -55,4 +55,99 @@ TEST(SSARegisterForestTest, PreorderLayoutAndWidthTwoLevel) {
   EXPECT_EQ(Position, WidthTwo.size());
 }
 
+TEST(SSARegisterForestTest, AvailabilityMatchesSpatialAndTemporalOverlap) {
+  IndexListEntry E1(nullptr, 1 * SlotIndex::InstrDist);
+  IndexListEntry E2(nullptr, 2 * SlotIndex::InstrDist);
+  IndexListEntry E3(nullptr, 3 * SlotIndex::InstrDist);
+  IndexListEntry E4(nullptr, 4 * SlotIndex::InstrDist);
+  IndexListEntry E5(nullptr, 5 * SlotIndex::InstrDist);
+  IndexListEntry E6(nullptr, 6 * SlotIndex::InstrDist);
+  IndexListEntry E7(nullptr, 7 * SlotIndex::InstrDist);
+  SlotIndex S1(&E1, 0);
+  SlotIndex S2(&E2, 0);
+  SlotIndex S3(&E3, 0);
+  SlotIndex S4(&E4, 0);
+  SlotIndex S5(&E5, 0);
+  SlotIndex S6(&E6, 0);
+  SlotIndex S7(&E7, 0);
+
+  struct SlotRange {
+    SlotIndex Start;
+    SlotIndex End;
+    const char *Name;
+  };
+  const SlotRange ProbeRanges[] = {
+      {S1, S2, "touches start"}, {S1, S3, "overlaps start"},
+      {S3, S5, "contained"},     {S5, S7, "overlaps end"},
+      {S6, S7, "touches end"},
+  };
+
+  const Register AssignedOwner = Register::index2VirtReg(0);
+  const Register ProbeOwner = Register::index2VirtReg(1);
+
+  // Two trees exercise both cross-tree isolation and every preorder position
+  // within a tree. Width eight supplies three non-leaf ancestor levels.
+  std::optional<SSARegisterForest> MaybeForest =
+      SSARegisterForest::create(2, 8);
+  ASSERT_TRUE(MaybeForest);
+  SSARegisterForest &Forest = *MaybeForest;
+
+  for (SSARegisterForest::NodeIndex AssignedNode = 0;
+       AssignedNode != Forest.numNodes(); ++AssignedNode) {
+    ASSERT_TRUE(Forest.assign(AssignedNode, S2, S6, AssignedOwner));
+    std::optional<SSARegisterForest::NodeRef> AssignedRef =
+        Forest.nodeAt(AssignedNode);
+    ASSERT_TRUE(AssignedRef);
+    const SSARegisterForest::PhysicalSpan AssignedSpan = AssignedRef->Span;
+
+    // Ownership is authoritative only at the exact assigned node.
+    for (SSARegisterForest::NodeIndex I = 0; I != Forest.numNodes(); ++I) {
+      std::optional<Register> Owner = Forest.ownerAt(I, S4);
+      if (I == AssignedNode) {
+        ASSERT_TRUE(Owner);
+        EXPECT_EQ(*Owner, AssignedOwner);
+      } else {
+        EXPECT_FALSE(Owner);
+      }
+    }
+
+    for (SSARegisterForest::NodeIndex ProbeNode = 0;
+         ProbeNode != Forest.numNodes(); ++ProbeNode) {
+      std::optional<SSARegisterForest::NodeRef> ProbeRef =
+          Forest.nodeAt(ProbeNode);
+      ASSERT_TRUE(ProbeRef);
+      const SSARegisterForest::PhysicalSpan ProbeSpan = ProbeRef->Span;
+      const bool SpatialOverlap =
+          AssignedSpan.FirstPhysicalLeaf < ProbeSpan.EndPhysicalLeaf &&
+          ProbeSpan.FirstPhysicalLeaf < AssignedSpan.EndPhysicalLeaf;
+
+      for (const SlotRange &Probe : ProbeRanges) {
+        const bool TemporalOverlap = S2 < Probe.End && Probe.Start < S6;
+        const bool ExpectedFree = !(SpatialOverlap && TemporalOverlap);
+
+        EXPECT_EQ(Forest.isFree(ProbeNode, Probe.Start, Probe.End),
+                  ExpectedFree)
+            << "assigned node " << AssignedNode << ", probe node " << ProbeNode
+            << ", temporal case " << Probe.Name;
+
+        const bool WasAssigned =
+            Forest.assign(ProbeNode, Probe.Start, Probe.End, ProbeOwner);
+        EXPECT_EQ(WasAssigned, ExpectedFree)
+            << "assigned node " << AssignedNode << ", probe node " << ProbeNode
+            << ", temporal case " << Probe.Name;
+        if (WasAssigned)
+          ASSERT_TRUE(
+              Forest.release(ProbeNode, Probe.Start, Probe.End, ProbeOwner))
+              << "assigned node " << AssignedNode << ", probe node "
+              << ProbeNode << ", temporal case " << Probe.Name;
+      }
+    }
+
+    std::optional<Register> Owner = Forest.ownerAt(AssignedNode, S4);
+    ASSERT_TRUE(Owner);
+    EXPECT_EQ(*Owner, AssignedOwner);
+    ASSERT_TRUE(Forest.release(AssignedNode, S2, S6, AssignedOwner));
+  }
+}
+
 } // end anonymous namespace
