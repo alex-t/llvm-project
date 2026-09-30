@@ -13,9 +13,10 @@
 /// Each equal-width hardware tree is encoded in preorder. Complete tree
 /// encodings are concatenated, so NodeIndex is a transparent coordinate over
 /// the whole forest without introducing a virtual root or inactive nodes.
-/// Temporal ownership is recorded once, at the exact physical node assigned to
-/// a value. Queries account for ownership on covering ancestors and contained
-/// descendants without copying those records between nodes.
+/// Temporal ownership is recorded on a canonical node or on the disjoint
+/// canonical cover of an arbitrary physical span. Queries account for ownership
+/// on covering ancestors and contained descendants without copying records into
+/// every covered leaf.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -26,6 +27,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/Support/Allocator.h"
 #include <cstddef>
 #include <iterator>
 #include <optional>
@@ -65,10 +67,10 @@ public:
     SlotIndex Start;
     SlotIndex End;
     Register Owner;
-
-    bool operator==(const Ownership &Other) const {
-      return Start == Other.Start && End == Other.End && Owner == Other.Owner;
-    }
+    /// Null for a canonical single-node assignment. Components of an
+    /// arbitrary-span assignment form a circular chain in increasing physical
+    /// order.
+    const Ownership *Next = nullptr;
   };
 
   class NodeLevelRange;
@@ -150,24 +152,24 @@ public:
   /// widths produce an empty range.
   NodeLevelRange nodeLevel(unsigned NodeWidth) const;
 
-  /// Return the owner recorded exactly at MemoryIndex at At, or no owner.
-  /// This does not report ownership recorded on ancestors or descendants.
-  std::optional<Register> ownerAt(NodeIndex MemoryIndex, SlotIndex At) const;
+  /// Return whether Span is free for [Start, End). Span may be aligned or
+  /// unaligned and may cross canonical-node or hardware-tree boundaries.
+  /// Invalid arguments return false.
+  bool isFree(PhysicalSpan Span, SlotIndex Start, SlotIndex End) const;
 
-  /// Return whether the physical span represented by MemoryIndex is free for
-  /// [Start, End). Ownership recorded at the node, on a covering ancestor, or
-  /// in any contained descendant interferes. Invalid arguments return false.
-  bool isFree(NodeIndex MemoryIndex, SlotIndex Start, SlotIndex End) const;
+  /// Return whether every canonical component of Span contains the exact
+  /// assignment {Span, Start, End, Owner}. Invalid arguments return false.
+  bool contains(PhysicalSpan Span, SlotIndex Start, SlotIndex End,
+                Register Owner) const;
 
-  /// Assign Owner to the physical span represented by MemoryIndex for
-  /// [Start, End). Returns false without mutation if the arguments are invalid
-  /// or the span is not free for the complete interval.
-  bool assign(NodeIndex MemoryIndex, SlotIndex Start, SlotIndex End,
+  /// Assign Owner to Span for [Start, End). The operation is all-or-nothing
+  /// across Span's complete canonical cover.
+  bool assign(PhysicalSpan Span, SlotIndex Start, SlotIndex End,
               Register Owner);
 
-  /// Remove the exact ownership record. Returns false without mutation when no
-  /// identical record exists at MemoryIndex.
-  bool release(NodeIndex MemoryIndex, SlotIndex Start, SlotIndex End,
+  /// Remove the exact assignment {Span, Start, End, Owner}. The operation is
+  /// all-or-nothing across Span's complete canonical cover.
+  bool release(PhysicalSpan Span, SlotIndex Start, SlotIndex End,
                Register Owner);
 
 private:
@@ -179,10 +181,10 @@ private:
     explicit NodeState(unsigned LeafWidth) : LeafWidth(LeafWidth) {}
 
     unsigned leafWidth() const { return LeafWidth; }
-    std::optional<Register> ownerAt(SlotIndex At) const;
+    const Ownership *find(SlotIndex Start, SlotIndex End, Register Owner) const;
     bool interferes(SlotIndex Start, SlotIndex End) const;
-    void insert(Ownership Owned);
-    bool erase(Ownership Owned);
+    void insert(const Ownership *Owned);
+    bool erase(const Ownership *Owned);
 
   private:
     /// Return the index of the first interval whose end is after Point.
@@ -190,7 +192,7 @@ private:
 
     unsigned LeafWidth = 0;
     /// Sorted by Start and pairwise temporally disjoint.
-    SmallVector<Ownership, 2> OwnedHere;
+    SmallVector<const Ownership *, 2> OwnedHere;
   };
 
   class AncestorRange;
@@ -255,10 +257,21 @@ private:
   unsigned NumLeaves = 0;
   unsigned NumNodes = 0;
   SmallVector<NodeState, 0> Nodes;
+  /// Ownership addresses must remain stable because composite assignments link
+  /// their canonical components. Released records are retained until the
+  /// function-local forest is destroyed.
+  BumpPtrAllocator OwnershipAllocator;
+
+  using NodeCover = SmallVector<NodeIndex, 4>;
+  using OwnershipChain = SmallVector<const Ownership *, 4>;
 
   bool validNodeWidth(unsigned Width) const;
-  bool validOwnership(NodeIndex MemoryIndex, SlotIndex Start, SlotIndex End,
-                      Register Owner) const;
+  bool validPhysicalSpan(PhysicalSpan Span) const;
+  bool validOwnership(SlotIndex Start, SlotIndex End, Register Owner) const;
+  std::optional<NodeIndex> canonicalNode(PhysicalSpan Span) const;
+  std::optional<NodeCover> cover(PhysicalSpan Span) const;
+  bool findAssignment(const NodeCover &Cover, SlotIndex Start, SlotIndex End,
+                      Register Owner, OwnershipChain &Assignment) const;
   bool subtreeOrAncestorInterference(NodeIndex MemoryIndex, SlotIndex Start,
                                      SlotIndex End) const;
   void initializeTree(NodeIndex Root, unsigned LeafWidth);

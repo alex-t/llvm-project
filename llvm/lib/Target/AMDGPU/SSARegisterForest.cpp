@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "SSARegisterForest.h"
+#include "llvm/ADT/bit.h"
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
 #include <cassert>
@@ -73,46 +74,111 @@ SSARegisterForest::nodeLevel(unsigned NodeWidth) const {
 std::size_t
 SSARegisterForest::NodeState::firstEndingAfter(SlotIndex Point) const {
   auto It = std::upper_bound(OwnedHere.begin(), OwnedHere.end(), Point,
-                             [](SlotIndex Point, const Ownership &Owned) {
-                               return Point < Owned.End;
+                             [](SlotIndex Point, const Ownership *Owned) {
+                               return Point < Owned->End;
                              });
   return It - OwnedHere.begin();
 }
 
-std::optional<Register>
-SSARegisterForest::NodeState::ownerAt(SlotIndex At) const {
-  const std::size_t Position = firstEndingAfter(At);
-  if (Position == OwnedHere.size() || At < OwnedHere[Position].Start)
-    return std::nullopt;
-  return OwnedHere[Position].Owner;
+const SSARegisterForest::Ownership *
+SSARegisterForest::NodeState::find(SlotIndex Start, SlotIndex End,
+                                   Register Owner) const {
+  const std::size_t Position = firstEndingAfter(Start);
+  if (Position == OwnedHere.size())
+    return nullptr;
+
+  const Ownership *Owned = OwnedHere[Position];
+  return Owned->Start == Start && Owned->End == End && Owned->Owner == Owner
+             ? Owned
+             : nullptr;
 }
 
 bool SSARegisterForest::NodeState::interferes(SlotIndex Start,
                                               SlotIndex End) const {
   const std::size_t Position = firstEndingAfter(Start);
-  return Position != OwnedHere.size() && OwnedHere[Position].Start < End;
+  return Position != OwnedHere.size() && OwnedHere[Position]->Start < End;
 }
 
-void SSARegisterForest::NodeState::insert(Ownership Owned) {
-  const std::size_t Position = firstEndingAfter(Owned.Start);
+void SSARegisterForest::NodeState::insert(const Ownership *Owned) {
+  const std::size_t Position = firstEndingAfter(Owned->Start);
   assert((Position == OwnedHere.size() ||
-          Owned.End <= OwnedHere[Position].Start) &&
+          Owned->End <= OwnedHere[Position]->Start) &&
          "overlapping temporal ownership");
   OwnedHere.insert(OwnedHere.begin() + Position, Owned);
 }
 
-bool SSARegisterForest::NodeState::erase(Ownership Owned) {
-  const std::size_t Position = firstEndingAfter(Owned.Start);
-  if (Position == OwnedHere.size() || !(OwnedHere[Position] == Owned))
+bool SSARegisterForest::NodeState::erase(const Ownership *Owned) {
+  const std::size_t Position = firstEndingAfter(Owned->Start);
+  if (Position == OwnedHere.size() || OwnedHere[Position] != Owned)
     return false;
   OwnedHere.erase(OwnedHere.begin() + Position);
   return true;
 }
 
-bool SSARegisterForest::validOwnership(NodeIndex MemoryIndex, SlotIndex Start,
-                                       SlotIndex End, Register Owner) const {
-  return MemoryIndex < NumNodes && Start.isValid() && End.isValid() &&
-         Start < End && Owner.isVirtual();
+bool SSARegisterForest::validPhysicalSpan(PhysicalSpan Span) const {
+  return Span.FirstPhysicalLeaf < Span.EndPhysicalLeaf &&
+         Span.EndPhysicalLeaf <= NumLeaves;
+}
+
+bool SSARegisterForest::validOwnership(SlotIndex Start, SlotIndex End,
+                                       Register Owner) const {
+  return Start.isValid() && End.isValid() && Start < End && Owner.isVirtual();
+}
+
+std::optional<SSARegisterForest::NodeIndex>
+SSARegisterForest::canonicalNode(PhysicalSpan Span) const {
+  if (!validPhysicalSpan(Span) || !validNodeWidth(Span.width()) ||
+      Span.FirstPhysicalLeaf % Span.width() != 0 ||
+      Span.FirstPhysicalLeaf / TreeWidth !=
+          (Span.EndPhysicalLeaf - 1) / TreeWidth)
+    return std::nullopt;
+  return nodeIndexForSpan(Span);
+}
+
+std::optional<SSARegisterForest::NodeCover>
+SSARegisterForest::cover(PhysicalSpan Span) const {
+  if (!validPhysicalSpan(Span))
+    return std::nullopt;
+
+  NodeCover Result;
+  if (std::optional<NodeIndex> Node = canonicalNode(Span)) {
+    Result.push_back(*Node);
+    return Result;
+  }
+
+  unsigned Cursor = Span.FirstPhysicalLeaf;
+  while (Cursor != Span.EndPhysicalLeaf) {
+    const unsigned TreeEnd = (Cursor / TreeWidth + 1) * TreeWidth;
+    const unsigned ComponentEnd = std::min(Span.EndPhysicalLeaf, TreeEnd);
+    unsigned Width = llvm::bit_floor(ComponentEnd - Cursor);
+    while (Cursor % Width != 0)
+      Width /= 2;
+
+    PhysicalSpan Component{Cursor, Cursor + Width};
+    Result.push_back(nodeIndexForSpan(Component));
+    Cursor += Width;
+  }
+  return Result;
+}
+
+bool SSARegisterForest::findAssignment(const NodeCover &Cover, SlotIndex Start,
+                                       SlotIndex End, Register Owner,
+                                       OwnershipChain &Assignment) const {
+  Assignment.clear();
+  for (NodeIndex Node : Cover) {
+    const Ownership *Owned = Nodes[Node].find(Start, End, Owner);
+    if (!Owned)
+      return false;
+    Assignment.push_back(Owned);
+  }
+
+  if (Assignment.size() == 1)
+    return Assignment.front()->Next == nullptr;
+
+  for (std::size_t I = 0; I != Assignment.size(); ++I)
+    if (Assignment[I]->Next != Assignment[(I + 1) % Assignment.size()])
+      return false;
+  return true;
 }
 
 void SSARegisterForest::initializeTree(NodeIndex Root, unsigned LeafWidth) {
@@ -155,8 +221,7 @@ SSARegisterForest::subtree(NodeIndex Root) const {
   const unsigned Width = Nodes[Root].leafWidth();
   const NodeIndex SubtreeEnd = Root + Width + (Width - 1);
   const NodeIndex TreeEnd = treeRootIndex(Root) + TreeStride;
-  assert(SubtreeEnd <= TreeEnd &&
-         "subtree crosses a hardware-tree boundary");
+  assert(SubtreeEnd <= TreeEnd && "subtree crosses a hardware-tree boundary");
   return seq(Root, SubtreeEnd);
 }
 
@@ -216,36 +281,69 @@ bool SSARegisterForest::subtreeOrAncestorInterference(NodeIndex MemoryIndex,
   return false;
 }
 
-std::optional<Register> SSARegisterForest::ownerAt(NodeIndex MemoryIndex,
-                                                   SlotIndex At) const {
-  if (MemoryIndex >= NumNodes || !At.isValid())
-    return std::nullopt;
-  return Nodes[MemoryIndex].ownerAt(At);
-}
-
-bool SSARegisterForest::isFree(NodeIndex MemoryIndex, SlotIndex Start,
+bool SSARegisterForest::isFree(PhysicalSpan Span, SlotIndex Start,
                                SlotIndex End) const {
-  if (MemoryIndex >= NumNodes || !Start.isValid() || !End.isValid() ||
-      !(Start < End))
-    return false;
-  return !subtreeOrAncestorInterference(MemoryIndex, Start, End);
-}
-
-bool SSARegisterForest::assign(NodeIndex MemoryIndex, SlotIndex Start,
-                               SlotIndex End, Register Owner) {
-  if (!validOwnership(MemoryIndex, Start, End, Owner) ||
-      !isFree(MemoryIndex, Start, End))
+  std::optional<NodeCover> Cover = cover(Span);
+  if (!Cover || !Start.isValid() || !End.isValid() || !(Start < End))
     return false;
 
-  Nodes[MemoryIndex].insert({Start, End, Owner});
+  for (NodeIndex Node : *Cover)
+    if (subtreeOrAncestorInterference(Node, Start, End))
+      return false;
   return true;
 }
 
-bool SSARegisterForest::release(NodeIndex MemoryIndex, SlotIndex Start,
-                                SlotIndex End, Register Owner) {
-  if (!validOwnership(MemoryIndex, Start, End, Owner))
+bool SSARegisterForest::contains(PhysicalSpan Span, SlotIndex Start,
+                                 SlotIndex End, Register Owner) const {
+  std::optional<NodeCover> Cover = cover(Span);
+  if (!Cover || !validOwnership(Start, End, Owner))
     return false;
-  return Nodes[MemoryIndex].erase({Start, End, Owner});
+
+  OwnershipChain Assignment;
+  return findAssignment(*Cover, Start, End, Owner, Assignment);
+}
+
+bool SSARegisterForest::assign(PhysicalSpan Span, SlotIndex Start,
+                               SlotIndex End, Register Owner) {
+  std::optional<NodeCover> Cover = cover(Span);
+  if (!Cover || !validOwnership(Start, End, Owner))
+    return false;
+
+  for (NodeIndex Node : *Cover)
+    if (subtreeOrAncestorInterference(Node, Start, End))
+      return false;
+
+  SmallVector<Ownership *, 4> Assignment;
+  Assignment.reserve(Cover->size());
+  for (std::size_t I = 0; I != Cover->size(); ++I)
+    Assignment.push_back(new (OwnershipAllocator)
+                             Ownership{Start, End, Owner, nullptr});
+
+  if (Assignment.size() > 1)
+    for (std::size_t I = 0; I != Assignment.size(); ++I)
+      Assignment[I]->Next = Assignment[(I + 1) % Assignment.size()];
+
+  for (std::size_t I = 0; I != Cover->size(); ++I)
+    Nodes[(*Cover)[I]].insert(Assignment[I]);
+  return true;
+}
+
+bool SSARegisterForest::release(PhysicalSpan Span, SlotIndex Start,
+                                SlotIndex End, Register Owner) {
+  std::optional<NodeCover> Cover = cover(Span);
+  if (!Cover || !validOwnership(Start, End, Owner))
+    return false;
+
+  OwnershipChain Assignment;
+  if (!findAssignment(*Cover, Start, End, Owner, Assignment))
+    return false;
+
+  for (std::size_t I = 0; I != Cover->size(); ++I) {
+    const bool Erased = Nodes[(*Cover)[I]].erase(Assignment[I]);
+    assert(Erased && "preflighted ownership disappeared");
+    (void)Erased;
+  }
+  return true;
 }
 
 SSARegisterForest::NodeIndex
