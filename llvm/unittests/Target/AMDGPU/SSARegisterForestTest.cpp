@@ -319,4 +319,83 @@ TEST(SSARegisterForestTest, InvalidOwnershipOperationsDoNotMutateState) {
   EXPECT_TRUE(Forest.isFree(OwnerSpan, S2, S5));
 }
 
+TEST(SSARegisterForestTest, PartialSpillReplacementPreservesRemainingOwnership) {
+  IndexListEntry E1(nullptr, SlotIndex::InstrDist);
+  IndexListEntry E2(nullptr, 2 * SlotIndex::InstrDist);
+  IndexListEntry E3(nullptr, 3 * SlotIndex::InstrDist);
+  IndexListEntry E4(nullptr, 4 * SlotIndex::InstrDist);
+  SlotIndex Start(&E1, 0), Spill(&E2, 0), End(&E3, 0), After(&E4, 0);
+  const Register Owner = Register::index2VirtReg(0);
+  const Register Neighbor = Register::index2VirtReg(1);
+  const Register NewOwner = Register::index2VirtReg(2);
+  using Span = SSARegisterForest::PhysicalSpan;
+  using Region = SSARegisterForest::OwnershipRegion;
+
+  // With 16-bit leaves, [4,8) is VGPR2_3. Also exercise a composite original
+  // crossing the hardware-tree boundary: [6,10) is VGPR3_4.
+  for (Span Whole : {Span{4, 8}, Span{6, 10}}) {
+    SCOPED_TRACE(Whole.FirstPhysicalLeaf);
+    auto MaybeForest = SSARegisterForest::create(2, 8);
+    ASSERT_TRUE(MaybeForest);
+    SSARegisterForest &Forest = *MaybeForest;
+    const Span Freed{Whole.FirstPhysicalLeaf, Whole.FirstPhysicalLeaf + 2};
+    const Span Retained{Whole.FirstPhysicalLeaf + 2, Whole.EndPhysicalLeaf};
+    const Span Unrelated{0, 2};
+    const Region Original{Whole, Start, End};
+    const Region Head{Whole, Start, Spill};
+    const Region Tail{Retained, Spill, End};
+    ASSERT_TRUE(Forest.assign(Whole, Start, End, Owner));
+    ASSERT_TRUE(Forest.assign(Unrelated, Start, End, Neighbor));
+
+    auto ExpectOriginal = [&] {
+      EXPECT_TRUE(Forest.contains(Whole, Start, End, Owner));
+      EXPECT_FALSE(Forest.isFree(Freed, Spill, End));
+      EXPECT_TRUE(Forest.contains(Unrelated, Start, End, Neighbor));
+    };
+    const Region Overlapping[] = {Head, {Retained, Start, End}};
+    EXPECT_FALSE(Forest.replace(Original, Owner, Overlapping));
+    ExpectOriginal();
+    const Region OutsideSpace[] = {
+        {{Whole.FirstPhysicalLeaf - 1, Whole.EndPhysicalLeaf}, Spill, End}};
+    EXPECT_FALSE(Forest.replace(Original, Owner, OutsideSpace));
+    ExpectOriginal();
+    const Region OutsideTime[] = {{Whole, Start, After}};
+    EXPECT_FALSE(Forest.replace(Original, Owner, OutsideTime));
+    ExpectOriginal();
+    const Region ReversedTime[] = {{Whole, End, Start}};
+    EXPECT_FALSE(Forest.replace(Original, Owner, ReversedTime));
+    ExpectOriginal();
+    EXPECT_FALSE(Forest.replace(Original, NewOwner, {}));
+    ExpectOriginal();
+    EXPECT_FALSE(Forest.replace({Retained, Start, End}, Owner, {}));
+    ExpectOriginal();
+
+    // Caller order does not determine temporal insertion order. The two pieces
+    // touch at Spill, with only the high dword remaining live afterwards.
+    const Region Replacements[] = {Tail, Head};
+    ASSERT_TRUE(Forest.replace(Original, Owner, Replacements));
+    EXPECT_FALSE(Forest.contains(Whole, Start, End, Owner));
+    EXPECT_TRUE(Forest.contains(Head.Span, Head.Start, Head.End, Owner));
+    EXPECT_TRUE(Forest.contains(Tail.Span, Tail.Start, Tail.End, Owner));
+    EXPECT_FALSE(Forest.isFree(Freed, Start, Spill));
+    EXPECT_TRUE(Forest.isFree(Freed, Spill, End));
+    EXPECT_FALSE(Forest.isFree(Retained, Start, End));
+    EXPECT_TRUE(Forest.isFree(Whole, End, After));
+    EXPECT_TRUE(Forest.contains(Unrelated, Start, End, Neighbor));
+
+    ASSERT_TRUE(Forest.assign(Freed, Spill, End, NewOwner));
+    EXPECT_TRUE(Forest.contains(Freed, Spill, End, NewOwner));
+    EXPECT_FALSE(Forest.release(Whole, Start, End, Owner));
+    EXPECT_TRUE(Forest.contains(Tail.Span, Tail.Start, Tail.End, Owner));
+    ASSERT_TRUE(Forest.replace(Head, Owner, {}));
+    EXPECT_TRUE(Forest.isFree(Whole, Start, Spill));
+    EXPECT_TRUE(Forest.contains(Tail.Span, Tail.Start, Tail.End, Owner));
+    EXPECT_TRUE(Forest.contains(Freed, Spill, End, NewOwner));
+    ASSERT_TRUE(Forest.release(Tail.Span, Tail.Start, Tail.End, Owner));
+    ASSERT_TRUE(Forest.release(Freed, Spill, End, NewOwner));
+    EXPECT_TRUE(Forest.isFree(Whole, Start, End));
+    EXPECT_TRUE(Forest.contains(Unrelated, Start, End, Neighbor));
+  }
+}
+
 } // end anonymous namespace

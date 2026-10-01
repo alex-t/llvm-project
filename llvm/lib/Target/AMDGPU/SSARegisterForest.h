@@ -23,7 +23,9 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_SSAREGISTERFOREST_H
 #define LLVM_LIB_TARGET_AMDGPU_SSAREGISTERFOREST_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/SlotIndexes.h"
@@ -48,6 +50,20 @@ public:
     bool operator==(const PhysicalSpan &Other) const {
       return FirstPhysicalLeaf == Other.FirstPhysicalLeaf &&
              EndPhysicalLeaf == Other.EndPhysicalLeaf;
+    }
+  };
+
+  /// One spatial and temporal region, independent of its canonical node cover.
+  struct OwnershipRegion {
+    PhysicalSpan Span;
+    SlotIndex Start;
+    SlotIndex End;
+
+    /// Both regions must be nonempty. Touching boundaries do not overlap.
+    bool overlaps(const OwnershipRegion &Other) const {
+      return Span.FirstPhysicalLeaf < Other.Span.EndPhysicalLeaf &&
+             Other.Span.FirstPhysicalLeaf < Span.EndPhysicalLeaf &&
+             Start < Other.End && Other.Start < End;
     }
   };
 
@@ -138,6 +154,11 @@ public:
   static std::optional<SSARegisterForest> create(unsigned NumTrees,
                                                  unsigned TreeWidth);
 
+  /// Visit every live canonical ownership component, including all components
+  /// of composite assignments. The callback must not mutate this forest.
+  void visitOwnership(
+      function_ref<void(PhysicalSpan, const Ownership &)> Visit) const;
+
   unsigned numTrees() const { return NumTrees; }
   unsigned treeWidth() const { return TreeWidth; }
   unsigned treeStride() const { return TreeStride; }
@@ -172,6 +193,14 @@ public:
   bool release(PhysicalSpan Span, SlotIndex Start, SlotIndex End,
                Register Owner);
 
+  /// Replace one exact assignment with regions retained by the same owner.
+  /// Every replacement must be nonempty and contained in Original. Replacements
+  /// must not overlap in both space and time; touching boundaries are permitted.
+  /// Empty Replacements removes Original. Each new region becomes an independent
+  /// exact assignment. Invalid input leaves all ownership unchanged.
+  bool replace(OwnershipRegion Original, Register Owner,
+               ArrayRef<OwnershipRegion> Replacements);
+
 private:
   /// Geometry and temporal state owned by one exact physical node. LeafWidth
   /// is initialized with the forest topology and never changes. This class
@@ -181,6 +210,7 @@ private:
     explicit NodeState(unsigned LeafWidth) : LeafWidth(LeafWidth) {}
 
     unsigned leafWidth() const { return LeafWidth; }
+    ArrayRef<const Ownership *> ownership() const { return OwnedHere; }
     const Ownership *find(SlotIndex Start, SlotIndex End, Register Owner) const;
     bool interferes(SlotIndex Start, SlotIndex End) const;
     void insert(const Ownership *Owned);
@@ -274,6 +304,9 @@ private:
                       Register Owner, OwnershipChain &Assignment) const;
   bool subtreeOrAncestorInterference(NodeIndex MemoryIndex, SlotIndex Start,
                                      SlotIndex End) const;
+  SmallVector<Ownership *, 4> createAssignment(unsigned NumComponents,
+                                               SlotIndex Start, SlotIndex End,
+                                               Register Owner);
   void initializeTree(NodeIndex Root, unsigned LeafWidth);
   NodeIndex treeRootIndex(NodeIndex MemoryIndex) const;
   NodeIndex parentIndex(NodeIndex Child) const;

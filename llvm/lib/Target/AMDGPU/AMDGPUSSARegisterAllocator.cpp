@@ -14,6 +14,7 @@
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIInstrInfo.h"
 #include "SIRegisterInfo.h"
+#include "SSARegisterForestAdapter.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -23,12 +24,222 @@
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "SSARATrace.h"
+#include <array>
+#include <tuple>
 
 using namespace llvm;
 
 #define DEBUG_TYPE "amdgpu-ssa-register-allocator"
+
+static cl::opt<bool> EnableVerifyForestColoring(
+    "amdgpu-ssa-verify-forest-coloring", cl::Hidden, cl::init(false),
+    cl::desc("Verify register-forest ownership during each call-free ordinary "
+             "coloring walk; excludes recovery mutations"));
+
+namespace llvm {
+
+/// One observer per color() invocation. Recovery and stage transitions destroy
+/// it; a later recoloring starts with an empty forest, just like ColorMap.
+class ForestColoringObserver {
+  const SIRegisterInfo &TRI;
+  const MachineRegisterInfo &MRI;
+  const LiveIntervals &LIS;
+  RegisterForestAdapter::OrderProvider GetOrder;
+  std::array<std::optional<SSARegisterForest>, 3> Forests;
+  std::array<std::unique_ptr<RegisterForestAdapter>, 3> Adapters;
+
+  struct Fact {
+    unsigned File, Leaf;
+    Register Owner;
+    SlotIndex Start, End;
+
+    auto key() const {
+      return std::make_tuple(File, Leaf, Owner.id(), Start, End);
+    }
+    bool operator==(const Fact &Other) const { return key() == Other.key(); }
+  };
+  using Facts = SmallVector<Fact, 0>;
+
+  std::optional<unsigned> file(MCRegister PR) const {
+    const TargetRegisterClass *RC = TRI.getPhysRegBaseClass(PR);
+    if (!RC)
+      return std::nullopt;
+    if (TRI.isAGPRClass(RC))
+      return 2;
+    if (TRI.isVGPRClass(RC))
+      return 1;
+    if (TRI.isSGPRClass(RC))
+      return 0;
+    return std::nullopt;
+  }
+
+  [[noreturn]] void fail(StringRef Reason, Register VR = Register(),
+                        MCRegister PR = MCRegister()) const {
+    std::string Message;
+    raw_string_ostream OS(Message);
+    OS << "register forest coloring in " << MRI.getMF().getName() << ": "
+       << Reason;
+    if (VR)
+      OS << " (" << printReg(VR, &TRI) << " -> " << printReg(PR, &TRI) << ')';
+    report_fatal_error(StringRef(Message));
+  }
+
+  static void normalize(Facts &State) {
+    llvm::sort(State, [](const Fact &A, const Fact &B) {
+      return A.key() < B.key();
+    });
+    Facts Result;
+    for (const Fact &F : State) {
+      if (!Result.empty()) {
+        Fact &Last = Result.back();
+        if (Last.File == F.File && Last.Leaf == F.Leaf &&
+            Last.Owner == F.Owner && F.Start <= Last.End) {
+          Last.End = std::max(Last.End, F.End);
+          continue;
+        }
+      }
+      Result.push_back(F);
+    }
+    State = std::move(Result);
+  }
+
+public:
+  ForestColoringObserver(
+      const SIRegisterInfo &TRI, const MachineRegisterInfo &MRI,
+      const LiveIntervals &LIS,
+      RegisterForestAdapter::OrderProvider GetOrder)
+      : TRI(TRI), MRI(MRI), LIS(LIS), GetOrder(std::move(GetOrder)) {
+    for (const MachineBasicBlock &MBB : MRI.getMF())
+      for (const MachineInstr &MI : MBB)
+        if (MI.isCall())
+          fail("calls are outside the supported observation scope");
+
+    // Size storage from target physical coordinates, including holes. Legal
+    // candidates still come exclusively from the allocator's filtered order.
+    std::array<unsigned, 3> Leaves = {8, 8, 8};
+    for (unsigned R = 1; R != TRI.getNumRegs(); ++R) {
+      MCRegister PR(R);
+      auto File = file(PR);
+      if (!File)
+        continue;
+      unsigned Bits = TRI.getRegSizeInBits(*TRI.getPhysRegBaseClass(PR));
+      if (Bits && Bits % 16 == 0)
+        Leaves[*File] = std::max(
+            Leaves[*File],
+            RegisterForestAdapter::firstPhysicalLeaf(PR, Bits, TRI) + Bits / 16);
+    }
+    for (unsigned F = 0; F != 3; ++F) {
+      Forests[F] = SSARegisterForest::create((Leaves[F] + 7) / 8, 8);
+      if (!Forests[F])
+        fail("invalid target topology");
+      Adapters[F] = std::make_unique<RegisterForestAdapter>(
+          *Forests[F], TRI, MRI,
+          [this](const TargetRegisterClass *RC) {
+            return this->GetOrder(RC);
+          });
+    }
+  }
+
+  void assigned(Register VR, MCRegister PR) {
+    auto File = file(PR);
+    if (!File || !LIS.hasInterval(VR))
+      fail("unsupported home or missing live interval", VR, PR);
+    const LiveInterval &LI = LIS.getInterval(VR);
+    SmallVector<RegisterForestAdapter::RetainedRegion, 8> Regions;
+    auto Append = [&](const LiveRange &Range, LaneBitmask Mask) {
+      for (const auto &S : Range.segments)
+        Regions.push_back({VRegMaskPair(VR, Mask), S.start, S.end});
+    };
+    if (LI.hasSubRanges()) {
+      for (const auto &S : LI.subranges())
+        Append(S, S.LaneMask);
+    } else {
+      Append(LI, MRI.getMaxLaneMaskForVReg(VR));
+    }
+    if (!Adapters[*File]->assign(VR, PR, Regions)) {
+      errs() << "Rejected live regions:";
+      for (const auto &R : Regions)
+        errs() << " [" << R.Start << ',' << R.End << ") mask="
+               << PrintLaneMask(R.Value.getLaneMask());
+      errs() << '\n';
+      fail("ownership insertion failed", VR, PR);
+    }
+  }
+
+  void verify(const DenseMap<Register, MCRegister> &Colors) const {
+    Facts Actual, Expected;
+    for (unsigned F = 0; F != 3; ++F)
+      Forests[F]->visitOwnership(
+          [&](SSARegisterForest::PhysicalSpan Span,
+              const SSARegisterForest::Ownership &O) {
+            for (unsigned L = Span.FirstPhysicalLeaf;
+                 L != Span.EndPhysicalLeaf; ++L)
+              Actual.push_back({F, L, O.Owner, O.Start, O.End});
+          });
+
+    // Independent projection: enumerate the target's concrete 16-bit
+    // subregisters and their relative masks, rather than using the adapter's
+    // channel/half composition or any of its emitted ownership rectangles.
+    for (const auto &[VR, PR] : Colors) {
+      auto File = file(PR);
+      if (!File || !LIS.hasInterval(VR))
+        fail("unsupported reference assignment", VR, PR);
+      const LiveInterval &LI = LIS.getInterval(VR);
+      unsigned Bits = TRI.getRegSizeInBits(*TRI.getPhysRegBaseClass(PR));
+      unsigned NumHalves = 0;
+      auto AppendHalf = [&](MCRegister Half, LaneBitmask Mask) {
+        ++NumHalves;
+        unsigned Leaf =
+            RegisterForestAdapter::firstPhysicalLeaf(Half, 16, TRI);
+        auto Append = [&](const LiveRange &Range) {
+          for (const auto &S : Range.segments)
+            Expected.push_back({*File, Leaf, VR, S.start, S.end});
+        };
+        if (LI.hasSubRanges()) {
+          for (const auto &S : LI.subranges())
+            if ((Mask & S.LaneMask).any())
+              Append(S);
+        } else {
+          Append(LI);
+        }
+      };
+      if (Bits == 16) {
+        AppendHalf(PR, MRI.getMaxLaneMaskForVReg(VR));
+      } else {
+        for (MCSubRegIndexIterator I(PR, &TRI); I.isValid(); ++I)
+          if (TRI.getSubRegIdxSize(I.getSubRegIndex()) == 16)
+            AppendHalf(I.getSubReg(),
+                       TRI.getSubRegIndexLaneMask(I.getSubRegIndex()));
+      }
+      if (!Bits || NumHalves * 16 != Bits)
+        fail("incomplete target subregister reference", VR, PR);
+    }
+    normalize(Actual);
+    normalize(Expected);
+    if (Actual == Expected)
+      return;
+    auto Print = [&](StringRef Label, const Fact &F) {
+      static const char *Names[] = {"SGPR", "VGPR", "AGPR"};
+      errs() << Label << ' ' << Names[F.File] << " leaf=" << F.Leaf
+             << " [" << F.Start << ',' << F.End << ") "
+             << printReg(F.Owner, &TRI) << " -> "
+             << printReg(Colors.lookup(F.Owner), &TRI) << '\n';
+    };
+    size_t I = 0;
+    while (I < Actual.size() && I < Expected.size() && Actual[I] == Expected[I])
+      ++I;
+    if (I < Actual.size())
+      Print("actual", Actual[I]);
+    if (I < Expected.size())
+      Print("expected", Expected[I]);
+    fail("ownership state differs from ColorMap/live intervals");
+  }
+};
+
+} // namespace llvm
 
 static cl::opt<bool> EnableExperimentBail(
     "amdgpu-ssa-experiment-bail", cl::Hidden, cl::init(false),
@@ -3221,6 +3432,15 @@ void AMDGPUSSARegisterAllocator::preassignValuesLiveAcrossCalls() {
 
 void AMDGPUSSARegisterAllocator::color() {
   SSARA_TRACE();
+  std::unique_ptr<ForestColoringObserver> ForestObserver;
+  if (EnableVerifyForestColoring) {
+    if (!ColorMap.empty())
+      report_fatal_error("forest coloring requires an empty initial ColorMap");
+    ForestObserver = std::make_unique<ForestColoringObserver>(
+        *TRI, *MRI, *LIS, [this](const TargetRegisterClass *RC) {
+          return availableOrder(RC);
+        });
+  }
   // The vreg set may have moved since the earlier classification: recovery in
   // the preceding allocation stage can add reload values. Rebuild the width
   // tiers for this stage before anything consults them.
@@ -3738,6 +3958,8 @@ void AMDGPUSSARegisterAllocator::color() {
           }
 
           ColorMap[Reg] = Chosen;
+          if (ForestObserver)
+            ForestObserver->assigned(Reg, Chosen);
           // A dead def (e.g. the unused carry-out of V_ADD_CO_U32_e64) is not
           // live past this instruction, so it must not reserve a register going
           // forward. Marking it occupied would leak: the kill path only frees
@@ -3818,6 +4040,9 @@ void AMDGPUSSARegisterAllocator::color() {
 
   } // width loop
   } // phase loop
+
+  if (ForestObserver)
+    ForestObserver->verify(ColorMap);
 
   LLVM_DEBUG({
     dbgs() << "\nColoring result:\n";

@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 using namespace llvm;
 
@@ -303,6 +304,22 @@ bool SSARegisterForest::contains(PhysicalSpan Span, SlotIndex Start,
   return findAssignment(*Cover, Start, End, Owner, Assignment);
 }
 
+SmallVector<SSARegisterForest::Ownership *, 4>
+SSARegisterForest::createAssignment(unsigned NumComponents, SlotIndex Start,
+                                    SlotIndex End, Register Owner) {
+  assert(NumComponents && "assignment requires a nonempty cover");
+  SmallVector<Ownership *, 4> Assignment;
+  Assignment.reserve(NumComponents);
+  for (unsigned I = 0; I != NumComponents; ++I)
+    Assignment.push_back(new (OwnershipAllocator)
+                             Ownership{Start, End, Owner, nullptr});
+
+  if (Assignment.size() > 1)
+    for (std::size_t I = 0; I != Assignment.size(); ++I)
+      Assignment[I]->Next = Assignment[(I + 1) % Assignment.size()];
+  return Assignment;
+}
+
 bool SSARegisterForest::assign(PhysicalSpan Span, SlotIndex Start,
                                SlotIndex End, Register Owner) {
   std::optional<NodeCover> Cover = cover(Span);
@@ -313,15 +330,8 @@ bool SSARegisterForest::assign(PhysicalSpan Span, SlotIndex Start,
     if (subtreeOrAncestorInterference(Node, Start, End))
       return false;
 
-  SmallVector<Ownership *, 4> Assignment;
-  Assignment.reserve(Cover->size());
-  for (std::size_t I = 0; I != Cover->size(); ++I)
-    Assignment.push_back(new (OwnershipAllocator)
-                             Ownership{Start, End, Owner, nullptr});
-
-  if (Assignment.size() > 1)
-    for (std::size_t I = 0; I != Assignment.size(); ++I)
-      Assignment[I]->Next = Assignment[(I + 1) % Assignment.size()];
+  SmallVector<Ownership *, 4> Assignment =
+      createAssignment(Cover->size(), Start, End, Owner);
 
   for (std::size_t I = 0; I != Cover->size(); ++I)
     Nodes[(*Cover)[I]].insert(Assignment[I]);
@@ -343,6 +353,53 @@ bool SSARegisterForest::release(PhysicalSpan Span, SlotIndex Start,
     assert(Erased && "preflighted ownership disappeared");
     (void)Erased;
   }
+  return true;
+}
+
+bool SSARegisterForest::replace(OwnershipRegion Original, Register Owner,
+                                 ArrayRef<OwnershipRegion> Replacements) {
+  std::optional<NodeCover> OriginalCover = cover(Original.Span);
+  if (!OriginalCover || !validOwnership(Original.Start, Original.End, Owner))
+    return false;
+
+  OwnershipChain OriginalAssignment;
+  if (!findAssignment(*OriginalCover, Original.Start, Original.End, Owner,
+                      OriginalAssignment))
+    return false;
+
+  SmallVector<NodeCover, 4> Covers;
+  for (std::size_t I = 0; I != Replacements.size(); ++I) {
+    const OwnershipRegion &R = Replacements[I];
+    std::optional<NodeCover> Cover = cover(R.Span);
+    if (!Cover || !validOwnership(R.Start, R.End, Owner) ||
+        R.Span.FirstPhysicalLeaf < Original.Span.FirstPhysicalLeaf ||
+        Original.Span.EndPhysicalLeaf < R.Span.EndPhysicalLeaf ||
+        R.Start < Original.Start || Original.End < R.End)
+      return false;
+
+    for (const OwnershipRegion &Previous : Replacements.take_front(I))
+      if (R.overlaps(Previous))
+        return false;
+    Covers.push_back(std::move(*Cover));
+  }
+
+  // Containment in the exact original assignment proves that no other owner
+  // can interfere. Prepare every replacement chain before removing that owner;
+  // all recoverable validation failures precede the first mutation.
+  SmallVector<SmallVector<Ownership *, 4>, 4> Assignments;
+  for (std::size_t I = 0; I != Replacements.size(); ++I)
+    Assignments.push_back(createAssignment(Covers[I].size(),
+                                           Replacements[I].Start,
+                                           Replacements[I].End, Owner));
+
+  for (std::size_t I = 0; I != OriginalCover->size(); ++I) {
+    const bool Erased = Nodes[(*OriginalCover)[I]].erase(OriginalAssignment[I]);
+    assert(Erased && "preflighted ownership disappeared");
+    (void)Erased;
+  }
+  for (std::size_t I = 0; I != Covers.size(); ++I)
+    for (std::size_t J = 0; J != Covers[I].size(); ++J)
+      Nodes[Covers[I][J]].insert(Assignments[I][J]);
   return true;
 }
 
@@ -414,4 +471,11 @@ bool SSARegisterForest::NodeLevelIterator::operator==(
     const NodeLevelIterator &Other) const {
   return Forest == Other.Forest && NodeWidth == Other.NodeWidth &&
          FirstPhysicalLeaf == Other.FirstPhysicalLeaf;
+}
+
+void SSARegisterForest::visitOwnership(
+    function_ref<void(PhysicalSpan, const Ownership &)> Visit) const {
+  for (NodeIndex I = 0; I != numNodes(); ++I)
+    for (const Ownership *Owned : Nodes[I].ownership())
+      Visit(nodeAt(I)->Span, *Owned);
 }
