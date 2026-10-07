@@ -18,9 +18,14 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_AMDGPUSSAREGISTERALLOCATOR_H
 #define LLVM_LIB_TARGET_AMDGPU_AMDGPUSSAREGISTERALLOCATOR_H
 
+#include "SSAForensicReporter.h"
+#include "SSAPlacementProfile.h"
+#include "SSARegisterForestAdapter.h"
+#include "SSASpillEmitter.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -29,11 +34,9 @@
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
-#include "SSASpillEmitter.h"
-#include "SSAForensicReporter.h"
-#include "SSAPlacementProfile.h"
-#include "SSARegisterTree.h"
+#include <array>
 #include <memory>
+#include <optional>
 #include <set>
 
 namespace llvm {
@@ -55,8 +58,39 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   RegisterClassInfo RegClassInfo;
 
   std::set<unsigned, std::greater<unsigned>> ColoringOrder;
-  DenseMap<Register, MCRegister> ColorMap;
-  BitVector OccupiedRegUnits;
+  // Sole assignment authority, retained through physical rewriting.
+  std::array<std::optional<SSARegisterForest>, 3> Forests;
+  std::array<std::unique_ptr<RegisterForestAdapter>, 3> Adapters;
+  void initializeForests();
+  RegisterForestAdapter *adapterFor(MCRegister PR) const;
+  void visitAssignments(function_ref<void(Register, MCRegister)> Visit) const;
+  std::optional<RegisterForestAdapter::Interference>
+  forestInterferences(Register VR, MCRegister PR) const;
+  bool placementIsFree(Register VR, MCRegister PR) const;
+  bool isFreeAt(MCRegister PR, SlotIndex At) const;
+  MCRegister assignedHome(Register VR) const;
+  /// Assignment requires an uncolored VR; removal requires an existing color.
+  /// Changing homes is an explicit unassignColor/assignColor sequence.
+  void assignColor(Register VR, MCRegister PR);
+  void unassignColor(Register VR);
+  void clearColors();
+  /// Adapters for the actual register files represented by Affected. A vector
+  /// superclass participates in both VGPR and AGPR storage; no global broadcast.
+  SmallVector<RegisterForestAdapter *, 3>
+  repairAdapters(ArrayRef<Register> Affected);
+  /// Reconcile completed liveness with RF ownership. Does not allocate or
+  /// recursively enter recovery; callers place or queue unassigned results.
+  void notifyLivenessChanged(ArrayRef<Register> Affected);
+  /// True for a surviving value without a retained assignment.
+  bool needsRecovery(Register VR);
+  /// Append all live unassigned values to the existing recovery worklist.
+  void queueUnassignedValues(ArrayRef<Register> Affected);
+  /// After emission, try ordinary placement, then queue unresolved values.
+  void placeRepairedValues(ArrayRef<Register> Affected);
+  SSASpillEmitter::RepairResult spillWithForest(VRegMaskPair Value,
+                                                SlotIndex Kill);
+  std::optional<SSASpillEmitter::RepairResult>
+  splitWithForest(Register VR, MachineBasicBlock::iterator Point);
   mutable DenseMap<const TargetRegisterClass *, unsigned> StrideCache;
 
   unsigned MaxVGPRIdx = 0;
@@ -67,9 +101,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // the SGPR allocation stage from the emitter's spilled-SGPR-lane count; 0
   // during the SGPR stage. Consumed by allocatablePool().
   unsigned VGPRReserve = 0;
-  // (call def-slot, call instruction) for every call; a vreg live across a call
-  // must avoid every register the call clobbers (regmask + explicit defs).
-  SmallVector<std::pair<SlotIndex, const MachineInstr *>, 8> CallSites;
   unsigned DynVGPRBlockSize = 0;
 
   // Exec-safe spill/reload emitter, shared with the spiller pass. Used by the
@@ -84,57 +115,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // allocator is byte-identical ON vs OFF. Created per function in
   // runOnMachineFunction and shared with the emitter via setReporter().
   std::unique_ptr<SSAForensicReporter> Reporter;
-
-  // === Shadow register-tree oracle (-amdgpu-ssa-shadow-tree, default off) ===
-  //
-  // A SHADOW SSARegisterTree that mirrors, for the VGPR_32 file ONLY, the exact
-  // occupancy the allocator maintains in OccupiedRegUnits, and — at each real
-  // VGPR_32 pick — logs what the tree WOULD have picked vs. what the allocator
-  // actually chose. It NEVER influences allocation: its answer is discarded and
-  // every mutation/compare is guarded behind the flag AND Reporter->active(), so
-  // an off run (and a build without the flag set) is byte-identical.
-  //
-  // Mapping: leaf index == VGPR_32 allocation-order ordinal (getOrder index).
-  // The tree requires a power-of-two leaf count, so it is sized to the padded
-  // power of two >= the real allocatable VGPR_32 count; the padding leaves
-  // [RealVGPR32Count, padded) are pre-allocated at construction so the tree's
-  // pickFreeAligned can never return a nonexistent register. See the .cpp for
-  // the leafOf() physreg->leaf map and the width-1 scope of this increment.
-  std::unique_ptr<SSARegisterTree> ShadowTree;
-  // getOrder(VGPR_32) ordinal for each MCRegister, or -1 if not a VGPR_32 in the
-  // order. Built once per function in setupShadowTree(); the identity of the
-  // physreg<->leaf bijection.
-  DenseMap<unsigned, int> VGPR32Leaf;
-  // MCRegUnit -> owning VGPR_32's leaf ordinal. Keyed by reg UNIT (not physreg)
-  // because on targets with lo16/hi16 sub-registers the reg-unit roots of a
-  // VGPR_32 are VGPRn_LO16/HI16, never VGPRn itself — so a physreg-id lookup off
-  // a reg unit never matches. This unit->leaf map is the reliable bridge from an
-  // OccupiedRegUnits bit (or a physreg's reg units) to its VGPR_32 leaf.
-  DenseMap<unsigned, int> VGPR32UnitLeaf;
-  unsigned RealVGPR32Count = 0;   // allocatable VGPR_32 regs (real, pre-padding)
-  unsigned ShadowLeaves = 0;      // padded power-of-two leaf count of ShadowTree
-  bool shadowActive() const;      // flag && Reporter && Reporter->active()
-  void setupShadowTree();         // build the map + tree (per function)
-  // Return the leaf index of \p PhysReg if it is a VGPR_32 in the mapped order,
-  // else -1. Wider VGPR tuples map to their FIRST (lowest-index) sub-VGPR_32
-  // leaf, which is the aligned block start; a non-VGPR physreg returns -1.
-  int shadowLeafOf(MCRegister PhysReg) const;
-  // Collect the leaf index of every VGPR_32 that \p PhysReg covers (its own leaf
-  // if it is a VGPR_32; each sub-VGPR_32's leaf if it is a wider tuple), resolved
-  // through the getOrder-ordinal map so no contiguity of a tuple's sub-registers
-  // in leaf space is assumed. Empty for a non-VGPR physreg.
-  void shadowLeavesOf(MCRegister PhysReg,
-                      SmallVectorImpl<unsigned> &Leaves) const;
-  // Mirror OccupiedRegUnits mutations into ShadowTree for the VGPR_32 file only.
-  // These are no-ops unless shadowActive(). \p PhysReg is a full physreg (any
-  // width); the width in leaves is derived from its VGPR-unit span.
-  void shadowAllocate(MCRegister PhysReg);
-  void shadowFree(MCRegister PhysReg);
-  // Mirror a raw OccupiedRegUnits.reset(Unit): free the VGPR_32 leaf that owns
-  // \p Unit (no-op if Unit is not a VGPR_32 unit). For the two sites that clear
-  // single reg units directly rather than through markFree.
-  void shadowFreeUnit(MCRegUnit Unit);
-  void shadowResetToOccupied(); // rebuild tree occupancy from OccupiedRegUnits
 
   // Values that color() could not place (no physreg free across their whole
   // range — the %560/%1072 long-liver class). color() collects ALL of them and
@@ -166,6 +146,9 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // recovery spill. Cleared at the start of each allocation stage.
   SmallDenseSet<Register, 8> RehomedVRegs;
   SmallDenseSet<Register, 16> RecoverySpilledVRegs;
+  // Completed splits in this function, retained across worklist retries.
+  // Also lets the drain recognize a committed split as progress.
+  unsigned RecoverySplitCount = 0;
 
   // === Coloring ===
   void classifyVRegs();
@@ -179,18 +162,26 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // constraint test does not apply to a subreg slice). Behind -amdgpu-ssa-agpr-
   // rescue. Must run before classifyVRegs so widened widths feed ColoringOrder.
   void widenToAVOnUnified();
-  /// Run a full coloring walk. Colors every placeable value into ColorMap;
+  /// Run a full coloring walk. Colors every placeable value into RF;
   /// appends any value it cannot place to UncolorableVRegs and skips it (does
   /// not occupy a register for it) so the rest of the walk proceeds as if that
   /// value were absent. Does not assert on failure.
   void color();
-  /// Color a single value \p R in place against the CURRENT ColorMap /
-  /// OccupiedRegUnits, without disturbing any existing assignment. Seeds
-  /// occupancy from the colored values whose live range overlaps R's, then picks
-  /// a free physreg across R's (short) range. Used to place reload remainders
-  /// after a coloring-failure spill. Returns false if no register is free
-  /// (should not happen for a width-1 reload — point pressure ≤ limit < file).
-  bool colorOneInPlace(Register R);
+  /// Place R against RF ownership over its complete lane live ranges,
+  /// without disturbing existing assignments. Used to place reload remainders
+  /// after a coloring-failure spill. Returns the assigned physical register,
+  /// or NoRegister if no register is free (should not happen for a width-1
+  /// reload — point pressure ≤ limit < file).
+  MCRegister colorOneInPlace(Register R);
+  /// Whether evicting VR alone would leave an already-assigned tied partner.
+  /// Uncolored future partners and undef tied uses do not prevent eviction.
+  bool hasAssignedTiedPartner(Register VR) const;
+  /// Repair tied inheritance using the known input home. Return the result's
+  /// home to commit, or NoRegister after queuing the repair COPY/undef result.
+  MCRegister prepareTiedDefHome(const PendingTie &Tie, MCRegister InputHome);
+  /// Resume uncolored tied defs whose inputs recovered. True means a result
+  /// was assigned or the repaired tie was queued for the existing drain.
+  bool resumePendingTies();
   bool tiedAssignmentsValid() const;
   bool drainUncolorableWorklist(MachineFunction &MF,
                                 bool ReportFailure = true);
@@ -205,15 +196,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   SmallVector<MCRegister, 32> getCSRSet(const MachineInstr &CallMI,
                                         const TargetRegisterClass *RC) const;
 
-  /// True if \p PR survives every clobber site the value described by \p VI is
-  /// live at. A site is a call (its regmask clobbers the caller-saved partition,
-  /// and an explicit def such as the return-address $sgpr30_sgpr31 clobbers that
-  /// too) or an implicit def of an allocatable physreg -- an inline-asm register
-  /// clobber, an implicit-def $vcc. A value colored onto a register that any
-  /// site in its range writes is destroyed there, so this is the legality rule
-  /// for every register handed to a value, wherever the decision is made.
-  bool survivesClobberSites(const LiveInterval &VI, MCRegister PR) const;
-
   /// Assign registers to the values live across calls, BEFORE any coloring, so
   /// they get first pick of the registers calls preserve -- a value crossing a
   /// call can occupy nothing else, while the values the main walk places are free
@@ -223,8 +205,10 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void preassignValuesLiveAcrossCalls();
 
   /// Result of one recovery strategy. NoChange guarantees that the strategy
-  /// left MIR, LIS, register classes, and ColorMap unchanged.
-  enum class RecoveryResult { Resolved, Changed, NoChange };
+  /// left MIR, LIS, register classes, and RF unchanged.
+  /// Deferred means mutation is committed and all unresolved results are
+  /// queued.
+  enum class RecoveryResult { Resolved, Changed, Deferred, NoChange };
 
   enum class RecoveryState {
     Entry,
@@ -254,8 +238,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   ///  - LIVE-THROUGH (B.def <= FS): frees P over ALL of F -> Failed colors whole
   ///    -> Resolved.
   ///  - BORN-IN-F (B.def in (FS,FE)): frees P over F's TAIL [B.def,FE); F is
-  ///    split at B.def, the tail colors into P, the HEAD [FS,B.def) is handed
-  ///    back in \p Remnant -> Changed.
+  ///    split at B.def through SSA repair; surviving unassigned split results
+  ///    are queued and the strategy returns Deferred.
   /// Multi-candidate pick = COVERAGE: live-through (frees all of F) beats
   /// born-in-F; among born-in-F the earliest def frees the longest tail. Returns
   /// an unchanged-state transition when a blocking PHI web must be processed by
@@ -412,40 +396,28 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   RegFile fileOf(const TargetRegisterClass *RC) const;
 
   /// Pick the register free at \p V's start that stays free LONGEST, and decide
-  /// whether that free run is worth peeling. Returns false when nothing is free at
-  /// the start, or when the run does not reach past \p V's first use (genuine
-  /// over-pressure rather than fragmentation). On true, \p PR is the register and
-  /// \p Bound the slot where it becomes occupied (>= V's end means free across all
-  /// of V). This is the single split-across policy used by SelfSplit. Const —
-  /// reads LIS/MRI/ColorMap.
+  /// whether that free run is worth peeling. Returns false when nothing is free
+  /// at the start, or when the run does not reach past \p V's first use
+  /// (genuine over-pressure rather than fragmentation). On true, \p PR is the
+  /// register and \p Bound the slot where it becomes occupied (>= V's end means
+  /// free across all of V). This is the single split-across policy used by
+  /// SelfSplit. Const — reads LIS/MRI/RF.
   bool pickPeelableRun(Register V, MCRegister &PR, SlotIndex &Bound) const;
-
-  /// Previous direct split-across implementation. Kept as the opt-in
-  /// differential oracle for the authoritative profile consumer.
-  bool pickPeelableRunLegacy(Register V, MCRegister &PR,
-                             SlotIndex &Bound) const;
 
   /// Authoritative application of the current longest-run and first-use policy
   /// to already collected placement facts. This method does not inspect
-  /// ColorMap or CallSites and does not mutate allocator state.
+  /// mutable allocation state and does not mutate it.
   bool selectPeelableRun(const PlacementProfile &Profile, MCRegister &PR,
                          SlotIndex &Bound) const;
 
   /// Earliest non-debug use strictly after Start, or an invalid index if none.
-  /// Temporary compatibility helper shared by the profile consumer and its
-  /// legacy differential oracle.
+  /// Used by recovery to reject a free run that ends before the first use.
   SlotIndex firstUseAfter(Register V, SlotIndex Start) const;
 
-  /// Populate the authoritative recovery placement mediator from the current
-  /// legacy facts. A later iteration will replace this producer with the
-  /// register forest without changing the consumer contract.
-  void buildLegacyPlacementProfile(Register Subject,
-                                   PlacementProfile &Out) const;
-
-  /// True iff splitLiveRangeAt(V, SplitMI) will redirect at least one real use.
-  /// The emitter creates its result vreg before discovering an empty split, so
-  /// every recovery NoChange path must run this side-effect-free preflight.
-  bool splitWouldRedirect(Register V, MachineInstr *SplitMI) const;
+  /// Set the subject window, target-ordered homes and physical clobber cuts.
+  /// RF supplies occupied intervals; LIS supplies register-mask cuts.
+  void initializePlacementProfile(Register Subject, PlacementProfile &Out) const;
+  void collectPlacementBlockers(PlacementProfile &Profile) const;
 
   /// Cross-file recovery strategy. First try to place \p R in its current
   /// class or in that class's sibling vector pool. If that fails, temporarily
@@ -480,16 +452,10 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// recolors once and performs a final recovery drain.
   bool reduceRegionPressure(MachineFunction &MF);
 
-  /// SelfSplit recovery strategy: \p Failed is
-  /// a long liver with no through-lane AND no live-through blocker to spill around
-  /// (spillCrossLiver found nothing). Chop Failed into segments, each
-  /// short enough that one physreg is free across it, coloring each into that reg.
-  /// Only valid when Failed is POINT-FEASIBLE (some PR free at every slot); aborts
-  /// (returns false -> caller memory-spills) if any slot has zero free PRs.
-  /// \p FirstPR / \p FirstBound may provide the pick for the first piece. Pass
-  /// an invalid \p FirstPR to have the strategy pick it from current state.
-  RecoveryResult trySelfSplitColor(Register Failed, MCRegister FirstPR,
-                                   SlotIndex FirstBound, Register &Remnant);
+  /// Place a whole value when the profile permits, otherwise attempt one
+  /// identity-copy split. Completed repair queues every live unassigned result
+  /// and returns Deferred; it does not assume a prefix or a shorter remnant.
+  RecoveryResult trySelfSplitColor(Register Failed);
 
   /// Coloring-time recovery for one value \p Failed that color() could not place.
   /// Runs a mutation-aware fixpoint in priority order: Web, CrossFileHome,
@@ -510,28 +476,16 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   [[noreturn]] void reportPointOverPressure(Register R, bool IsVGPR,
                                             unsigned RPLimit, const char *Ctx);
 
-  /// Assign \p Piece -> \p PR in ColorMap and bump the file's high-water mark.
+  /// Assign \p Piece -> \p PR in RF and bump the file's high-water mark.
   /// Shared by the coloring-time split paths.
   void commitColor(Register Piece, MCRegister PR);
 
-  /// Earliest slot > \p S in [\p S, \p End) where \p PR becomes occupied by an
-  /// overlapping colored value in \p Overlappers or a call-clobber; returns \p S
-  /// if PR is already occupied at S (not free here), else the bound (clamped to
-  /// \p End). Helper for trySelfSplitColor's per-piece free-run search.
-  SlotIndex
-  firstBlockAfter(MCRegister PR, SlotIndex S, SlotIndex End,
-                  ArrayRef<std::pair<Register, MCRegister>> Overlappers) const;
+  /// Distinct virtual blockers of Subject over its legal candidate homes.
+  /// Owners and their full homes come from RF; fixed conflicts are not victims.
+  void collectBlockers(
+      Register Subject,
+      SmallVectorImpl<std::pair<Register, MCRegister>> &Blockers) const;
 
-  /// Single linear scan over ColorMap for \p VI: the shared "collect" step of
-  /// the split pipeline. ORs the register units of every colored occupant whose
-  /// interval overlaps VI into \p OccupiedUnits. \p Overlappers is optional: when
-  /// non-null it also collects (occupant vreg, its physreg) for each, as every
-  /// current caller does. NOT cacheable across callers — they run in different
-  /// phases with ColorMap mutated between.
-  void scanOverlappersForVI(
-      const LiveInterval &VI, BitVector &OccupiedUnits,
-      SmallVectorImpl<std::pair<Register, MCRegister>> *Overlappers = nullptr) const;
-  void seedOccupiedAtBBEntry(MachineBasicBlock *MBB);
   // True if the parallel PHI edge-copies for Pred->MBB cannot be safely placed
   // at Pred's terminator (they would clobber a value live into a sibling
   // successor, or need a scratch register for a cycle), i.e. the critical edge
@@ -539,25 +493,12 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   bool
   edgeCopiesNeedSplit(MachineBasicBlock *Pred, MachineBasicBlock *MBB,
                       ArrayRef<std::pair<MCRegister, MCRegister>> Copies) const;
-  void markOccupied(MCRegister PhysReg);
-  void markFree(MCRegister PhysReg);
 
-  /// Debug: print \p RC's allocation order at slot \p SI as an occupancy map,
-  /// one char per register in order:
-  ///   '.' free and usable    '#' occupied (ColorMap vreg live at SI)
-  ///   'x' free but CLOBBERED by a call \p VI is live across (unusable by a
-  ///       value pinned to callee-saved) — only marked when \p VI is given.
-  /// So "####xxxx####" shows callee-saved full ('#') with only caller-saved
-  /// ('x') free — the classic pinned-value exhaustion. Occupancy is derived by
-  /// walking ColorMap for vregs live at SI. \p Tag labels the line.
+  /// Print RF occupancy at SI and availability over VI, in target order.
   void dumpOccupancyMap(const TargetRegisterClass *RC, SlotIndex SI,
                         const char *Tag, const LiveInterval *VI = nullptr) const;
 
-  /// Pure fact extraction shared by dumpOccupancyMap (debug print) and the
-  /// forensic reporter (E16 snapshots): compute the occupancy view of \p RC at
-  /// \p SI into \p Out. Const — reads OccupiedRegUnits / ColorMap / CallSites /
-  /// LIS only, mutates nothing. Identical logic to the counting loop that used
-  /// to live inline in dumpOccupancyMap; that function now calls this and prints.
+  /// Extract diagnostic facts from RF without maintaining a second oracle.
   void collectOccupancy(const TargetRegisterClass *RC, SlotIndex SI,
                         const LiveInterval *VI, OccupancyFacts &Out) const;
 
@@ -571,54 +512,25 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
     const LiveInterval *OVI;
   };
   /// Pure fact extraction shared by the COLORFAIL debug block and the forensic
-  /// reporter: over ColorMap, find colored values in \p Failed's register file
-  /// that are live-through [FS,FE) (\p FS/\p FE = Failed's interval bounds). Sets
-  /// \p NLiveThru to all live-through occupants and appends the no-interior-use
-  /// subset (the spillable ones) to \p Out; \p LiveThruIdx gets the sorted vreg
-  /// indices of the full live-through set. Const; mutates nothing.
+  /// reporter: enumerate RF assignments to find values in \p Failed's register
+  /// file that are live-through [FS,FE) (\p FS/\p FE = Failed's interval
+  /// bounds). Sets \p NLiveThru to all live-through occupants and appends the
+  /// no-interior-use subset (the spillable ones) to \p Out; \p LiveThruIdx gets
+  /// the sorted vreg indices of the full live-through set. Const; mutates
+  /// nothing.
   void collectSpillAcrossCandidates(
       Register Failed, SlotIndex FS, SlotIndex FE, bool FIsVGPR,
       unsigned &NLiveThru, SmallVectorImpl<SpillAcrossCandidate> &Out,
       SmallVectorImpl<unsigned> &LiveThruIdx) const;
 
   /// Forensic (facts-only, const): enumerate EVERY value live at \p SI into
-  /// \p Out — the full liveness cross-section the analyst joins to the timeline.
-  /// Reuses the same const LIS/ColorMap walk the allocator already relies on
-  /// (liveAt over every vreg interval, ColorMap lookup for the physreg), so it
-  /// adds no new pressure/LIS pass and mutates nothing. Only called when the
-  /// forensic reporter is enabled (decision boundaries: E4/E10/E16).
+  /// \p Out — the full liveness cross-section the analyst joins to the
+  /// timeline. Reads LIS for liveness and RF for assigned homes, including
+  /// unassigned values. Called only when forensic reporting is enabled.
   void collectLiveSet(SlotIndex SI, SmallVectorImpl<LiveSetEntry> &Out) const;
-
-  // === Value-flow correctness verifier (-amdgpu-ssa-verify-value-flow) ===
-  // Certifies SSA-destruction + physreg assignment preserved VALUE IDENTITY:
-  // every physreg use holds the SSA value its vreg operand named. Catches the
-  // clobber-while-live class (a live value overwritten in its register) that
-  // liveness / reaching-def cannot see (both only tell "is there A value", never
-  // "is it THE value"). Ground truth = a snapshot taken PRE-destruction, while
-  // values are still vregs. v1 certifies single-basic-block functions (~92% of
-  // the corpus green set); multi-block functions are reported SKIP (uncertified)
-  // pending the meet-at-joins + dominance-rescue layer.
-  struct VFOp {
-    unsigned VReg;
-    unsigned SubReg;
-    bool IsDef;
-  };
-  DenseMap<const MachineInstr *, SmallVector<VFOp, 4>> VFIntent;
-  DenseMap<Register, MCRegister> VFColor; // ColorMap frozen pre-destruction
-  DenseMap<uint64_t, uint64_t> VFUF;      // union-find over (vreg,lane) keys
-  // (vreg,lane) keys that receive a REAL (non-undef) definition. A use only
-  // checks lanes in this set: a partial def `undef %V.sub0 = ...` leaves other
-  // lanes intentionally undefined (don't-care), and a later read of %V must not
-  // demand a value token for those lanes (else false clobber).
-  DenseSet<uint64_t> VFDefinedLane;
-  uint64_t vfFind(uint64_t X);
-  void vfUnion(uint64_t A, uint64_t B);
-  void snapshotValueFlow(MachineFunction &MF); // call BEFORE lowerPHIs
-  bool verifyValueFlow(MachineFunction &MF);   // call AFTER finalizeProperties
 
   MCRegister pickFreePhysReg(
       const TargetRegisterClass *RC, const LiveInterval &VI,
-      ArrayRef<std::pair<MCRegister, const LiveInterval *>> WiderDefs,
       ArrayRef<MCRegister> Hints = {}, uint64_t AttemptID = 0);
 
   // Option B affinity: collect already-colored phi-partner physregs for VReg
@@ -638,7 +550,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // Rewrite one file's vregs to physregs (lowerPHIs + rewriteOperands +
   // eliminateRegSequences), scoped to \p Only. Called per allocation stage.
   void rewriteStage(MachineFunction &MF, RegFile Only);
-  // Post-both-stages finalize: physreg live-ins, MF properties, value-flow check.
+  // Finalize MachineFunction properties after both stages are physical.
   void finalizeAfterRewrite(MachineFunction &MF);
   void lowerPHIs(MachineFunction &MF, RegFile Only);
   void resolvePermutation(
@@ -680,7 +592,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
 public:
   static char ID;
 
-  AMDGPUSSARegisterAllocator() : MachineFunctionPass(ID) {}
+  AMDGPUSSARegisterAllocator();
+  ~AMDGPUSSARegisterAllocator() override;
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 

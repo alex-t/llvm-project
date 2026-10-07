@@ -7,11 +7,106 @@
 //===----------------------------------------------------------------------===//
 
 #include "SSARegisterForest.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "gtest/gtest.h"
+
+#include <tuple>
 
 using namespace llvm;
 
 namespace {
+
+TEST(SSARegisterForestTest, SharedCompositeOwnershipAndOwnerIndex) {
+  auto MaybeForest = SSARegisterForest::create(2, 4);
+  ASSERT_TRUE(MaybeForest);
+  auto &Forest = *MaybeForest;
+  Register A = Register::index2VirtReg(3);
+  Register B = Register::index2VirtReg(9);
+  IndexListEntry E1(nullptr, SlotIndex::InstrDist);
+  IndexListEntry E2(nullptr, 2 * SlotIndex::InstrDist);
+  IndexListEntry E3(nullptr, 3 * SlotIndex::InstrDist);
+  IndexListEntry E4(nullptr, 4 * SlotIndex::InstrDist);
+  SlotIndex S1(&E1, 0), S2(&E2, 0), S3(&E3, 0), S4(&E4, 0);
+
+  // Compare the indexed logical view with an independent full node walk.
+  // Pointer deduplication is required only in this reference view.
+  auto CheckOwner = [&](Register Owner, unsigned Count) {
+    SmallPtrSet<const SSARegisterForest::Ownership *, 8> Expected, Actual;
+    Forest.visitOwnershipComponents([&](auto, const auto &O) {
+      if (O.Owner == Owner)
+        Expected.insert(&O);
+    });
+    EXPECT_EQ(Count != 0, Forest.visitOwnerAssignments(Owner, [&](const auto &O) {
+      EXPECT_EQ(O.Owner, Owner);
+      EXPECT_TRUE(Actual.insert(&O).second);
+      EXPECT_TRUE(Expected.contains(&O));
+    }));
+    EXPECT_EQ(Expected.size(), Count);
+    EXPECT_EQ(Actual.size(), Expected.size());
+  };
+
+  // An unaligned assignment crossing two trees has four canonical references
+  // to one record. Another span with the same owner/time is a distinct record.
+  ASSERT_TRUE(Forest.assign({1, 7}, S1, S2, A));
+  ASSERT_TRUE(Forest.assign({7, 8}, S1, S2, A));
+  ASSERT_TRUE(Forest.assign({1, 7}, S2, S3, A));
+  ASSERT_TRUE(Forest.assign({1, 7}, S3, S4, B));
+  ASSERT_TRUE(Forest.assign({0, 1}, S1, S4, SSARegisterForest::SELF_OWNED));
+  CheckOwner(A, 3);
+  CheckOwner(B, 1);
+  const SSARegisterForest::Ownership *Composite = nullptr;
+  unsigned Components = 0;
+  Forest.visitOwnershipComponents([&](auto Span, const auto &O) {
+    if (O.Owner != A || O.Start != S1 || O.Span.FirstPhysicalLeaf != 1)
+      return;
+    EXPECT_EQ(O.Span, (SSARegisterForest::PhysicalSpan{1, 7}));
+    EXPECT_GE(Span.FirstPhysicalLeaf, 1u);
+    EXPECT_LE(Span.EndPhysicalLeaf, 7u);
+    if (!Composite)
+      Composite = &O;
+    EXPECT_EQ(&O, Composite);
+    ++Components;
+  });
+  EXPECT_EQ(Components, 4u);
+
+  // Failed mutations preserve both views. Releasing one canonical component
+  // must not accidentally release part of a logical composite assignment.
+  EXPECT_FALSE(Forest.release({1, 2}, S1, S2, A));
+  EXPECT_FALSE(Forest.assign({1, 7}, S3, S4, A));
+  SSARegisterForest::OwnershipRegion Outside[] = {{{0, 3}, S2, S3}};
+  EXPECT_FALSE(Forest.replace({{1, 7}, S2, S3}, A, Outside));
+  CheckOwner(A, 3);
+  EXPECT_TRUE(Forest.contains({1, 7}, S1, S2, A));
+
+  // A still owns the same nodes at another time: their bits must survive.
+  ASSERT_TRUE(Forest.release({1, 7}, S1, S2, A));
+  CheckOwner(A, 2);
+  SSARegisterForest::OwnershipRegion Retained[] = {
+      {{1, 3}, S2, S3}, {{5, 7}, S2, S3}};
+  ASSERT_TRUE(Forest.replace({{1, 7}, S2, S3}, A, Retained));
+  CheckOwner(A, 3);
+  EXPECT_TRUE(Forest.isFree({3, 5}, S2, S3));
+  EXPECT_TRUE(Forest.contains({1, 3}, S2, S3, A));
+  EXPECT_TRUE(Forest.contains({5, 7}, S2, S3, A));
+
+  ASSERT_TRUE(Forest.releaseOwner(A));
+  CheckOwner(A, 0);
+  CheckOwner(B, 1);
+  EXPECT_TRUE(Forest.contains({1, 7}, S3, S4, B));
+  EXPECT_TRUE(Forest.contains({0, 1}, S1, S4, SSARegisterForest::SELF_OWNED));
+  EXPECT_FALSE(Forest.releaseOwner(A));
+  CheckOwner(Register::index2VirtReg(1000), 0);
+  EXPECT_FALSE(Forest.releaseOwner(Register::index2VirtReg(1000)));
+  EXPECT_FALSE(Forest.releaseOwner(SSARegisterForest::SELF_OWNED));
+  EXPECT_FALSE(Forest.visitOwnerAssignments(SSARegisterForest::SELF_OWNED,
+                                     [&](const auto &) { ADD_FAILURE(); }));
+
+  // An emptied bitmap is reusable, including for a different canonical cover.
+  ASSERT_TRUE(Forest.assign({0, 8}, S4, S4.getDeadSlot(), A));
+  CheckOwner(A, 1);
+  ASSERT_TRUE(Forest.replace({{0, 8}, S4, S4.getDeadSlot()}, A, {}));
+  CheckOwner(A, 0);
+}
 
 TEST(SSARegisterForestTest, PreorderLayoutAndWidthTwoLevel) {
   std::optional<SSARegisterForest> MaybeForest =
@@ -346,11 +441,29 @@ TEST(SSARegisterForestTest, PartialSpillReplacementPreservesRemainingOwnership) 
     const Region Tail{Retained, Spill, End};
     ASSERT_TRUE(Forest.assign(Whole, Start, End, Owner));
     ASSERT_TRUE(Forest.assign(Unrelated, Start, End, Neighbor));
+    ASSERT_TRUE(Forest.assign(Whole, End, After, Owner));
+    SmallVector<const SSARegisterForest::Ownership *, 4> Unchanged;
+    Forest.visitOwnershipComponents([&](Span S, const SSARegisterForest::Ownership &O) {
+      if (S == Unrelated || O.Start == End)
+        Unchanged.push_back(&O);
+    });
+    ASSERT_FALSE(Unchanged.empty());
+    auto ExpectUnchanged = [&] {
+      SmallVector<const SSARegisterForest::Ownership *, 4> Current;
+      Forest.visitOwnershipComponents([&](Span S, const SSARegisterForest::Ownership &O) {
+        if (S == Unrelated || O.Start == End)
+          Current.push_back(&O);
+      });
+      EXPECT_EQ(Current, Unchanged);
+      EXPECT_TRUE(Forest.contains(Whole, End, After, Owner));
+      EXPECT_TRUE(Forest.contains(Unrelated, Start, End, Neighbor));
+    };
 
     auto ExpectOriginal = [&] {
       EXPECT_TRUE(Forest.contains(Whole, Start, End, Owner));
       EXPECT_FALSE(Forest.isFree(Freed, Spill, End));
       EXPECT_TRUE(Forest.contains(Unrelated, Start, End, Neighbor));
+      ExpectUnchanged();
     };
     const Region Overlapping[] = {Head, {Retained, Start, End}};
     EXPECT_FALSE(Forest.replace(Original, Owner, Overlapping));
@@ -380,7 +493,7 @@ TEST(SSARegisterForestTest, PartialSpillReplacementPreservesRemainingOwnership) 
     EXPECT_FALSE(Forest.isFree(Freed, Start, Spill));
     EXPECT_TRUE(Forest.isFree(Freed, Spill, End));
     EXPECT_FALSE(Forest.isFree(Retained, Start, End));
-    EXPECT_TRUE(Forest.isFree(Whole, End, After));
+    ExpectUnchanged();
     EXPECT_TRUE(Forest.contains(Unrelated, Start, End, Neighbor));
 
     ASSERT_TRUE(Forest.assign(Freed, Spill, End, NewOwner));
@@ -393,9 +506,88 @@ TEST(SSARegisterForestTest, PartialSpillReplacementPreservesRemainingOwnership) 
     EXPECT_TRUE(Forest.contains(Freed, Spill, End, NewOwner));
     ASSERT_TRUE(Forest.release(Tail.Span, Tail.Start, Tail.End, Owner));
     ASSERT_TRUE(Forest.release(Freed, Spill, End, NewOwner));
+    ExpectUnchanged();
+    ASSERT_TRUE(Forest.release(Whole, End, After, Owner));
     EXPECT_TRUE(Forest.isFree(Whole, Start, End));
     EXPECT_TRUE(Forest.contains(Unrelated, Start, End, Neighbor));
   }
+}
+
+TEST(SSARegisterForestTest, VisitsOnlyIntersectingOwnershipComponents) {
+  IndexListEntry E1(nullptr, SlotIndex::InstrDist);
+  IndexListEntry E2(nullptr, 2 * SlotIndex::InstrDist);
+  IndexListEntry E3(nullptr, 3 * SlotIndex::InstrDist);
+  IndexListEntry E4(nullptr, 4 * SlotIndex::InstrDist);
+  SlotIndex S1(&E1, 0), S2(&E2, 0), S3(&E3, 0), S4(&E4, 0);
+  using Span = SSARegisterForest::PhysicalSpan;
+  using Hit = std::tuple<Span, SlotIndex, SlotIndex, Register>;
+  const Register RootOwner = Register::index2VirtReg(0);
+  const Register LeafOwner = Register::index2VirtReg(1);
+  const Register CompositeOwner = Register::index2VirtReg(2);
+  const Register Neighbor = Register::index2VirtReg(3);
+  auto MaybeForest = SSARegisterForest::create(3, 8);
+  ASSERT_TRUE(MaybeForest);
+  SSARegisterForest &Forest = *MaybeForest;
+
+  // The root owns all of the first tree before S2. Afterwards, its leaf and
+  // a cross-tree composite own disjoint parts. A later root record and spatial
+  // neighbors must not leak into the [5,11) x [S1,S3) query.
+  ASSERT_TRUE(Forest.assign({0, 8}, S1, S2, RootOwner));
+  ASSERT_TRUE(Forest.assign({5, 6}, S2, S3, LeafOwner));
+  ASSERT_TRUE(Forest.assign({6, 10}, S2, S3, CompositeOwner));
+  ASSERT_TRUE(Forest.assign({0, 8}, S3, S4, RootOwner));
+  ASSERT_TRUE(Forest.assign({14, 16}, S1, S4, Neighbor));
+  ASSERT_TRUE(Forest.assign({16, 24}, S1, S4, Neighbor));
+
+  auto Expect = [&](Span Query, SlotIndex Start, SlotIndex End,
+                    ArrayRef<Hit> Expected) {
+    SmallVector<Hit, 8> Actual;
+    EXPECT_TRUE(Forest.visitInterferences(
+        Query, Start, End, [&](Span S, const SSARegisterForest::Ownership &O) {
+          Actual.emplace_back(S, O.Start, O.End, O.Owner);
+        }));
+    EXPECT_EQ(ArrayRef<Hit>(Actual), Expected);
+  };
+
+  // The root spans several branches of this unaligned query but appears once.
+  // Both components of the composite appear, with their original bounds.
+  Expect({5, 11}, S1, S3,
+         {{Span{0, 8}, S1, S2, RootOwner},
+          {Span{5, 6}, S2, S3, LeafOwner},
+          {Span{6, 8}, S2, S3, CompositeOwner},
+          {Span{8, 10}, S2, S3, CompositeOwner}});
+  // Leaf queries see ancestors; whole-tree queries see descendants. Touching
+  // temporal and physical boundaries do not interfere.
+  Expect({7, 8}, S1, S2, {{Span{0, 8}, S1, S2, RootOwner}});
+  Expect({0, 8}, S1, S4,
+         {{Span{0, 8}, S1, S2, RootOwner},
+          {Span{0, 8}, S3, S4, RootOwner},
+          {Span{5, 6}, S2, S3, LeafOwner},
+          {Span{6, 8}, S2, S3, CompositeOwner}});
+  Expect({0, 8}, S2, S3,
+         {{Span{5, 6}, S2, S3, LeafOwner},
+          {Span{6, 8}, S2, S3, CompositeOwner}});
+  Expect({8, 9}, S2, S3, {{Span{8, 10}, S2, S3, CompositeOwner}});
+  Expect({5, 11}, S3, S4, {{Span{0, 8}, S3, S4, RootOwner}});
+  Expect({10, 14}, S1, S4, {});
+
+  auto ExpectInvalid = [&](Span Query, SlotIndex Start, SlotIndex End) {
+    EXPECT_FALSE(Forest.visitInterferences(
+        Query, Start, End, [&](Span, const SSARegisterForest::Ownership &) {
+          ADD_FAILURE() << "invalid query must not invoke its visitor";
+        }));
+  };
+  ExpectInvalid({5, 5}, S1, S4);
+  ExpectInvalid({6, 5}, S1, S4);
+  ExpectInvalid({23, 25}, S1, S4);
+  ExpectInvalid({5, 11}, SlotIndex(), S4);
+  ExpectInvalid({5, 11}, S1, SlotIndex());
+  ExpectInvalid({5, 11}, S2, S2);
+  ExpectInvalid({5, 11}, S3, S2);
+
+  // Released components are no longer enumerated; adjacent owners survive.
+  ASSERT_TRUE(Forest.release({6, 10}, S2, S3, CompositeOwner));
+  Expect({5, 11}, S2, S3, {{Span{5, 6}, S2, S3, LeafOwner}});
 }
 
 } // end anonymous namespace

@@ -136,7 +136,9 @@ int SSASpillEmitter::createSpillSlot(const TargetRegisterClass *RC) {
   return FrameInfo->CreateSpillStackObject(SpillSize, SpillAlign);
 }
 
-void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx) {
+SSASpillEmitter::RepairResult
+SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
+                            LivenessCallback OnChange) {
   SSARA_TRACE();
   assert(canSpill(VMP) && "spill has no legal, EXEC-safe insertion plan");
 
@@ -167,11 +169,11 @@ void SSASpillEmitter::spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx) {
 
   // Step 2d: Place reloads at uses reachable from KillIdx, so uses above KillIdx
   // keep the original register and are not reloaded.
-  emitReloadsAndRepairSSA(VMP, KillIdx);
+  return emitReloadsAndRepairSSA(VMP, KillIdx, OnChange);
 }
 
-void SSASpillEmitter::spillPhiWeb(
-    const PhiWeb &Web, llvm::function_ref<void(Register)> ColorFreshVReg) {
+SSASpillEmitter::RepairResult
+SSASpillEmitter::spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange) {
   SSARA_TRACE();
   LastWebErased.clear();
   LastWebGround.clear();
@@ -183,6 +185,14 @@ void SSASpillEmitter::spillPhiWeb(
   const auto &PhiMembers = Web.PhiMembers;
   const auto &GroundOps = Web.GroundOps;
   const auto &GroundEdges = Web.GroundEdges;
+  RepairResult Result;
+  Result.Affected.append(PhiMembers.begin(), PhiMembers.end());
+  for (Register G : GroundOps)
+    if (G.isVirtual())
+      Result.Affected.push_back(G);
+  auto CollectChanges = [&](ArrayRef<Register> Affected) {
+    Result.Affected.append(Affected.begin(), Affected.end());
+  };
 
   // Report the ground ops so the driver marks them Spilled (a web stores each once;
   // without this the driver re-selects a stored ground op as a plain victim and
@@ -258,8 +268,8 @@ void SSASpillEmitter::spillPhiWeb(
   }
 
   // Reload each PHI member's EXTERNAL uses from the shared slot and erase the PHIs.
-  // The reload redefs are fresh vregs colored in place by the driver
-  // (ColorFreshVReg via reloadedRegs()); the value delivery is memory on whichever
+  // The reload redefs are fresh vregs returned to the driver for placement;
+  // the value delivery is memory on whichever
   // edge ran. This is the join-dissolution: the spilled web is FINAL (no register
   // coalescing remains — the coalescer's job on it is done by the spill).
   for (Register M : MembersWithExtUse) {
@@ -269,7 +279,8 @@ void SSASpillEmitter::spillPhiWeb(
     VRegMaskPair VMP(M, MRI->getMaxLaneMaskForVReg(M));
     Virt2StackSlotMap[VMP] = FI;
     emitReloadsAndRepairSSA(VMP,
-                            LIS->getInstructionIndex(*MDef).getRegSlot());
+                            LIS->getInstructionIndex(*MDef).getRegSlot(),
+                            CollectChanges);
   }
 
   for (Register M : PhiMembers) {
@@ -303,9 +314,17 @@ void SSASpillEmitter::spillPhiWeb(
     LIS->createAndComputeVirtRegInterval(G);
   }
 
+  llvm::sort(Result.Affected,
+             [](Register A, Register B) { return A.id() < B.id(); });
+  Result.Affected.erase(
+      std::unique(Result.Affected.begin(), Result.Affected.end()),
+      Result.Affected.end());
+  OnChange(Result.Affected);
+
   LLVM_DEBUG(dbgs() << "  phi-web: coalesced, erased " << LastWebErased.size()
                     << "/" << PhiMembers.size() << " PHIs, " << GroundOps.size()
                     << " ground stores -> FI" << FI << "\n");
+  return Result;
 }
 
 bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
@@ -401,68 +420,42 @@ bool SSASpillEmitter::narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
   return true;
 }
 
-Register SSASpillEmitter::splitLiveRangeAt(Register V,
-                                           MachineBasicBlock::iterator SplitPt) {
+std::optional<SSASpillEmitter::RepairResult>
+SSASpillEmitter::splitLiveRangeAt(Register V,
+                                  MachineBasicBlock::iterator SplitPt,
+                                  LivenessCallback OnChange) {
   SSARA_TRACE();
   if (!LIS->hasInterval(V))
-    return Register();
+    return std::nullopt;
   MachineBasicBlock &MBB = *SplitPt->getParent();
-  const TargetRegisterClass *RC = MRI->getRegClass(V);
   SplitPt = AMDGPURegAllocInsertion::legalBefore(MBB, SplitPt);
   if (SplitPt == MBB.end())
-    return Register();
+    return std::nullopt;
+  SlotIndex Before = LIS->getInstructionIndex(*SplitPt).getBaseIndex();
+  if (!LIS->getInterval(V).liveAt(Before))
+    return std::nullopt;
+  assert(MRI->hasOneDef(V) && "split requires an SSA input");
 
-  // Insert %new = COPY %v at the legal block-body position nearest SplitPt.
-  Register NewReg = MRI->createVirtualRegister(RC);
-  MachineInstr *CopyMI = BuildMI(MBB, SplitPt, SplitPt->getDebugLoc(),
-                                 TII->get(TargetOpcode::COPY), NewReg)
-                             .addReg(V);
+  // Let the existing updater handle joins and backedges. Its reaching interval
+  // must include the temporary identity redefinition before repair starts.
+  MachineInstr *CopyMI =
+      BuildMI(MBB, SplitPt, SplitPt->getDebugLoc(),
+              TII->get(TargetOpcode::COPY), V)
+          .addReg(V);
   LIS->InsertMachineInstrInMaps(*CopyMI);
-  SlotIndex CopySlot = LIS->getInstructionIndex(*CopyMI).getRegSlot();
-
-  // Redirect uses of %v that (a) sit at-or-after the copy and (b) read the same
-  // value the copy captured. Reaching-VNI ownership (not dominance) mirrors
-  // narrowRemnantToNewReg: a use may be dominated yet reach a different VNI
-  // (PHI merge / another def), so query %v's interval for the VNInfo reaching
-  // each use and only rewrite when it is the copy's source VNI.
-  const LiveInterval &LI = LIS->getInterval(V);
-  VNInfo *SrcVNI = LI.getVNInfoBefore(CopySlot);
-  bool Changed = false;
-  for (MachineOperand &MO : llvm::make_early_inc_range(MRI->use_operands(V))) {
-    MachineInstr *UseMI = MO.getParent();
-    if (UseMI == CopyMI || UseMI->isDebugInstr() || isSpillInstr(UseMI))
-      continue;
-    SlotIndex UseSlot = LIS->getInstructionIndex(*UseMI).getRegSlot();
-    // Redirect a use to %new only if the split COPY actually DOMINATES it. A
-    // slot-index comparison (UseSlot < CopySlot) is NOT a dominance test: for a
-    // multi-block value a use in a block the split point does not dominate can
-    // still have a later slot index, and redirecting it to %new leaves %new used
-    // where its def does not dominate ("defs don't dominate all uses").
-    if (!DT->dominates(CopyMI, UseMI))
-      continue; // not dominated by the split: keeps reading %v
-    VNInfo *AtUse = LI.getVNInfoBefore(UseSlot);
-    if (!AtUse || AtUse != SrcVNI)
-      continue; // different reaching value: leave alone
-    MO.setReg(NewReg); // sub-register index (if any) preserved unchanged
-    Changed = true;
-  }
-
-  if (!Changed) {
-    LIS->RemoveMachineInstrFromMaps(*CopyMI);
-    CopyMI->eraseFromParent();
-    if (LIS->hasInterval(NewReg))
-      LIS->removeInterval(NewReg);
-    return Register();
-  }
-
-  LIS->createAndComputeVirtRegInterval(NewReg);
-  if (LIS->hasInterval(V))
-    LIS->removeInterval(V);
+  LIS->removeInterval(V);
   LIS->createAndComputeVirtRegInterval(V);
+  RepairResult Result =
+      SSAUpdater->repairSSAForNewDefs(V, {CopyMI}, OnChange);
 
-  LLVM_DEBUG(dbgs() << "splitLiveRangeAt(): " << printReg(V, TRI) << " @ "
-                    << CopySlot << " -> " << printReg(NewReg, TRI) << "\n");
-  return NewReg;
+  Register CopyResult = CopyMI->getOperand(0).getReg();
+  if (!llvm::any_of(MRI->use_nodbg_operands(CopyResult),
+                    [](const MachineOperand &MO) { return MO.readsReg(); }))
+    report_fatal_error("live split point produced no reachable uses after SSA "
+                       "repair; inconsistent liveness or broken repair");
+  LLVM_DEBUG(dbgs() << "splitLiveRangeAt(): " << printReg(V, TRI) << " -> "
+                    << printReg(CopyResult, TRI) << "\n");
+  return Result;
 }
 
 MachineInstr *SSASpillEmitter::spillAtDefinition(VRegMaskPair VMP) {
@@ -802,14 +795,13 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
   return true;
 }
 
-void SSASpillEmitter::emitReloadsAndRepairSSA(VRegMaskPair SpilledVMP,
-                                              SlotIndex KillIdx) {
+SSASpillEmitter::RepairResult SSASpillEmitter::emitReloadsAndRepairSSA(
+    VRegMaskPair SpilledVMP, SlotIndex KillIdx, LivenessCallback OnChange) {
   SSARA_TRACE();
   Register SpilledReg = SpilledVMP.getVReg();
 
   MachineInstr *KillMI = Indexes->getInstructionFromIndex(KillIdx);
   assert(KillMI && "KillIdx must correspond to an instruction");
-  MachineBasicBlock *KillBB = KillMI->getParent();
 
   LLVM_DEBUG({
     dbgs() << "\n=== emitReloadsAndRepairSSA() [Option 3: redef-only] ===\n";
@@ -877,42 +869,21 @@ void SSASpillEmitter::emitReloadsAndRepairSSA(VRegMaskPair SpilledVMP,
   for (MachineInstr &D : MRI->def_instructions(SpilledReg))
     if (isReloadInstr(&D))
       ReloadDefs.push_back(&D);
-  // Freeze the reaching oracle ONCE, here: the interval was just recomputed (line
-  // above) and already contains every reload redef, and nothing renames it until
-  // the repair loop below. All repairSSAForNewDef calls share this one snapshot,
-  // so no per-call re-freeze (resetSession) is needed -- the emitter no longer
-  // disturbs the interval between repair calls.
-  FrozenInterval Oracle = SSAUpdater->freezeInterval(SpilledReg);
-  bool InsertedPHI = false;
+  RepairResult Result =
+      SSAUpdater->repairSSAForNewDefs(SpilledReg, ReloadDefs, OnChange);
+  // Preserve reload-specific policy metadata independently of the complete
+  // affected set, which also includes PHIs and reconstruction values.
   for (MachineInstr *RMI : ReloadDefs) {
-    SmallVector<MachineOperand *> PHIDefs;
-    SSAUpdater->repairSSAForNewDef(*RMI, SpilledReg, PHIDefs, &Oracle);
-    if (!PHIDefs.empty())
-      InsertedPHI = true;
-    // Track the reloaded value -- now a renamed fresh vreg -- so the forward
-    // walk does not immediately re-spill it. (Tracking OrigVReg would corrupt
-    // its active-lane accounting; see getOrCreateReloadInBlock.)
     Register ReloadReg = RMI->getOperand(0).getReg();
     if (ReloadReg.isVirtual() && ReloadReg != SpilledReg)
       ReloadedRegs.insert(
           VRegMaskPair(ReloadReg, MRI->getMaxLaneMaskForVReg(ReloadReg)));
   }
-  // Every reload redef has been renamed, so SpilledReg's subranges are final.
-  // Rebuild its main range as their union: repair left it spanning the defs that
-  // moved to the reload vregs, which would make SpilledReg claim registers it no
-  // longer occupies once coloring consults it.
-  SSAUpdater->rebuildMainRangeFromSubranges(SpilledReg);
   // SSA is restored inline; do not clear the IsSSA property at pass end.
   SSAInvalidated = false;
 
-  // Only clear NoPHIs if reconstruction actually inserted a merge PHI. Clearing
-  // it otherwise wrongly enables verifier checks (e.g. the physreg-live-in
-  // check) that assume the function may contain PHIs. (Cf. X86CmovConversion.)
-  if (InsertedPHI)
-    KillBB->getParent()->getProperties().reset(
-        MachineFunctionProperties::Property::NoPHIs);
-
   LLVM_DEBUG(dbgs() << "\nemitReloadsAndRepairSSA() complete\n");
+  return Result;
 }
 
 MachineBasicBlock *
@@ -941,4 +912,3 @@ SSASpillEmitter::getEffectiveKillBB(MachineBasicBlock *SpillBB) const {
       dbgs() << "  Warning: No preheader for loop containing spill point\n");
   return SpillBB;
 }
-

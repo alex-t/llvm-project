@@ -41,6 +41,7 @@ struct PlacementProfile {
   };
 
   struct BlockerSpan {
+    // A virtual owner or the non-virtual SELF_OWNED sentinel for fixed occupancy.
     Register Blocker;
     SlotRange Range;
 
@@ -116,12 +117,13 @@ normalizePlacementProfile(const PlacementProfile &Profile);
 void getFreeRuns(const PlacementProfile &Profile,
                  SmallVectorImpl<PlacementFreeRun> &Out);
 
-/// Collect every distinct blocker intersecting Range on any legal home.
-void getBlockers(const PlacementProfile &Profile,
-                 PlacementProfile::SlotRange Range,
-                 SmallVectorImpl<Register> &Out);
+/// Collect distinct virtual owners intersecting Range on any legal home.
+/// Fixed occupancy blocks free runs but cannot be selected as a movable victim.
+void getVirtualBlockers(const PlacementProfile &Profile,
+                        PlacementProfile::SlotRange Range,
+                        SmallVectorImpl<Register> &Out);
 
-/// Visit the same maximal slices used by normalization.
+/// Visit the same maximal slices used by normalization, including fixed blockers.
 void visitInterferenceSlices(
     const PlacementProfile &Profile,
     function_ref<void(PlacementProfile::HomeID,

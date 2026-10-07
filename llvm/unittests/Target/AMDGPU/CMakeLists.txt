@@ -29,7 +29,6 @@ add_llvm_target_unittest(AMDGPUTests
   PALMetadata.cpp
   SSARegisterForestTest.cpp
   SSARegisterForestAdapterTest.cpp
-  SSARegisterTreeTest.cpp
   VRegMaskPairTest.cpp
   )
 

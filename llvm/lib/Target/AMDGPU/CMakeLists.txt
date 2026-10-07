@@ -196,7 +196,6 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPUPHISimplifier.cpp
   SSARegisterForest.cpp
   SSARegisterForestAdapter.cpp
-  SSARegisterTree.cpp
 
   LINK_COMPONENTS
   AMDGPUDesc

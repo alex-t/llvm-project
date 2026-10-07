@@ -24,11 +24,13 @@
 #define LLVM_LIB_TARGET_AMDGPU_SSAREGISTERFOREST_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/MC/MCRegister.h"
 #include "llvm/Support/Allocator.h"
 #include <cstddef>
 #include <iterator>
@@ -39,6 +41,11 @@ namespace llvm {
 class SSARegisterForest {
 public:
   using NodeIndex = unsigned;
+
+  /// Fixed physical occupancy has no virtual owner to relocate. Reserve a
+  /// nonvirtual Register encoding locally; this is not a stack-slot identity
+  /// and must never be passed to MachineRegisterInfo. Zero remains invalid.
+  static constexpr Register SELF_OWNED{Register::FirstStackSlot};
 
   /// A half-open interval on the global physical-leaf axis.
   struct PhysicalSpan {
@@ -59,6 +66,10 @@ public:
     SlotIndex Start;
     SlotIndex End;
 
+    bool operator==(const OwnershipRegion &Other) const {
+      return Span == Other.Span && Start == Other.Start && End == Other.End;
+    }
+
     /// Both regions must be nonempty. Touching boundaries do not overlap.
     bool overlaps(const OwnershipRegion &Other) const {
       return Span.FirstPhysicalLeaf < Other.Span.EndPhysicalLeaf &&
@@ -77,16 +88,15 @@ public:
     }
   };
 
-  /// One half-open temporal ownership interval stored at its exact physical
-  /// node. Owner is a virtual register.
+  /// One logical assignment, shared by all canonical nodes covering Span.
+  /// The forest owns this record; node lists contain non-owning references.
+  /// Owner is a virtual register or SELF_OWNED. Pointer identity distinguishes
+  /// separate assignments with equal owner/time but different physical spans.
   struct Ownership {
     SlotIndex Start;
     SlotIndex End;
     Register Owner;
-    /// Null for a canonical single-node assignment. Components of an
-    /// arbitrary-span assignment form a circular chain in increasing physical
-    /// order.
-    const Ownership *Next = nullptr;
+    PhysicalSpan Span;
   };
 
   class NodeLevelRange;
@@ -154,10 +164,60 @@ public:
   static std::optional<SSARegisterForest> create(unsigned NumTrees,
                                                  unsigned TreeWidth);
 
-  /// Visit every live canonical ownership component, including all components
-  /// of composite assignments. The callback must not mutate this forest.
-  void visitOwnership(
-      function_ref<void(PhysicalSpan, const Ownership &)> Visit) const;
+  /// Visit every live canonical ownership component. The first argument is
+  /// the node's span; Ownership::Span is the complete logical assignment.
+  /// Composite components reference the same Ownership record. The callback
+  /// must not mutate this forest.
+  void visitOwnershipComponents(
+      function_ref<void(PhysicalSpan, const Ownership &)> VisitComponent) const;
+
+  /// Visit each logical assignment of this virtual owner exactly once.
+  /// Uses the owner-to-node bitmap, then filters those nodes' records. Does not
+  /// scan unrelated nodes or consult LIS. The callback must not mutate RF.
+  /// Return true only when assignments were visited. A nonvirtual or unassigned
+  /// owner returns false without callbacks or index growth. Callers expecting
+  /// existing ownership must treat false as an integrity error.
+  bool visitOwnerAssignments(
+      Register Owner, function_ref<void(const Ownership &)> VisitAssignment) const;
+
+  /// Full target home recorded with this owner's node index. Constant-time
+  /// lookup; zero means no target assignment. RF stores the identity opaquely:
+  /// the adapter validates target classes and projects lanes to physical spans.
+  MCRegister assignedHome(Register Owner) const;
+
+  /// Visit each owner with a recorded home once, in virtual-register order.
+  /// Includes homes with no live regions; excludes fixed physical ownership.
+  /// Reads the existing owner index. The callback must not mutate this forest.
+  void
+  visitAssignedOwners(function_ref<void(Register, MCRegister)> Visit) const;
+
+  /// Add a batch of regions at one target home, atomically. Reject a different
+  /// existing home, unbound geometry-only ownership, or any overlapping region.
+  /// The adapter must validate Home and every region's lane projection first.
+  /// An empty batch records the home even when the interval has no live lanes.
+  /// Metadata lives in the existing owner entry, not a second assignment map.
+  bool assign(Register Owner, MCRegister Home,
+              ArrayRef<OwnershipRegion> Regions);
+
+  /// Remove all of a virtual owner's records, including complete composite
+  /// assignments. Does not require an interval or a physical home from RA.
+  /// Also clear its recorded target home. Return true when records or a home
+  /// were removed, including a home assigned with no live regions. A nonvirtual
+  /// or unassigned owner returns false without mutation. Callers expecting existing ownership
+  /// must treat false as an integrity error.
+  bool releaseOwner(Register Owner);
+
+  /// Visit canonical ownership components overlapping Span and [Start, End).
+  /// Each component is visited once, in node preorder then increasing time.
+  /// The callback receives the canonical node span and the shared logical
+  /// record, not their intersection with the query. Ownership::Span may extend
+  /// beyond the queried node. A composite record may be reported more than once.
+  /// The callback must not mutate this forest.
+  /// Return false for invalid input, without callbacks; true for a valid query,
+  /// including one with no interference.
+  bool visitInterferences(
+      PhysicalSpan Span, SlotIndex Start, SlotIndex End,
+      function_ref<void(PhysicalSpan, const Ownership &)> VisitComponent) const;
 
   unsigned numTrees() const { return NumTrees; }
   unsigned treeWidth() const { return TreeWidth; }
@@ -184,7 +244,9 @@ public:
                 Register Owner) const;
 
   /// Assign Owner to Span for [Start, End). The operation is all-or-nothing
-  /// across Span's complete canonical cover.
+  /// across Span's complete canonical cover. This geometry-only entry point
+  /// rejects an owner with a recorded target home; use the home-aware batch
+  /// overload for that owner so assignment metadata cannot be bypassed.
   bool assign(PhysicalSpan Span, SlotIndex Start, SlotIndex End,
               Register Owner);
 
@@ -213,8 +275,13 @@ private:
     ArrayRef<const Ownership *> ownership() const { return OwnedHere; }
     const Ownership *find(SlotIndex Start, SlotIndex End, Register Owner) const;
     bool interferes(SlotIndex Start, SlotIndex End) const;
+    void visitInterferences(
+        SlotIndex Start, SlotIndex End,
+        function_ref<void(const Ownership &)> Visit) const;
     void insert(const Ownership *Owned);
     bool erase(const Ownership *Owned);
+    bool hasOwner(Register Owner) const;
+    void eraseOwner(Register Owner);
 
   private:
     /// Return the index of the first interval whose end is after Point.
@@ -287,26 +354,46 @@ private:
   unsigned NumLeaves = 0;
   unsigned NumNodes = 0;
   SmallVector<NodeState, 0> Nodes;
-  /// Ownership addresses must remain stable because composite assignments link
-  /// their canonical components. Released records are retained until the
-  /// function-local forest is destroyed.
+  // Indexed by virtRegIndex(), grown on first assignment of a higher owner.
+  // A bitmap is allocated only when that owner first receives a record.
+  // Bit N means Nodes[N] contains at least one record belonging to that owner.
+  // SELF_OWNED is not indexed. Empty entries/bitmaps may remain until destruction.
+  struct OwnerState {
+    BitVector Nodes;
+    MCRegister Home;
+  };
+  SmallVector<OwnerState, 0> Owners;
+
+  // Called after an entire release/replace, never between component edits.
+  void clearHomeIfEmpty(Register Owner);
+
+  // All component insertion/removal goes through these helpers so membership
+  // follows the actual node lists, including during exact replacement.
+  void insertOwnership(NodeIndex Node, const Ownership *Owned);
+  void eraseOwnership(NodeIndex Node, const Ownership *Owned);
+  /// Node lists share stable ownership addresses. Released records remain
+  /// allocated until the function-local forest is destroyed.
   BumpPtrAllocator OwnershipAllocator;
 
   using NodeCover = SmallVector<NodeIndex, 4>;
-  using OwnershipChain = SmallVector<const Ownership *, 4>;
 
+  bool assignRegion(PhysicalSpan Span, SlotIndex Start, SlotIndex End,
+                    Register Owner);
   bool validNodeWidth(unsigned Width) const;
   bool validPhysicalSpan(PhysicalSpan Span) const;
   bool validOwnership(SlotIndex Start, SlotIndex End, Register Owner) const;
   std::optional<NodeIndex> canonicalNode(PhysicalSpan Span) const;
   std::optional<NodeCover> cover(PhysicalSpan Span) const;
-  bool findAssignment(const NodeCover &Cover, SlotIndex Start, SlotIndex End,
-                      Register Owner, OwnershipChain &Assignment) const;
+  const Ownership *findAssignment(PhysicalSpan Span, const NodeCover &Cover,
+                                  SlotIndex Start, SlotIndex End,
+                                  Register Owner) const;
   bool subtreeOrAncestorInterference(NodeIndex MemoryIndex, SlotIndex Start,
                                      SlotIndex End) const;
-  SmallVector<Ownership *, 4> createAssignment(unsigned NumComponents,
-                                               SlotIndex Start, SlotIndex End,
-                                               Register Owner);
+  void visitInterferencesInTree(
+      NodeRef Node, PhysicalSpan Span, SlotIndex Start, SlotIndex End,
+      function_ref<void(PhysicalSpan, const Ownership &)> VisitComponent) const;
+  Ownership *createAssignment(PhysicalSpan Span, SlotIndex Start,
+                              SlotIndex End, Register Owner);
   void initializeTree(NodeIndex Root, unsigned LeafWidth);
   NodeIndex treeRootIndex(NodeIndex MemoryIndex) const;
   NodeIndex parentIndex(NodeIndex Child) const;

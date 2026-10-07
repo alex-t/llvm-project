@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "SSAPlacementProfile.h"
+#include "SSARegisterForest.h"
 #include "gtest/gtest.h"
 
 using namespace llvm;
@@ -78,6 +79,42 @@ TEST(SSAPlacementProfileTest, NormalizesOverlappingBlockersAndFreeRuns) {
   EXPECT_EQ(FreeRuns[1].PhysReg, MCRegister::from(1));
   EXPECT_TRUE(FreeRuns[1].Range ==
               (PlacementProfile::SlotRange{S7, S9}));
+}
+
+TEST(SSAPlacementProfileTest, FixedOccupancyBlocksFreeRunsButIsNotAVirtualVictim) {
+  IndexListEntry E1(nullptr, 1 * SlotIndex::InstrDist);
+  IndexListEntry E2(nullptr, 2 * SlotIndex::InstrDist);
+  IndexListEntry E4(nullptr, 4 * SlotIndex::InstrDist);
+  IndexListEntry E5(nullptr, 5 * SlotIndex::InstrDist);
+  IndexListEntry E7(nullptr, 7 * SlotIndex::InstrDist);
+  IndexListEntry E9(nullptr, 9 * SlotIndex::InstrDist);
+  SlotIndex S1(&E1, 0), S2(&E2, 0), S4(&E4, 0);
+  SlotIndex S5(&E5, 0), S7(&E7, 0), S9(&E9, 0);
+  Register A = Register::index2VirtReg(0);
+
+  PlacementProfile Profile;
+  Profile.Region = {S1, S9};
+  Profile.Homes.push_back(MCRegister::from(1));
+  SmallBitVector Home0(1);
+  Home0.set(0);
+  Profile.Blockers.push_back({SSARegisterForest::SELF_OWNED, {S2, S5}, Home0});
+  Profile.Blockers.push_back({A, {S4, S7}, Home0});
+
+  // The fixed-only prefix [S2, S4) must not appear in the free runs.
+  SmallVector<PlacementFreeRun, 2> FreeRuns;
+  getFreeRuns(Profile, FreeRuns);
+  ASSERT_EQ(FreeRuns.size(), 2u);
+  EXPECT_TRUE(FreeRuns[0].Range == (PlacementProfile::SlotRange{S1, S2}));
+  EXPECT_TRUE(FreeRuns[1].Range == (PlacementProfile::SlotRange{S7, S9}));
+
+  SmallVector<Register, 2> Victims;
+  getVirtualBlockers(Profile, {S1, S9}, Victims);
+  ASSERT_EQ(Victims.size(), 1u);
+  EXPECT_EQ(Victims[0], A);
+
+  // The virtual owner starts exactly at this query's excluded end.
+  getVirtualBlockers(Profile, {S2, S4}, Victims);
+  EXPECT_TRUE(Victims.empty());
 }
 
 } // end anonymous namespace

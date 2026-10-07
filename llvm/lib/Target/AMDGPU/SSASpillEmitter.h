@@ -36,6 +36,7 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include <memory>
+#include <optional>
 
 namespace llvm {
 
@@ -95,6 +96,10 @@ struct PhiWeb {
 /// beginPass() before each register-file pass to (re)create the SSA updater,
 /// and select the file mechanics.
 class SSASpillEmitter {
+public:
+  using RepairResult = MachineLaneSSAUpdater::RepairResult;
+  using LivenessCallback = MachineLaneSSAUpdater::LivenessCallback;
+
 private:
   // Analyses / target info (borrowed, not owned).
   MachineFunction &MF;
@@ -152,7 +157,8 @@ private:
   MachineInstr *spillAtDefinition(VRegMaskPair VMP);
   int assignVirt2StackSlot(VRegMaskPair VMP);
   int createSpillSlot(const TargetRegisterClass *RC);
-  void emitReloadsAndRepairSSA(VRegMaskPair SpilledVMP, SlotIndex KillIdx);
+  RepairResult emitReloadsAndRepairSSA(VRegMaskPair SpilledVMP, SlotIndex KillIdx,
+                                       LivenessCallback OnChange);
   std::pair<Register, MachineInstr *>
   getOrCreateReloadInBlock(MachineBasicBlock *BB, VRegMaskPair SpilledVMP,
                            MachineInstr *InsertBefore = nullptr,
@@ -192,8 +198,10 @@ public:
   /// THE primitive both callers use. Spill \p VMP: store at its definition
   /// (EXEC-safe — all lanes captured while EXEC is full), free the register from
   /// \p KillIdx onward, place a reload directly before each reachable use, and
-  /// repair SSA inline.
-  void spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx);
+  /// repair SSA inline. Notify after final liveness is available, then return
+  /// every affected value for the caller's placement/recovery continuation.
+  RepairResult spillOneVMP(VRegMaskPair VMP, SlotIndex KillIdx,
+                          LivenessCallback OnChange);
 
   /// In-memory PHI-web coalescing of an ALREADY-CLOSED, feasible web \p Web
   /// (detection, the shared-slot soundness gate, AND the reload-feasibility gate
@@ -208,11 +216,10 @@ public:
   /// assert is a per-store WIDTH check (reg-width <= slot lanes), NOT a color/count
   /// check, and the web's non-interference gate already proves the operands are
   /// never simultaneously live — so sequential writelanes into the shared lane are
-  /// correct. No shared color is forced. A sub-register PHI operand is
-  /// COPY-extracted to slot width first; that fresh short-lived vreg is colored via
-  /// \p ColorFreshVReg (it lives only [copy, store], so a free reg always exists).
-  void spillPhiWeb(const PhiWeb &Web,
-                   llvm::function_ref<void(Register)> ColorFreshVReg);
+  /// correct. No shared color is forced. Notifications from member repairs are
+  /// combined with ground-value changes and PHI retirements; OnChange runs once
+  /// after the whole web's liveness is final. No allocation occurs inside it.
+  RepairResult spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange);
 
   /// Members erased by the last spillPhiWeb() (for the caller to prune ColorMap).
   ArrayRef<Register> lastWebErased() const { return LastWebErased; }
@@ -230,16 +237,14 @@ public:
   bool narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
                              LaneBitmask RemnantMask);
 
-  /// Live-range split (Hack-compatible, pre-coloring): insert
-  /// `%new = COPY \p V` just before \p SplitPt and redirect every use of \p V
-  /// at-or-after the copy (whose reaching value is the one live at the split) to
-  /// %new. \p V then ends at the copy; the two halves no longer interfere across
-  /// SplitPt, so coloring may place them in different physregs (reopening an
-  /// aligned through-lane mid-life). Stays in SSA, so the interference graph
-  /// stays chordal. Returns %new, or a null Register if nothing was redirected
-  /// (dead copy removed). A prologue or terminator-sequence anchor is clamped to
-  /// the nearest legal block-body boundary.
-  Register splitLiveRangeAt(Register V, MachineBasicBlock::iterator SplitPt);
+  /// Insert an identity redefinition of V and repair it with SSA Updater.
+  /// Returns nullopt only before mutation, when no legal live insertion point
+  /// exists. Completed repair notifies OnChange and returns all affected IDs.
+  /// Joins/backedges may introduce PHIs; no linear prefix or profitability is
+  /// promised. The caller must retain every surviving unassigned value.
+  std::optional<RepairResult>
+  splitLiveRangeAt(Register V, MachineBasicBlock::iterator SplitPt,
+                   LivenessCallback OnChange);
 
   /// Reload vregs created so far (fresh names from SSA repair). Policy layers
   /// subtract these from their spill-candidate sets so a reload is never

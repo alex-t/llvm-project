@@ -31,6 +31,7 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -41,6 +42,7 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "machine-lane-ssa-updater"
@@ -64,6 +66,65 @@ FrozenInterval MachineLaneSSAUpdater::freezeInterval(Register OrigVReg) const {
       F.LI->createSubRangeFrom(F.Alloc, S.LaneMask, S);
   }
   return F;
+}
+
+MachineLaneSSAUpdater::RepairResult
+MachineLaneSSAUpdater::repairSSAForNewDefs(
+    Register OrigVReg, ArrayRef<MachineInstr *> NewDefs,
+    LivenessCallback OnChange) {
+  assert(!AffectedRegs && "SSA repair notification is not reentrant");
+  assert(OrigVReg.isVirtual() && LIS.hasInterval(OrigVReg) &&
+         "batch requires indexed redefinitions and their reaching interval");
+
+  SmallSetVector<Register, 8> Affected;
+  AffectedRegs = &Affected;
+  recordAffected(OrigVReg);
+  resetSession();
+  FrozenInterval Oracle = freezeInterval(OrigVReg);
+  bool InsertedPHI = false;
+  for (MachineInstr *MI : NewDefs) {
+    SmallVector<MachineOperand *, 4> PHIDefs;
+    repairSSAForNewDef(*MI, OrigVReg, PHIDefs, &Oracle);
+    InsertedPHI |= !PHIDefs.empty();
+  }
+  finalizeCoupledUses(OrigVReg);
+
+  RepairResult Result;
+  Result.Affected.append(Affected.begin(), Affected.end());
+  llvm::sort(Result.Affected,
+             [](Register A, Register B) { return A.id() < B.id(); });
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  for (Register VR : Result.Affected) {
+    // All renames and operand rewrites are complete. Recomputing here is safe
+    // even for the original partial-def value: no sibling lane is migrating.
+    // It also accounts for PHI-edge uses and coupled-operand rewrites, which
+    // cannot be described by simply truncating the old main range.
+    if (LIS.hasInterval(VR))
+      LIS.removeInterval(VR);
+    if (MRI.def_empty(VR)) {
+      if (llvm::any_of(MRI.use_nodbg_operands(VR),
+                       [](const MachineOperand &MO) { return MO.readsReg(); }))
+        report_fatal_error("SSA repair left a live value without a definition");
+      // Undef-only operands still name this value. Keep an empty interval so
+      // consumers can distinguish it from a fully retired register.
+      if (!MRI.reg_nodbg_empty(VR))
+        LIS.createEmptyInterval(VR);
+      continue; // Keep its ID in the notification so old ownership is removed.
+    }
+    assert(MRI.hasOneDef(VR) && "batch did not restore SSA for affected value");
+    LIS.createAndComputeVirtRegInterval(VR);
+    updateDeadFlags(VR);
+  }
+  if (InsertedPHI)
+    MF.getProperties().reset(MachineFunctionProperties::Property::NoPHIs);
+
+  // The external reaching oracle is local to this batch. A subsequent repair
+  // must start a fresh session rather than observe the destroyed snapshot.
+  ExternalFrozen = nullptr;
+  resetSession();
+  OnChange(Result.Affected);
+  AffectedRegs = nullptr;
+  return Result;
 }
 
 Register MachineLaneSSAUpdater::repairSSAForNewDef(
@@ -178,6 +239,7 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
     RC = MRI.getRegClass(OrigVReg);
   }
   Register NewSSAVReg = MRI.createVirtualRegister(RC);
+  recordAffected(NewSSAVReg);
   LLVM_DEBUG(dbgs() << "  Created new SSA vreg " << NewSSAVReg
                     << " with RC=" << TRI.getRegClassName(RC) << "\n");
 
@@ -505,6 +567,7 @@ MachineOperand *MachineLaneSSAUpdater::createPHIInBlockReaching(
       RC = SubRC;
 
   Register PHIVReg = MRI.createVirtualRegister(RC);
+  recordAffected(PHIVReg);
   auto PHINode = BuildMI(JoinMBB, JoinMBB.begin(), DebugLoc(),
                          TII->get(TargetOpcode::PHI), PHIVReg);
   LLVM_DEBUG(dbgs() << "    createPHIInBlockReaching in BB#"
@@ -522,6 +585,7 @@ MachineOperand *MachineLaneSSAUpdater::createPHIInBlockReaching(
       LaneBitmask RFull = MRI.getMaxLaneMaskForVReg(RD->VReg);
       unsigned Sub =
           (RLane == RFull) ? 0 : getSubRegIndexForLaneMask(RLane, &TRI);
+      recordAffected(RD->VReg);
       PHINode.addReg(RD->VReg, 0, Sub);
     } else {
       // No renamed reaching def on this edge. Two cases:
@@ -533,6 +597,7 @@ MachineOperand *MachineLaneSSAUpdater::createPHIInBlockReaching(
       //    placeholder (final, or patched later by its owner's rewrite).
       unsigned Sub =
           (Lane == FullMask) ? 0 : getSubRegIndexForLaneMask(Lane, &TRI);
+      recordAffected(OrigVReg);
       PHINode.addReg(OrigVReg, V ? 0 : RegState::Undef, Sub);
     }
     PHINode.addMBB(Pred);
@@ -619,6 +684,8 @@ void MachineLaneSSAUpdater::rewriteUseReaching(
     LaneBitmask NewFull = MRI.getMaxLaneMaskForVReg(NewSSA);
     unsigned Sub =
         (NewLanes == NewFull) ? 0 : getSubRegIndexForLaneMask(NewLanes, &TRI);
+    recordAffected(MO.getReg());
+    recordAffected(NewSSA);
     MO.setReg(NewSSA);
     MO.setSubReg(Sub);
     return;
@@ -635,6 +702,8 @@ void MachineLaneSSAUpdater::rewriteUseReaching(
   auto RSKey = std::make_pair(UseMI, OpMask);
   if (ShareRS)
     if (Register Cached = SuperUseRSCache.lookup(RSKey)) {
+      recordAffected(MO.getReg());
+      recordAffected(Cached);
       MO.setReg(Cached);
       MO.setSubReg(0);
       return;
@@ -663,6 +732,8 @@ void MachineLaneSSAUpdater::rewriteUseReaching(
   if (ShareRS)
     SuperUseRSCache[RSKey] = RSReg;
   extendAt(OrigLI, RSIdx, LanesToExtend);
+  recordAffected(MO.getReg());
+  recordAffected(RSReg);
   MO.setReg(RSReg);
   MO.setSubReg(0);
   LIS.extendToIndices(LIS.getInterval(RSReg), {UsePt});
@@ -766,6 +837,8 @@ void MachineLaneSSAUpdater::finalizeCoupledUses(Register OrigVReg) {
       if (!Sub && SubMask != BaseRegFull)
         continue; // no aligned subreg for these lanes -> leave as-is (valid)
 
+      recordAffected(MO.getReg());
+      recordAffected(BaseReg);
       MO.setReg(BaseReg);
       MO.setSubReg(Sub);
     }
@@ -970,6 +1043,7 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
   };
 
   Register Dest = MRI.createVirtualRegister(UseRC);
+  recordAffected(Dest);
   auto RS = BuildMI(*InsertBB, IP,
                     (IP != InsertBB->end() ? IP->getDebugLoc() : DebugLoc()),
                     TII.get(TargetOpcode::REG_SEQUENCE), Dest);
@@ -1127,6 +1201,7 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
   for (MachineOperand &MO : RS.getInstr()->uses()) {
     if (MO.isReg() && MO.getReg().isVirtual()) {
       Register SrcReg = MO.getReg();
+      recordAffected(SrcReg);
       LiveInterval &SrcLI = LIS.getInterval(SrcReg);
       LIS.extendToIndices(SrcLI, {UseSlot});
     }
@@ -1141,6 +1216,7 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
 /// Extend LI (and only the specified subranges) at Idx.
 void MachineLaneSSAUpdater::extendAt(LiveInterval &LI, SlotIndex Idx,
                                      ArrayRef<LaneBitmask> Lanes) {
+  recordAffected(LI.reg());
   SmallVector<SlotIndex, 1> P{Idx};
   LIS.extendToIndices(LI, P);
   for (auto &SR : LI.subranges())

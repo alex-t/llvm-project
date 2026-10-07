@@ -13,8 +13,11 @@
 #ifndef LLVM_CODEGEN_MACHINELANESSAUPDATER_H
 #define LLVM_CODEGEN_MACHINELANESSAUPDATER_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"      // SmallVector
 #include "llvm/ADT/bit.h"              // countr_zero
 #include "llvm/CodeGen/LiveInterval.h" // LiveRange
@@ -80,6 +83,36 @@ public:
                         MachineDominatorTree &MDT,
                         const TargetRegisterInfo &TRI)
       : MF(MF), LIS(LIS), MDT(MDT), TRI(TRI) {}
+
+  struct RepairResult {
+    /// Sorted, unique IDs of values whose definitions, uses or liveness were
+    /// touched, including new PHI/reconstruction results and retired values.
+    /// An affected value need not still have an interval at completion.
+    SmallVector<Register, 8> Affected;
+  };
+
+  using LivenessCallback = function_ref<void(ArrayRef<Register>)>;
+
+  /// Repair a complete batch of already-inserted redefinitions of OrigVReg.
+  /// Instructions must be indexed and OrigVReg's current interval must include
+  /// all new definitions. NewDefs contains no duplicates and
+  /// leaves at most one original definition after renaming. A one-copy split
+  /// supplies the instruction "OrigVReg = COPY OrigVReg" as its single entry.
+  /// An empty batch finalizes OrigVReg after edits needing no new definition.
+  ///
+  /// Uses the existing reaching-def repair, then finalizes coupled operands
+  /// and recomputes only affected intervals from the completed SSA form.
+  /// OnChange is called synchronously once, after this finalization and before
+  /// return. The same affected IDs are returned to the caller for allocation.
+  ///
+  /// OnChange may reconcile external ownership using its stored before-state
+  /// and the repaired LIS. It must not mutate MIR/LIS or reenter this updater.
+  /// No allocation query is permitted between individual repairs in the batch.
+  /// The callback is not retained. No physical home is chosen by the updater;
+  /// failure to place a repaired value does not undo the completed mutation.
+  RepairResult repairSSAForNewDefs(Register OrigVReg,
+                                  ArrayRef<MachineInstr *> NewDefs,
+                                  LivenessCallback OnChange);
 
   // Repair SSA for a new definition that violates SSA form
   //
@@ -174,6 +207,14 @@ public:
                           LaneBitmask OpMask, LiveInterval &OrigLI);
 
 private:
+  // Non-null only for the synchronous batch entry point. Legacy incremental
+  // callers retain their existing repair/finalization contract.
+  SmallSetVector<Register, 8> *AffectedRegs = nullptr;
+  void recordAffected(Register VR) {
+    if (AffectedRegs && VR.isVirtual())
+      AffectedRegs->insert(VR);
+  }
+
   // Common SSA repair logic
   // Returns a vector of MachineOperand pointers to the PHI result registers
   SmallVector<MachineOperand *> performSSARepair(Register NewVReg,

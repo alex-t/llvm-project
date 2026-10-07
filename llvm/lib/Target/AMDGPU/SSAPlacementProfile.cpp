@@ -108,12 +108,12 @@ void llvm::getFreeRuns(const PlacementProfile &Profile,
       Out.push_back({Slice.Home, Normalized.Homes[Slice.Home], Slice.Range});
 }
 
-void llvm::getBlockers(const PlacementProfile &Profile,
-                       PlacementProfile::SlotRange Range,
-                       SmallVectorImpl<Register> &Out) {
+void llvm::getVirtualBlockers(const PlacementProfile &Profile,
+                              PlacementProfile::SlotRange Range,
+                              SmallVectorImpl<Register> &Out) {
   Out.clear();
   for (const PlacementProfile::BlockerSpan &Span : Profile.Blockers)
-    if (overlaps(Span.Range, Range))
+    if (Span.Blocker.isVirtual() && overlaps(Span.Range, Range))
       Out.push_back(Span.Blocker);
 
   llvm::sort(Out, [](Register A, Register B) { return A.id() < B.id(); });
