@@ -3730,20 +3730,25 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
     LLVM_DEBUG(dbgs() << "  Edge " << printMBBReference(*InsertMBB) << " -> "
                       << printMBBReference(MBB) << ":\n");
     auto InsertPt = AMDGPURegAllocInsertion::bodyEnd(*InsertMBB);
-    // Materialize undef edges (null source) as IMPLICIT_DEF of DstPhys and
-    // drop them; the remainder are real copies handed to resolvePermutation.
+    // Remove undef edges from the permutation, but defer their definitions:
+    // an undef destination may still hold another PHI's incoming value.
+    SmallVector<MCRegister, 4> UndefDests;
     for (auto *It = Copies.begin(); It != Copies.end();) {
       if (!It->first) {
-        MachineInstr *IDef =
-            BuildMI(*InsertMBB, InsertPt, DebugLoc(),
-                    TII->get(TargetOpcode::IMPLICIT_DEF), It->second);
-        LIS->InsertMachineInstrInMaps(*IDef);
+        UndefDests.push_back(It->second);
         It = Copies.erase(It);
       } else {
         ++It;
       }
     }
     resolvePermutation(*InsertMBB, InsertPt, Copies);
+    // All incoming copy sources have been consumed before redefining storage.
+    for (MCRegister Dst : UndefDests) {
+      MachineInstr *IDef =
+          BuildMI(*InsertMBB, InsertPt, DebugLoc(),
+                  TII->get(TargetOpcode::IMPLICIT_DEF), Dst);
+      LIS->InsertMachineInstrInMaps(*IDef);
+    }
   }
 
   for (MachineInstr *PHI : PHIsToErase) {
