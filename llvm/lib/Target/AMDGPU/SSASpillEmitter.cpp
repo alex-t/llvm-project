@@ -591,10 +591,8 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
   SSARA_TRACE();
   Register OrigVReg = SpilledVMP.getVReg();
 
-  // Narrow the reload to the lanes actually requested. The stack slot stays the
-  // full SpilledVMP slot (the store side is untouched); we only reload the
-  // sub-slice a use needs, from within that slot. A full-width request
-  // (getAll()) reproduces the original whole-VMP reload.
+  // Vector reloads may narrow to the lanes requested by the use. SGPR restore
+  // pseudos have no source offset, so they must reload the entire stored slice.
   LaneBitmask Slice = ReloadMask & SpilledVMP.getLaneMask();
   if (Slice.none())
     Slice = SpilledVMP.getLaneMask();
@@ -617,7 +615,17 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
   unsigned SubRegIdx = 0;
   unsigned FirstChan = 0;
   unsigned TotalChans = TRI->getNumCoveredRegs(FullMask);
-  if (Slice != FullMask) {
+  if (TRI->isSGPRClass(FullRC)) {
+    // Match spillAtDefinition: a named, supported slice starts at slot lane 0;
+    // otherwise the store and slot cover the whole register. The destination
+    // subreg identifies the lanes redefined for SSA repair, not a slot offset.
+    unsigned SpillSubIdx = SpilledVMP.getSubReg(MRI, TRI);
+    if (const TargetRegisterClass *SpillRC =
+            SpillSubIdx ? TRI->getSubRegisterClass(FullRC, SpillSubIdx) : nullptr) {
+      RC = SpillRC;
+      SubRegIdx = SpillSubIdx;
+    }
+  } else if (Slice != FullMask) {
     // Contiguous channel span covering the slice.
     unsigned First = ~0u, Last = 0;
     for (unsigned C = 0; C < TotalChans; ++C) {
@@ -686,12 +694,8 @@ SSASpillEmitter::getOrCreateReloadInBlock(MachineBasicBlock *BB,
   MachineInstr *ReloadMI = &*std::prev(InsertIt);
   LIS->InsertMachineInstrInMaps(*ReloadMI);
 
-  // When the reloaded slice starts above channel 0 of the full slot, point the
-  // load at the right sub-slice. For VGPR/AV reloads the slot is memory and the
-  // in-slot position is a byte offset (channel N is stored at byte N*4); set the
-  // pseudo's immediate `offset` operand. For SGPR reloads (spill-to-VGPR-lane)
-  // the narrowed dest subreg already selects the correct lanes in restoreSGPR,
-  // so no offset is needed -- and there is no offset operand to set.
+  // Vector reloads encode the source position as a byte offset. SGPR reloads
+  // start at slot lane 0 and reload the same width as the store above.
   if (SubRegIdx != 0 && FirstChan != 0) {
     if (MachineOperand *Off =
             TII->getNamedOperand(*ReloadMI, AMDGPU::OpName::offset)) {
