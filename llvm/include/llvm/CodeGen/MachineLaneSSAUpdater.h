@@ -256,6 +256,8 @@ private:
   struct RenamedDef {
     Register VReg;
     LaneBitmask OrigLanes;
+    // The original subregister def did not read the complementary lanes.
+    bool UndefUnwrittenLanes = false;
   };
 
   // Per-OrigVReg repair session: maps each renamed real (non-PHI) def

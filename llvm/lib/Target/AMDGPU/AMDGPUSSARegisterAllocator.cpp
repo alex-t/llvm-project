@@ -36,6 +36,15 @@ using namespace llvm;
 
 #define DEBUG_TYPE "amdgpu-ssa-register-allocator"
 
+/// An `undef` flag applies to the entire selected operand. Missing lanes make
+/// a read partial-undef, but the operand remains a real use while any selected
+/// lane has a value. This matches RegisterCoalescer::addUndefFlag and
+/// VirtRegRewriter::readsUndefSubreg.
+static bool readsOnlyUndefLanes(LaneBitmask ReadMask,
+                                LaneBitmask DefinedMask) {
+  return (ReadMask & DefinedMask).none();
+}
+
 AMDGPUSSARegisterAllocator::AMDGPUSSARegisterAllocator()
     : MachineFunctionPass(ID) {}
 AMDGPUSSARegisterAllocator::~AMDGPUSSARegisterAllocator() = default;
@@ -3842,16 +3851,11 @@ void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF,
           MO.setSubReg(0);
         }
 
-        // DEAD-LANE UNDEF PROPAGATION (reaching-VNI). Check the lanes THIS operand
-        // actually reads — the full reg mask, or the subreg's lane mask for a
-        // sub-tuple read (e.g. %x.sub0_sub1 of a 128b value). If ANY read lane has
-        // no reaching value at the use, the read is partial-undef; in virtual MIR
-        // the vreg's per-subrange liveness makes that legal, but once rewritten to
-        // the physical tuple the dead lane's physreg looks read-but-never-defined
-        // and LIS/verifier reject it ("needs to be live in ... missing from
-        // live-in list"). LLVM's VirtRegRewriter marks such a read `undef`; match
-        // it. Query each subrange for the VNInfo reaching the use (getVNInfoBefore
-        // — the same reaching-VNI idiom splitLiveRangeAt / the emitter use).
+        // Mark a read `undef` only when NONE of its selected lanes has a
+        // reaching value. A full-register use of a partially defined tuple is a
+        // real use: LLVM models its defined lanes with subranges and may assign
+        // unrelated values to the other lanes. The operand-level flag cannot
+        // represent that partial state.
         if (MO.isUse() && !MO.isUndef() && LIS->hasInterval(VReg)) {
           const LiveInterval &LI = LIS->getInterval(VReg);
           if (LI.hasSubRanges()) {
@@ -3863,7 +3867,7 @@ void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF,
             for (const LiveInterval::SubRange &S : LI.subranges())
               if (S.getVNInfoBefore(UseIdx))
                 Reached |= S.LaneMask;
-            if ((ReadMask & ~Reached).any()) // a READ lane has no reaching def
+            if (readsOnlyUndefLanes(ReadMask, Reached))
               MO.setIsUndef(true);
           }
         }
@@ -3925,16 +3929,9 @@ void AMDGPUSSARegisterAllocator::finalizeProperties(MachineFunction &MF) {
 void AMDGPUSSARegisterAllocator::markRegSequenceUndefLaneUses(
     MachineFunction &MF, RegFile Only) {
   SSARA_TRACE();
-  // A REG_SEQUENCE with an `undef` source leaves the destination lanes it feeds
-  // undefined. That is legal on the vreg (per-subrange liveness), but once the
-  // result is rewritten to a physical tuple the dead lane looks read-but-never-
-  // defined -> the post-RA LiveIntervals verifier fatals "register $vgprN_vgprN+1
-  // needs to be live in ... missing from the live-in list" (the "Invalid global
-  // physical register" cluster). While the REG_SEQUENCE still exists — its result
-  // is a virtual register, so its uses are findable via MRI — mark each use of the
-  // result that READS an undef lane `undef`, so rewriteOperands carries the flag
-  // onto the physical read. Only the lanes fed by undef sources are considered, so
-  // a subreg use of a live lane is left untouched.
+  // A REG_SEQUENCE with an `undef` source leaves those destination lanes
+  // undefined. Mark a use of its result `undef` only when every selected lane
+  // comes from an undef source; a partial-undef use remains a real use.
   for (MachineBasicBlock &MBB : MF)
     for (MachineInstr &MI : MBB) {
       if (!MI.isRegSequence())
@@ -3956,7 +3953,7 @@ void AMDGPUSSARegisterAllocator::markRegSequenceUndefLaneUses(
         LaneBitmask ReadMask =
             UseMO.getSubReg() ? TRI->getSubRegIndexLaneMask(UseMO.getSubReg())
                               : MRI->getMaxLaneMaskForVReg(Dst);
-        if ((ReadMask & UndefLanes).any())
+        if (readsOnlyUndefLanes(ReadMask, ~UndefLanes))
           UseMO.setIsUndef(true);
       }
     }
@@ -3985,15 +3982,32 @@ void AMDGPUSSARegisterAllocator::eliminateRegSequences(MachineFunction &MF) {
       // overwrites a register another pair still needs) and cycles. Emitting
       // the copies naively in operand order corrupts such overlaps.
       SmallVector<std::pair<MCRegister, MCRegister>, 4> Copies;
+      SmallVector<MCRegister, 4> UndefDests;
       for (unsigned I = 1, E = MI.getNumOperands(); I < E; I += 2) {
-        // An undef source slice (e.g. `undef %175.sub0`) is a don't-care: the
-        // destination lanes it would fill are never read, so emit no copy.
-        // Lowering it would COPY from the undef value's physreg, which is never
-        // defined -> "Using an undefined physical register".
-        if (MI.getOperand(I).isUndef())
-          continue;
-        MCRegister Src = MI.getOperand(I).getReg().asMCReg();
         unsigned SubIdx = MI.getOperand(I + 1).getImm();
+        MCRegister Expected = TRI->getSubReg(Dst, SubIdx);
+
+        // An undef source requires no copy, but its destination slice must still
+        // have a physical definition when another instruction reads the whole
+        // REG_SEQUENCE result. Defer that definition until after the parallel
+        // copies: the destination may still be one of their sources.
+        if (MI.getOperand(I).isUndef()) {
+          if (Expected) {
+            UndefDests.push_back(Expected);
+          } else {
+            unsigned First = TRI->getChannelFromSubReg(SubIdx);
+            unsigned NumDW = TRI->getSubRegIdxSize(SubIdx) / 32;
+            for (unsigned K = 0; K < NumDW; ++K) {
+              MCRegister D = TRI->getSubReg(
+                  Dst, SIRegisterInfo::getSubRegFromChannel(First + K));
+              assert(D && "per-dword destination subregister must exist");
+              UndefDests.push_back(D);
+            }
+          }
+          continue;
+        }
+
+        MCRegister Src = MI.getOperand(I).getReg().asMCReg();
         // The source class may be wider than the slice it fills (e.g. a 64-bit
         // value held in an sgpr_128 vreg). The slice index then also names the
         // matching sub-register of the source — narrow Src to it so the COPY is
@@ -4001,7 +4015,6 @@ void AMDGPUSSARegisterAllocator::eliminateRegSequences(MachineFunction &MF) {
         // no sub-register of Src and getSubReg() returns 0, leaving Src as-is.
         if (MCRegister SubSrc = TRI->getSubReg(Src, SubIdx))
           Src = SubSrc;
-        MCRegister Expected = TRI->getSubReg(Dst, SubIdx);
         if (Expected) {
           if (Src != Expected)
             Copies.push_back({Src, Expected});
@@ -4028,6 +4041,12 @@ void AMDGPUSSARegisterAllocator::eliminateRegSequences(MachineFunction &MF) {
         }
       }
       resolvePermutation(MBB, MI, Copies);
+      for (MCRegister UndefDst : UndefDests) {
+        MachineInstr *IDef =
+            BuildMI(MBB, MI, DebugLoc(),
+                    TII->get(TargetOpcode::IMPLICIT_DEF), UndefDst);
+        LIS->InsertMachineInstrInMaps(*IDef);
+      }
       // Keep SlotIndexes consistent for a later allocation stage's queries.
       if (Indexes->hasIndex(MI))
         LIS->RemoveMachineInstrFromMaps(MI);

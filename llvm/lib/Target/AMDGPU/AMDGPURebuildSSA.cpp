@@ -20,6 +20,7 @@
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -87,6 +88,7 @@ bool AMDGPURebuildSSALegacy::runOnMachineFunction(MachineFunction &MF) {
   MachineLaneSSAUpdater Updater(MF, *LIS, *MDT, *TRI);
   DenseSet<Register> Processed;
   SmallVector<MachineOperand *, 4> PHIDefs;
+  SmallSetVector<Register, 16> PendingMainRangeRebuilds;
 
   for (auto &B : MF) {
     for (auto &I : B) {
@@ -112,8 +114,19 @@ bool AMDGPURebuildSSALegacy::runOnMachineFunction(MachineFunction &MF) {
         // replaces OrigVReg's interval object, invalidating any reference
         // held across calls.
         LiveInterval &LI = LIS->getInterval(VReg);
-        if (LI.getNumValNums() == 1)
-          continue;
+        if (LI.getNumValNums() == 1) {
+          // A single full-register definition is already SSA. A single partial
+          // definition still needs repair: replacing it with a narrow vreg lets
+          // the updater reconstruct wider uses from the lanes actually defined.
+          MachineInstr *DefMI = MRI->getUniqueVRegDef(VReg);
+          int DefIdx = -1;
+          if (DefMI)
+            DefIdx = DefMI->findRegisterDefOperandIdx(VReg, TRI,
+                                                      /*IsDead=*/false,
+                                                      /*Overlaps=*/true);
+          if (DefIdx < 0 || !DefMI->getOperand(DefIdx).getSubReg())
+            continue;
+        }
 
         LLVM_DEBUG(dbgs() << "\n[VREG] " << printReg(VReg) << " has "
                           << LI.getNumValNums() << " VNs\n");
@@ -186,7 +199,7 @@ bool AMDGPURebuildSSALegacy::runOnMachineFunction(MachineFunction &MF) {
         WorkList.push_back(Root);
         // LI not used below this point.
 
-        assert(Root && "live interval with multiple VNs must have a non-PHI def");
+        assert(Root && "live interval to repair must have a non-PHI def");
 
         // Rename each re-def to a fresh vreg. repairSSAForNewDef inserts
         // lane-aware PHIs at pruned IDF blocks and rewrites dominated uses
@@ -219,14 +232,77 @@ bool AMDGPURebuildSSALegacy::runOnMachineFunction(MachineFunction &MF) {
         // implicit vector use).
         Updater.finalizeCoupledUses(VReg);
 
-        // All defs this pass intended to rename are renamed; VReg's main range
-        // is the union of its now-final subranges.
-        Updater.rebuildMainRangeFromSubranges(VReg);
+        // The complete use -> unique-def relation is available only after all
+        // original redefinitions have been processed. Defer rebuilding the
+        // main range: doing it here can encounter a use reached by a real def
+        // on one path and undef on another before the missing undef definition
+        // has been made explicit.
+        PendingMainRangeRebuilds.insert(VReg);
       }
     }
   }
 
   Processed.clear();
+
+  // Concrete redefinitions are gone now, so every non-undef use must have one
+  // unique definition which dominates that use. LiveIntervals accepted the
+  // original non-SSA form where a lane can be undefined on one path, and such a
+  // lane may have had no second concrete definition to trigger the def-driven
+  // repair above. Find those remaining holes with a single linear use scan.
+  const unsigned NumVRegsAfterDefRepair = MRI->getNumVirtRegs();
+  for (unsigned I = 0; I != NumVRegsAfterDefRepair; ++I) {
+    Register VReg = Register::index2VirtReg(I);
+    MachineInstr *DefMI = MRI->getUniqueVRegDef(VReg);
+    bool NeedsUndefRepair = false;
+
+    for (MachineOperand &Use : MRI->use_nodbg_operands(VReg)) {
+      if (!Use.readsReg() || Use.isUndef())
+        continue;
+      if (!DefMI)
+        report_fatal_error(
+            "SSA reconstruction did not leave one definition per live value");
+
+      MachineInstr *UseMI = Use.getParent();
+      bool Dominates = false;
+      if (UseMI->isPHI()) {
+        MachineBasicBlock *Incoming =
+            UseMI->getOperand(Use.getOperandNo() + 1).getMBB();
+        Dominates = MDT->dominates(DefMI->getParent(), Incoming);
+      } else {
+        Dominates = MDT->dominates(DefMI, UseMI);
+      }
+
+      if (!Dominates) {
+        NeedsUndefRepair = true;
+        break;
+      }
+    }
+
+    if (!NeedsUndefRepair)
+      continue;
+
+    // One undef definition at the entry dominates every previously uncovered
+    // path for this value. Once indexed and included in the interval it is an
+    // ordinary redefinition, so the common repair constructs the required
+    // real/undef PHIs and rewrites the uses.
+    MachineInstr *ImpDef =
+        BuildMI(MF.front(), MF.front().getFirstNonPHI(), DebugLoc(),
+                TII->get(TargetOpcode::IMPLICIT_DEF), VReg);
+    LIS->InsertMachineInstrInMaps(*ImpDef);
+    if (LIS->hasInterval(VReg))
+      LIS->removeInterval(VReg);
+    LIS->createAndComputeVirtRegInterval(VReg);
+    SmallVector<MachineInstr *, 1> NewDefs{ImpDef};
+    Updater.repairSSAForNewDefs(VReg, NewDefs,
+                                [](ArrayRef<Register>) {});
+    PendingMainRangeRebuilds.remove(VReg);
+  }
+
+  // Registers repaired above were fully recomputed by the batch updater. The
+  // remaining def-driven repairs still need their deferred main ranges rebuilt
+  // from the now-final subranges.
+  for (Register VReg : PendingMainRangeRebuilds)
+    Updater.rebuildMainRangeFromSubranges(VReg);
 
   // Flatten nested REG_SEQUENCE towers the reconstruction produced, so wide
   // values rebuilt lane-by-lane don't carry growing-width live intermediates

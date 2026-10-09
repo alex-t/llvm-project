@@ -211,6 +211,7 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
 
   // Step 2: Derive DefMask from the operand's subreg index (if any)
   unsigned SubRegIdx = DefOp->getSubReg();
+  const bool UndefUnwrittenLanes = SubRegIdx && DefOp->isUndef();
   LaneBitmask DefMask;
 
   if (SubRegIdx) {
@@ -267,7 +268,8 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
   // record the renamed def by its instruction (with the OrigVReg lanes it
   // covers), so reaching-VNInfo lookups can map a reaching real def to its
   // renamed vreg and rebase target lanes.
-  DefInstrToRenamed[&NewDefMI] = {NewSSAVReg, DefMask};
+  DefInstrToRenamed[&NewDefMI] = {NewSSAVReg, DefMask,
+                                  UndefUnwrittenLanes};
 
   // Step 6: Perform common SSA repair (PHI placement + use rewriting)
   // LiveInterval for NewSSAVReg will be created by getInterval() as needed
@@ -396,69 +398,6 @@ MachineLaneSSAUpdater::performSSARepair(Register NewVReg, Register OrigVReg,
   // verification errors: "Not all lanes of PHI source live at use". The
   // createAndComputeVirtRegInterval already produces correct, minimal liveness
   // that includes PHI uses properly.
-
-  // Flag reads whose lanes are not JOINTLY DOMINATED by defs. A repair can leave a
-  // lane defined on only some paths to a use: %11 defined in one predecessor while
-  // a later EXP reads %11.sub1 (issue98474). Left as a strict read, the next
-  // whole-value LiveIntervals computation walks back from the use, reaches entry
-  // without finding a def on that path, and aborts with "Virtual register defs
-  // don't dominate all uses".
-  //
-  // The property is joint domination, NOT liveness at the use: a lane can be
-  // perfectly live along one edge and still undefined along another, so a
-  // getVNInfo*(UseIdx) probe cannot decide this. The updater maintains SSA, so the
-  // value reaching the use has a single def and joint domination reduces to one
-  // dominance query. A PHI-defined value is exempt: its operands are per-edge by
-  // construction.
-  {
-    MachineRegisterInfo &MRI = MF.getRegInfo();
-    LiveInterval &FinalLI = LIS.getInterval(OrigVReg);
-    if (FinalLI.hasSubRanges())
-      for (MachineOperand &MO :
-           llvm::make_early_inc_range(MRI.use_operands(OrigVReg))) {
-        MachineInstr *UseMI = MO.getParent();
-        if (UseMI->isPHI() || UseMI->isDebugInstr() || MO.isUndef())
-          continue;
-        LaneBitmask UseLane =
-            MO.getSubReg() ? TRI.getSubRegIndexLaneMask(MO.getSubReg())
-                           : MRI.getMaxLaneMaskForVReg(OrigVReg);
-        SlotIndex UseIdx = LIS.getInstructionIndex(*UseMI).getRegSlot();
-        bool UndefOnSomePath = false;
-        for (LiveInterval::SubRange &S : FinalLI.subranges()) {
-          if ((S.LaneMask & UseLane).none())
-            continue;
-          VNInfo *VNI = S.getVNInfoBefore(UseIdx);
-          if (!VNI) {
-            UndefOnSomePath = true; // no value of this lane reaches the use
-            break;
-          }
-          if (VNI->isPHIDef()) {
-            // Not a PHI instruction: a block-boundary value, i.e. the lane enters
-            // this block from its predecessors. It is jointly dominated only if
-            // EVERY predecessor carries the lane out; one that does not is the
-            // undefined path.
-            MachineBasicBlock *DefBB = LIS.getMBBFromIndex(VNI->def);
-            for (MachineBasicBlock *P : DefBB->predecessors())
-              if (!S.getVNInfoBefore(LIS.getMBBEndIdx(P))) {
-                UndefOnSomePath = true;
-                break;
-              }
-            if (UndefOnSomePath)
-              break;
-            continue;
-          }
-          // A def that does not dominate the use is absent on the paths it does
-          // not reach, which is exactly the joint-domination failure.
-          MachineInstr *DefMI = LIS.getInstructionFromIndex(VNI->def);
-          if (DefMI && !MDT.dominates(DefMI, UseMI)) {
-            UndefOnSomePath = true;
-            break;
-          }
-        }
-        if (UndefOnSomePath)
-          MO.setIsUndef(true);
-      }
-  }
 
   // Step 4: Update operand flags to match the LiveIntervals
   updateDeadFlags(NewVReg);
@@ -1182,9 +1121,26 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
   if (LaneBitmask NoSub = LanesFromOld & ~Covered; NoSub.any())
     OldPieces.push_back({NoSub, nullptr});
 
-  for (auto &[PieceLanes, V] : OldPieces)
-    if (PieceLanes.any())
-      AddOldGroup(PieceLanes, V);
+  for (auto &[PieceLanes, V] : OldPieces) {
+    if (PieceLanes.none())
+      continue;
+
+    // Without subranges, the frozen main range associates every lane with one
+    // VNInfo. If that value came from an `undef` partial definition, only the
+    // definition's explicit lanes exist; its unwritten lanes are undef. Split
+    // that otherwise-indivisible main-range piece before selecting RS sources.
+    if (const RenamedDef *RD = renamedForReachingVNI(V);
+        RD && RD->UndefUnwrittenLanes) {
+      LaneBitmask Defined = PieceLanes & RD->OrigLanes;
+      LaneBitmask Undef = PieceLanes & ~RD->OrigLanes;
+      if (Defined.any())
+        AddOldGroup(Defined, V);
+      if (Undef.any())
+        AddOldGroup(Undef, nullptr);
+      continue;
+    }
+    AddOldGroup(PieceLanes, V);
+  }
 
   assert(DestCovered == DestFull &&
          "REG_SEQUENCE must define every destination lane exactly once");
