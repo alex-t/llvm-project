@@ -32,7 +32,6 @@
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineLaneSSAUpdater.h"
-#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include <memory>
@@ -105,7 +104,6 @@ private:
   MachineFunction &MF;
   const SIRegisterInfo *TRI;
   const SIInstrInfo *TII;
-  const MachineLoopInfo *MLI;
   MachineRegisterInfo *MRI;
   MachineFrameInfo *FrameInfo;
   LiveIntervals *LIS;
@@ -121,17 +119,9 @@ private:
   DenseMap<VRegMaskPair, MachineInstr *> StoredAtDefinition; // store-at-def memo
   DenseMap<VRegMaskPair, MachineInstr *> WebGroundStores;
 
-  // Reload redefs create fresh vregs; callers exclude these from their own spill
-  // candidate sets (a reload must not be immediately re-spilled). Written by the
-  // emitter, read by policy via reloadedRegs().
-  VRegMaskPairSet ReloadedRegs;
-
   // Current file being spilled: selects vector vs scalar spill MECHANICS.
   // AGPR is a vector file, so it too sets this. Set by beginPass().
   bool IsVGPRPass = false;
-
-  // Set transiently if a reload redef leaves SSA broken; inline repair clears it.
-  bool SSAInvalidated = false;
 
   // Forensic reporter (observer, borrowed, may be null). When non-null and
   // enabled, spillAtDefinition / phi-web stores (E14) and reload emission (E15)
@@ -146,12 +136,8 @@ private:
   // function by the RA.
   unsigned NumSGPRSpillLanes = 0;
 
-  // PHI web members erased by the last spillPhiWeb() call (caller prunes ColorMap).
+  // PHI web members erased by the last spillPhiWeb() call, for debug reporting.
   SmallVector<Register, 32> LastWebErased;
-  // Ground operands the last spillPhiWeb() stored (the driver marks them Spilled
-  // so they are not re-selected and double-spilled as plain victims).
-  SmallVector<Register, 32> LastWebGround;
-
   // --- internal mechanism helpers (moved verbatim from the spiller) ---
   // Store \p VMP right after its def (EXEC full ⇒ captures all lanes). The store
   // half of spillOneVMP; its only caller. Returns the store instruction.
@@ -168,31 +154,21 @@ private:
   void collectReloadUses(VRegMaskPair VMP, SlotIndex KillIdx,
                          SmallVectorImpl<MachineInstr *> &Uses,
                          SmallVectorImpl<MachineInstr *> &PhiUses) const;
-  MachineBasicBlock *getEffectiveKillBB(MachineBasicBlock *SpillBB) const;
   bool ordinaryVALUUseIsExecSafe(MachineInstr *UseMI) const;
 
 public:
   SSASpillEmitter(MachineFunction &MF, LiveIntervals *LIS, SlotIndexes *Indexes,
-                  MachineDominatorTree *DT, const MachineLoopInfo *MLI);
+                  MachineDominatorTree *DT);
 
   /// (Re)create the SSA updater and select the file mechanics
   /// (\p IsVGPR: vector vs scalar).
   /// Call before a fresh register-file pass. Does NOT clear the store-at-def
-  /// memo or stack-slot map (those persist per function) nor ReloadedRegs (the
-  /// caller controls that via clearReloadedRegs()).
+  /// memo or stack-slot map (those persist per function).
   void beginPass(bool IsVGPR);
 
   /// Attach the forensic reporter (observer; may be null). Records spill/reload
   /// facts (E14/E15) when set and enabled. Does not take ownership.
   void setReporter(SSAForensicReporter *R) { Reporter = R; }
-
-  /// Provide the effective kill block for \p SpillBB after hoisting out of all
-  /// enclosing loops (outermost preheader), or \p SpillBB unchanged. The spiller
-  /// needs this for candidate filtering before it picks a KillIdx; exposed so
-  /// policy and emission agree on the hoist target.
-  MachineBasicBlock *effectiveKillBB(MachineBasicBlock *SpillBB) const {
-    return getEffectiveKillBB(SpillBB);
-  }
 
   /// Return true when the store-at-def and every ordinary reload-before-use
   /// position are legal. PHI-edge reloads are exempt from the EXEC-stability
@@ -229,22 +205,6 @@ public:
   /// after the whole web's liveness is final. No allocation occurs inside it.
   RepairResult spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange);
 
-  /// Members erased by the last spillPhiWeb() (for the caller to prune ColorMap).
-  ArrayRef<Register> lastWebErased() const { return LastWebErased; }
-
-  /// Ground operands stored by the last spillPhiWeb() (driver marks them Spilled).
-  ArrayRef<Register> lastWebGround() const { return LastWebGround; }
-
-  /// After a partial spill leaves \p WideVReg with only its \p RemnantMask lanes
-  /// live (a contiguous sub-register named by \p SubIdx), extract that remnant
-  /// into a fresh narrow vreg so WideVReg vacates its aligned tuple. Inserts
-  /// `%new:SubRC = COPY WideVReg.SubIdx` right after WideVReg's def and uses the
-  /// SSA updater's rewriteDominatedUses to redirect the remnant-lane uses to
-  /// %new (dominance- and subreg-policy-correct, composing REG_SEQUENCEs where a
-  /// use spans the split). Returns true if the remnant was narrowed.
-  bool narrowRemnantToNewReg(Register WideVReg, unsigned SubIdx,
-                             LaneBitmask RemnantMask);
-
   /// Insert an identity redefinition of V and repair it with SSA Updater.
   /// Returns nullopt only before mutation, when no legal live insertion point
   /// exists. Completed repair notifies OnChange and returns all affected IDs.
@@ -254,21 +214,12 @@ public:
   splitLiveRangeAt(Register V, MachineBasicBlock::iterator SplitPt,
                    LivenessCallback OnChange);
 
-  /// Reload vregs created so far (fresh names from SSA repair). Policy layers
-  /// subtract these from their spill-candidate sets so a reload is never
-  /// immediately re-spilled.
-  const VRegMaskPairSet &reloadedRegs() const { return ReloadedRegs; }
-  void clearReloadedRegs() { ReloadedRegs.clear(); }
-
   /// Total SGPR lanes spilled so far (see NumSGPRSpillLanes). The RA reads this
   /// after the SGPR allocation stage to reserve VGPRs for WWM SGPR-spill
   /// lowering, and clears it per function.
   unsigned numSGPRSpillLanes() const { return NumSGPRSpillLanes; }
   void clearSGPRSpillLanes() { NumSGPRSpillLanes = 0; }
 
-  /// True if any reload path left SSA transiently broken and it was not repaired
-  /// (defensive; normally false — inline repair clears it).
-  bool ssaInvalidated() const { return SSAInvalidated; }
 };
 
 } // end namespace llvm

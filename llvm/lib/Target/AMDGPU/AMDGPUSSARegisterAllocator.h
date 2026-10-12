@@ -185,8 +185,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// was assigned or the repaired tie was queued for the existing drain.
   bool resumePendingTies();
   bool tiedAssignmentsValid() const;
-  bool drainUncolorableWorklist(MachineFunction &MF,
-                                bool ReportFailure = true);
+  void drainUncolorableWorklist(MachineFunction &MF);
 
   /// CSR(CS): the registers this allocation may use for \p RC that \p CallMI
   /// preserves. A call's regmask IS its preserved set, and ISel builds that mask
@@ -240,25 +239,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // values of StageFile; the driver sets it before each stage.
   RegFile StageFile = RegFile::SGPR;
 
-  /// [Stage 1] A tight region: a contiguous slot span within ONE block whose
-  /// all-live RP in \p File exceeds the allocatable-pool limit. Half-open slot
-  /// pair label; a value "crosses" it if its interval overlaps [Start,End).
-  /// Block-local for v1 (cross-MBB coalescing deferred). Target is RP > pool:
-  /// all-live RP already counts colored + uncolored crossers, so RP <= pool is
-  /// exactly "placed + uncolored-crossers all fit".
-  struct TightRegion {
-    MachineBasicBlock *MBB;
-    SlotIndex Start, End; // half-open, within MBB
-    SlotIndex PeakSlot;   // slot carrying the largest deficiency (a value must be
-                          // live here to relieve the region by being spilled)
-    RegFile File;
-    unsigned Deficiency; // max runs SHORT over the span, from demandDeficiency
-    unsigned Limit;      // allocatable-pool count. A budget handed to the emitter
-                         // and a number to report — never again a feasibility
-                         // threshold: whether a slot fits is a packing question
-                         // a pool size cannot answer.
-  };
-
   /// [Stage 1] Allocatable-pool size for \p File (SGPR_32 / VGPR_32 / AGPR_32
   /// count) — the number the colorer draws from; the region target is RP <= this.
   /// NOT raw getMaxNum* (102/64), NOT the spiller's margined value.
@@ -308,55 +288,10 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
                             RegFile Pool,
                             SmallVectorImpl<TierDemand> &Out) const;
 
-  /// One in-region slot: the live set there and its deficiency. Carrying the SET
-  /// rather than a number is what lets a candidate be priced by MEASUREMENT —
-  /// re-query the oracle without the victim — instead of subtracting its width
-  /// from a scalar that had already rounded.
-  struct RegionSlot {
-    SlotIndex SI;
-    MachineInstr *MI;
-    DenseMap<unsigned, LaneBitmask> Live;
-    unsigned Short;
-  };
-
   /// [Stage 1] Per-file pressure at a tracker point. VGPR is the arch-VGPR count
   /// on every target (rationale at the definition); AGPR is the separate AGPR
   /// count.
   unsigned pressureOf(const GCNRegPressure &P, RegFile File) const;
-
-  /// 32-bit slots \p Lanes of \p RC occupy, in the SAME unit pressureOf reports:
-  /// GCNRegPressure::inc charges a 32-bit class exactly 1 whatever its mask and a
-  /// tuple the number of slots its live lanes cover. Use this, never the class
-  /// width, whenever a value's demand is compared against a region peak.
-  unsigned coveredSlots(const TargetRegisterClass *RC, LaneBitmask Lanes) const;
-
-  /// [Stage 1] Enumerate tight regions for \p File: per block, maximal contiguous
-  /// slot spans where all-live RP (GCNUpwardRPTracker) > allocatablePool(File).
-  void findTightRegions(MachineFunction &MF, RegFile File,
-                        SmallVectorImpl<TightRegion> &Out) const;
-
-  /// What a region holds of one virtual register: the UNION of the lane masks the
-  /// tracker reported live at in-region slots, and how many such slots. The mask is
-  /// not decoration — pressure is charged per covered 32-bit slot, so it is what
-  /// puts a victim's demand (and the spill that relieves it) in the peak's unit.
-  struct RegionOccupancy {
-    LaneBitmask Lanes = LaneBitmask::getNone();
-    unsigned Slots = 0;
-  };
-
-  /// Largest demand DEFICIENCY of \p R's pool over ONLY [R.Start,R.End), from the
-  /// oracle, so it is directly comparable to R.Deficiency. With \p Occupants the
-  /// same walk also reports every virtual register live inside R — which IS the
-  /// overlap test, hole-accurate by construction. With \p Slots it reports each
-  /// in-region slot's instruction, live set, and deficiency, which the direct
-  /// planner copies and re-evaluates. With \p PeakTiers it reports which
-  /// (pool, width) tiers were short at the worst slot.
-  /// Returns 0 if the region packs, or if R's first instruction no longer exists.
-  unsigned measureRegionPeak(
-      const TightRegion &R,
-      DenseMap<Register, RegionOccupancy> *Occupants = nullptr,
-      SmallVectorImpl<RegionSlot> *Slots = nullptr,
-      SmallVectorImpl<TierDemand> *PeakTiers = nullptr) const;
 
   /// Diagnostic (-amdgpu-ssa-lane-waste-dump): per function and file, report the
   /// peak whole-tuple occupancy this allocator charges against the subrange
@@ -383,33 +318,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
 
   bool tryEvict(Register B, SlotIndex Start, SlotIndex End);
 
-  struct SpillCandidateInput {
-    Register V;
-    LaneBitmask Lanes;
-  };
-
-  struct AreaSpillAction {
-    Register V;
-    LaneBitmask Lanes;
-    uint64_t Area = 0;
-  };
-
-  /// Select one direct-placement spill candidate that improves the copied
-  /// region deficiency. PHI webs are excluded until their multi-value footprint
-  /// can be modeled as one atomic unit.
-  bool planAreaSpillSet(const TightRegion &R, ArrayRef<RegionSlot> Slots,
-                        ArrayRef<SpillCandidateInput> Inputs,
-                        SmallVectorImpl<AreaSpillAction> &Actions,
-                        unsigned *RemainingShort = nullptr);
-
-  /// Late direct-placement spill planner for failures that recovery could not
-  /// resolve. Select at most one candidate per tight region; the caller then
-  /// recolors once and performs a final recovery drain.
-  bool reduceRegionPressure(MachineFunction &MF);
-
-  /// Place a whole value when the profile permits, otherwise attempt one
-  /// identity-copy split. Completed repair queues every live unassigned result
-  /// and returns Deferred; it does not assume a prefix or a shorter remnant.
   RecoveryResult trySelfSplitColor(Register Failed);
 
   /// Coloring-time recovery for one value \p Failed that color() could not place.
@@ -448,10 +356,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   bool
   edgeCopiesNeedSplit(MachineBasicBlock *Pred, MachineBasicBlock *MBB,
                       ArrayRef<std::pair<MCRegister, MCRegister>> Copies) const;
-
-  /// Print RF occupancy at SI and availability over VI, in target order.
-  void dumpOccupancyMap(const TargetRegisterClass *RC, SlotIndex SI,
-                        const char *Tag, const LiveInterval *VI = nullptr) const;
 
   /// Extract diagnostic facts from RF without maintaining a second oracle.
   void collectOccupancy(const TargetRegisterClass *RC, SlotIndex SI,

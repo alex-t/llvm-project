@@ -121,7 +121,7 @@ struct ForensicEvent {
 };
 
 /// Occupancy of one register class at one program point, as observed facts.
-/// Mirrors exactly what dumpOccupancyMap prints; produced by the allocator's
+/// Produced by the allocator's
 /// const collectOccupancy() so the reporter never re-derives allocator state.
 struct OccupancyFacts {
   std::string Map;   // one char per reg in order: '#','x','.'
@@ -180,14 +180,6 @@ public:
   /// disabled. Unlike endRun it does NOT reset per-function state (the caller is
   /// typically about to abort, or endRun runs later and does the reset).
   void flushNow();
-
-  // === Region-RP rounds (E2/E3) ===
-
-  /// E2. Returns the event ID (a cause handle for the round's spills).
-  uint64_t roundStarted(unsigned Round, uint64_t UncolorableIn);
-  /// E3.
-  void roundCompleted(unsigned Round, uint64_t UncolorableOut, bool Spilled,
-                      uint64_t StartedCause);
 
   // === Per-value coloring attempt (E4/E9/E10) ===
 
@@ -256,18 +248,6 @@ public:
   void spillEmitted(unsigned VRegIdx, StringRef Site);
   /// E15. A reload was emitted for \p VRegIdx.
   void reloadEmitted(unsigned VRegIdx, StringRef Site);
-
-  /// E19. Recovery-classifier Stage 1 observation: the recovery window computed
-  /// for an uncolored value. Plain fields (not the allocator's RecoveryWindow
-  /// struct) to avoid a layering dependency. \p Crossers is the spill-candidate
-  /// universe as vreg indices (width derived consumer-side). Endpoints are BLOCK
-  /// NUMBERS (not slot ordinals — layout order is not program order). \p WebPhiIdx
-  /// is the PHI result reg the value merges into, or 0 if none. Purely
-  /// descriptive — records what the classifier saw; drives nothing.
-  void recoveryWindow(unsigned UncoloredVRegIdx, int StartBlock, int EndBlock,
-                      ArrayRef<unsigned> Crossers, StringRef StopReason,
-                      unsigned WebPhiIdx, unsigned UncoloredWidth,
-                      unsigned RPOvershoot);
 
   // === Causality ===
 

@@ -17,7 +17,6 @@
 #define LLVM_LIB_TARGET_AMDGPU_SSAPLACEMENTPROFILE_H
 
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/Register.h"
@@ -122,13 +121,6 @@ void getFreeRuns(const PlacementProfile &Profile,
 void getVirtualBlockers(const PlacementProfile &Profile,
                         PlacementProfile::SlotRange Range,
                         SmallVectorImpl<Register> &Out);
-
-/// Visit the same maximal slices used by normalization, including fixed blockers.
-void visitInterferenceSlices(
-    const PlacementProfile &Profile,
-    function_ref<void(PlacementProfile::HomeID,
-                      PlacementProfile::SlotRange,
-                      ArrayRef<Register>)> Visit);
 
 } // end namespace llvm
 

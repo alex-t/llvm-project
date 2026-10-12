@@ -120,12 +120,3 @@ void llvm::getVirtualBlockers(const PlacementProfile &Profile,
   Out.erase(std::unique(Out.begin(), Out.end()), Out.end());
 }
 
-void llvm::visitInterferenceSlices(
-    const PlacementProfile &Profile,
-    function_ref<void(PlacementProfile::HomeID,
-                      PlacementProfile::SlotRange,
-                      ArrayRef<Register>)> Visit) {
-  NormalizedPlacementProfile Normalized = normalizePlacementProfile(Profile);
-  for (const PlacementProfileSlice &Slice : Normalized.Slices)
-    Visit(Slice.Home, Slice.Range, Slice.Blockers);
-}

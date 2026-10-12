@@ -550,19 +550,6 @@ void AMDGPUSSARegisterAllocator::collectOccupancy(const TargetRegisterClass *RC,
   }
 }
 
-void AMDGPUSSARegisterAllocator::dumpOccupancyMap(
-    const TargetRegisterClass *RC, SlotIndex SI, const char *Tag,
-    const LiveInterval *VI) const {
-  OccupancyFacts Facts;
-  collectOccupancy(RC, SI, VI, Facts);
-  dbgs()
-      << "  [OCCMAP " << Tag << "] " << Facts.ClassName << " @" << SI
-      << " usable=" << Facts.FreeUsable << " blocked=" << Facts.FreeClobbered
-      << " occupied=" << Facts.Occupied << " total=" << Facts.Total << '\n'
-      << "    " << Facts.Map << '\n'
-      << "    # occupied here; x blocked elsewhere in the interval; . free\n";
-}
-
 void AMDGPUSSARegisterAllocator::collectSpillAcrossCandidates(
     Register Failed, SlotIndex FS, SlotIndex FE, bool FIsVGPR,
     unsigned &NLiveThru, SmallVectorImpl<SpillAcrossCandidate> &Out,
@@ -1053,19 +1040,6 @@ unsigned AMDGPUSSARegisterAllocator::pressureOf(const GCNRegPressure &P,
 }
 
 unsigned
-AMDGPUSSARegisterAllocator::coveredSlots(const TargetRegisterClass *RC,
-                                         LaneBitmask Lanes) const {
-  SSARA_TRACE();
-  // Mirrors GCNRegPressure::inc: a 32-bit class charges exactly 1 whatever its
-  // mask, a tuple charges the 32-bit slots its live lanes cover. Keeping this in
-  // one place is what lets a victim's demand, its spill traffic and a region peak
-  // be compared at all.
-  if (TRI->getRegSizeInBits(*RC) == 32)
-    return 1;
-  return std::max(1u, SIRegisterInfo::getNumCoveredRegs(Lanes));
-}
-
-unsigned
 AMDGPUSSARegisterAllocator::allocStride(const TargetRegisterClass *RC) const {
   SSARA_TRACE();
   auto It = StrideCache.find(RC);
@@ -1164,81 +1138,6 @@ unsigned AMDGPUSSARegisterAllocator::demandDeficiency(
   return Short;
 }
 
-void AMDGPUSSARegisterAllocator::findTightRegions(
-    MachineFunction &MF, RegFile File,
-    SmallVectorImpl<TightRegion> &Out) const {
-  RecoveryScopeTimer PhaseTimer("find-regions");
-  SSARA_TRACE();
-  const unsigned Limit = allocatablePool(MF, File);
-  for (MachineBasicBlock &MBB : MF) {
-    if (MBB.empty())
-      continue;
-    // Upward RP tracker: seed live-out at block end, recede toward the top (same
-    // machinery as SSASpillEmitter::maxRPBetween). Collect per-slot RP, then scan
-    // for over-limit runs in program order.
-    GCNUpwardRPTracker Tracker(*LIS);
-    Tracker.reset(MBB);
-    SmallVector<std::pair<SlotIndex, unsigned>, 32> SlotShort; // bottom-to-top
-    for (MachineInstr &MI : llvm::reverse(MBB)) {
-      if (MI.isDebugInstr())
-        continue;
-      // Registers needed AT this instruction: what it defines, plus the operands
-      // that stay live. Operands that die here release theirs, which is why the
-      // colorer frees kills before assigning defs. Walking bottom-up, that set is
-      // what the tracker holds BEFORE recede. After recede it holds the set above
-      // the instruction, which counts a def at the NEXT instruction and so starts
-      // every region one instruction late.
-      // A slot is tight when some (pool, width) tier cannot be placed. A dword
-      // total errs in both directions: it calls a fragmented under-limit slot
-      // fine, and an over-limit slot that packs perfectly tight.
-      SmallVector<TierDemand, 8> Tiers;
-      unsigned Short = demandDeficiency(Tracker.getLiveRegs(), File, Tiers);
-      Tracker.recede(MI);
-      // PHIs carry NO real register pressure: their operands are parallel-copy
-      // semantics resolved at PREDECESSOR EDGES, not simultaneously live at the
-      // join. Receding across a PHI wall over-counts (every result + all incoming
-      // operands appear coexisting), producing PHANTOM tight regions. Skip PHI
-      // slots — the true live set is at the first non-PHI point (PHI results only,
-      // operands already collapsed), which the non-PHI slots below capture.
-      if (MI.isPHI())
-        continue;
-      SlotIndex SI = LIS->getInstructionIndex(MI).getRegSlot();
-      SlotShort.push_back({SI, Short});
-      LLVM_DEBUG(if (Short) dbgs()
-                 << "    slotShort " << printMBBReference(MBB) << " @" << SI
-                 << " short=" << Short << " OVER\n");
-    }
-    std::reverse(SlotShort.begin(), SlotShort.end()); // program order
-
-    // Consume each maximal deficient run as one region (while(Over){...} form).
-    for (unsigned I = 0, N = SlotShort.size(); I < N;) {
-      if (!SlotShort[I].second) {
-        ++I;
-        continue;
-      }
-      SlotIndex RS = SlotShort[I].first;
-      unsigned Peak = 0;
-      SlotIndex PeakSlot = RS;
-      while (I < N && SlotShort[I].second) {
-        if (SlotShort[I].second > Peak) {
-          Peak = SlotShort[I].second;
-          PeakSlot = SlotShort[I].first;
-        }
-        ++I;
-      }
-      // Half-open end: first packing slot, or block end if the run reaches it.
-      SlotIndex RE = (I < N) ? SlotShort[I].first : LIS->getMBBEndIdx(&MBB);
-      Out.push_back({&MBB, RS, RE, PeakSlot, File, Peak, Limit});
-      LLVM_DEBUG(dbgs() << "  findTightRegions[" << (File == RegFile::SGPR ? "SGPR"
-                        : File == RegFile::AGPR ? "AGPR" : "VGPR")
-                        << "] " << printMBBReference(MBB) << " [" << RS << ","
-                        << RE << ") short=" << Peak << "@" << PeakSlot
-                        << " pool=" << Limit
-                        << " loopdepth=" << MLI->getLoopDepth(&MBB) << "\n");
-    }
-  }
-}
-
 void AMDGPUSSARegisterAllocator::reportLaneWaste(MachineFunction &MF) const {
   SSARA_TRACE();
   // Two occupancy models over one tracker walk: what this allocator charges
@@ -1293,374 +1192,6 @@ AMDGPUSSARegisterAllocator::fileOf(const TargetRegisterClass *RC) const {
   // AGPR folds into VGPR so this matches pressureOf(VGPR)'s unified count; only
   // SGPR classes are the SGPR file.
   return TRI->isSGPRClass(RC) ? RegFile::SGPR : RegFile::VGPR;
-}
-
-unsigned AMDGPUSSARegisterAllocator::measureRegionPeak(
-    const TightRegion &R, DenseMap<Register, RegionOccupancy> *Occupants,
-    SmallVectorImpl<RegionSlot> *Slots,
-    SmallVectorImpl<TierDemand> *PeakTiers) const {
-  RecoveryScopeTimer PhaseTimer("measure-region");
-  SSARA_TRACE();
-  // Same machinery findTightRegions used, so the number is comparable bit for bit,
-  // but walking ONLY [R.Start,R.End): the tracker is seeded from LIS at the
-  // bottom-most in-region instruction (reset(MI) = the live set just after MI, as
-  // reloadRPBeforeUse does), so no block prefix or suffix is traversed.
-  //
-  // With \p Occupants the same walk also reports WHO is in the region: each virtual
-  // register live at an in-region non-PHI slot, the union of its live lanes there,
-  // and at how many slots. That IS the overlap test, hole-accurate for free, since
-  // the tracker's live set never holds a value inside its own liveness hole.
-  MachineInstr *StartMI = LIS->getInstructionFromIndex(R.Start);
-  if (!StartMI || StartMI->getParent() != R.MBB) {
-    // R's first instruction is gone (erased by an earlier spill this pass). Report
-    // "fits": re-deriving the span here would measure a different region.
-    LLVM_DEBUG(dbgs() << "    measureRegionPeak: start slot " << R.Start
-                      << " no longer maps into " << printMBBReference(*R.MBB)
-                      << "\n");
-    return 0;
-  }
-  // R.End is half-open: the first slot NOT over the limit, or the block end index,
-  // where no instruction exists.
-  MachineInstr *EndMI = LIS->getInstructionFromIndex(R.End);
-  MachineBasicBlock::iterator B = StartMI->getIterator();
-  MachineBasicBlock::iterator E = (EndMI && EndMI->getParent() == R.MBB)
-                                      ? EndMI->getIterator()
-                                      : R.MBB->end();
-  GCNUpwardRPTracker Tracker(*LIS);
-  bool Seeded = false;
-  unsigned Peak = 0;
-  for (MachineBasicBlock::iterator I = E; I != B;) {
-    MachineInstr &MI = *--I;
-    if (MI.isDebugInstr())
-      continue;
-    if (!Seeded) {
-      Tracker.reset(MI);
-      Seeded = true;
-    }
-    // PHIs carry no real pressure (see findTightRegions).
-    if (!MI.isPHI()) {
-      // The live-out side, read before recede: what this instruction defines plus
-      // what stays live past it. Occupancy is read from the SAME set, or a value
-      // defined at a slot would not be an occupant of the region that needs it
-      // spilled.
-      auto &Live = Tracker.getLiveRegs();
-      SmallVector<TierDemand, 8> Tiers;
-      unsigned Short = demandDeficiency(Live, R.File, Tiers);
-      if (Short > Peak) {
-        Peak = Short;
-        if (PeakTiers)
-          *PeakTiers = Tiers;
-      }
-      if (Slots)
-        Slots->push_back(
-            {LIS->getInstructionIndex(MI).getRegSlot(), &MI, Live, Short});
-      if (Occupants)
-        for (auto [RegNum, Mask] : Live) {
-          Register Reg(RegNum);
-          if (!Reg.isVirtual())
-            continue;
-          RegionOccupancy &O = (*Occupants)[Reg];
-          O.Lanes |= Mask; // union over the region: what R actually holds of Reg
-          O.Slots += 1;
-        }
-    }
-    Tracker.recede(MI);
-  }
-  return Peak;
-}
-
-bool AMDGPUSSARegisterAllocator::planAreaSpillSet(
-    const TightRegion &R, ArrayRef<RegionSlot> Slots,
-    ArrayRef<SpillCandidateInput> Inputs,
-    SmallVectorImpl<AreaSpillAction> &Actions, unsigned *RemainingShort) {
-  RecoveryScopeTimer PhaseTimer("area-search");
-  SSARA_TRACE();
-  Actions.clear();
-  if (Slots.empty())
-    return false;
-
-  struct Candidate {
-    AreaSpillAction Action;
-    SmallVector<unsigned, 16> FreedSlots;
-  };
-
-  DenseMap<Register, unsigned> DirectIndex;
-  SmallVector<SmallBitVector, 32> DirectLiveSlots;
-  SmallVector<SmallBitVector, 32> DirectResidentSlots;
-  for (unsigned I = 0; I != Inputs.size(); ++I) {
-    DirectIndex.try_emplace(Inputs[I].V, I);
-    DirectLiveSlots.emplace_back(Slots.size());
-    DirectResidentSlots.emplace_back(Slots.size());
-  }
-
-  for (unsigned S = 0; S != Slots.size(); ++S) {
-    for (unsigned I = 0; I != Inputs.size(); ++I)
-      if (Slots[S].Live.count(Inputs[I].V.id()))
-        DirectLiveSlots[I].set(S);
-
-    for (const MachineOperand &MO : Slots[S].MI->operands()) {
-      if (!MO.isReg() || !MO.getReg().isVirtual())
-        continue;
-      auto It = DirectIndex.find(MO.getReg());
-      if (It == DirectIndex.end())
-        continue;
-      if ((VRegMaskPair(MO, TRI, MRI).getLaneMask() &
-           Inputs[It->second].Lanes)
-              .any())
-        DirectResidentSlots[It->second].set(S);
-    }
-  }
-
-  auto FirstTerm = R.MBB->getFirstTerminator();
-  if (FirstTerm != R.MBB->end()) {
-    SmallBitVector PhiEdgeSlots(Slots.size());
-    SlotIndex FirstTermIdx =
-        LIS->getInstructionIndex(*FirstTerm).getRegSlot();
-    for (unsigned S = 0; S != Slots.size(); ++S)
-      if (LIS->getInstructionIndex(*Slots[S].MI).getRegSlot() >= FirstTermIdx)
-        PhiEdgeSlots.set(S);
-
-    for (MachineBasicBlock *Succ : R.MBB->successors())
-      for (const MachineInstr &Phi : *Succ) {
-        if (!Phi.isPHI())
-          break;
-        for (unsigned I = 1, E = Phi.getNumOperands(); I + 1 < E; I += 2) {
-          const MachineOperand &Val = Phi.getOperand(I);
-          if (!Val.isReg() || !Val.getReg().isVirtual() ||
-              Phi.getOperand(I + 1).getMBB() != R.MBB)
-            continue;
-          auto It = DirectIndex.find(Val.getReg());
-          if (It == DirectIndex.end())
-            continue;
-          if ((VRegMaskPair(Val, TRI, MRI).getLaneMask() &
-               Inputs[It->second].Lanes)
-                  .any())
-            DirectResidentSlots[It->second] |= PhiEdgeSlots;
-        }
-      }
-  }
-
-  SmallVector<Candidate, 32> Candidates;
-  for (const SpillCandidateInput &I : Inputs) {
-    if (!LIS->hasInterval(I.V) || LIS->getInterval(I.V).empty())
-      continue;
-    if (PhiWeb Web = closePhiWeb(I.V); Web.valid()) {
-      LLVM_DEBUG(dbgs() << "    [AREA] exclude " << printReg(I.V, TRI)
-                        << ": PHI web requires atomic multi-value footprint\n");
-      continue;
-    }
-
-    const TargetRegisterClass *RC = MRI->getRegClass(I.V);
-    unsigned Width = coveredSlots(RC, I.Lanes);
-    Candidate C;
-    C.Action.V = I.V;
-    C.Action.Lanes = I.Lanes;
-    unsigned INo = DirectIndex.lookup(I.V);
-    SmallBitVector Freed = DirectLiveSlots[INo];
-    Freed.reset(DirectResidentSlots[INo]);
-    for (int S = Freed.find_first(); S >= 0; S = Freed.find_next(S))
-      C.FreedSlots.push_back(S);
-    C.Action.Area = uint64_t(Width) * C.FreedSlots.size();
-    if (C.Action.Area)
-      Candidates.push_back(std::move(C));
-  }
-
-  llvm::sort(Candidates, [](const Candidate &A, const Candidate &B) {
-    if (A.Action.Area != B.Action.Area)
-      return A.Action.Area > B.Action.Area;
-    return A.Action.V.id() < B.Action.V.id();
-  });
-
-  SmallVector<RegionSlot, 32> Virtual(Slots.begin(), Slots.end());
-  auto totalShort = [&]() {
-    unsigned Total = 0;
-    for (const RegionSlot &S : Virtual)
-      Total += S.Short;
-    return Total;
-  };
-
-  const unsigned InitialShort = totalShort();
-  unsigned BestShort = InitialShort;
-
-  for (Candidate &Cand : Candidates) {
-    if (!llvm::any_of(Cand.FreedSlots,
-                      [&](unsigned S) { return Virtual[S].Short != 0; }))
-      continue;
-    for (unsigned S : Cand.FreedSlots)
-      Virtual[S].Live.erase(Cand.Action.V.id());
-    for (RegionSlot &S : Virtual) {
-      SmallVector<TierDemand, 8> Tiers;
-      S.Short = demandDeficiency(S.Live, R.File, Tiers);
-    }
-    unsigned CurrentShort = totalShort();
-    if (CurrentShort < InitialShort) {
-      BestShort = CurrentShort;
-      Actions.push_back(Cand.Action);
-    }
-    LLVM_DEBUG(dbgs() << "    [AREA] choose "
-                      << printReg(Cand.Action.V, TRI)
-                      << " area=" << Cand.Action.Area
-                      << " remaining-short=" << CurrentShort
-                      << " footprint=direct"
-                      << "\n");
-    break;
-  }
-
-  if (RemainingShort)
-    *RemainingShort = BestShort;
-  if (Actions.empty()) {
-    LLVM_DEBUG(dbgs() << "    [AREA] no measured improvement; emit nothing\n");
-    Actions.clear();
-    return false;
-  }
-  LLVM_DEBUG(dbgs() << "    [AREA] retain one direct candidate short="
-                    << InitialShort << "->" << BestShort
-                    << "; defer residual to coloring and recovery\n");
-  return !Actions.empty();
-}
-
-bool AMDGPUSSARegisterAllocator::reduceRegionPressure(MachineFunction &MF) {
-  RecoveryScopeTimer PhaseTimer("late-planner");
-  SSARA_TRACE();
-  // RP-PROFILE spill-across (post-color recovery). Tight regions come from
-  // findTightRegions: per BLOCK, measured with GCNUpwardRPTracker, so liveness
-  // HOLES, subranges and PHI semantics are the tracker's and a region can never
-  // span blocks. The event sweep this replaces collapsed every value to its hull
-  // [beginIndex,endIndex) — holes stopped existing — and ran on ONE global slot
-  // axis, so a single "region" could cover several blocks and SUM mutually
-  // exclusive divergent paths.
-  //
-  // Per region: select at most one candidate whose direct reload footprint
-  // improves copied deficiency. Queue repaired values against retained assignments.
-  // Returns true if any spill was performed.
-  bool AnySpill = false;
-
-  // Only the current allocation stage's pools. The vector stage owns two of them:
-  // arch-VGPR and AGPR are disjoint register sets with separate orders, so
-  // enumerating them as one hides an AGPR shortage and inflates the arch-VGPR
-  // reading with values that will never occupy that pool. Everything below is
-  // per REGION (R.File, R.Limit), never per stage.
-  SmallVector<RegFile, 2> Pools;
-  if (StageFile == RegFile::SGPR)
-    Pools.push_back(RegFile::SGPR);
-  else {
-    Pools.push_back(RegFile::VGPR);
-    Pools.push_back(RegFile::AGPR);
-  }
-
-  SmallVector<TightRegion, 8> Regions;
-  for (RegFile P : Pools)
-    findTightRegions(MF, P, Regions);
-  if (Regions.empty())
-    return false;
-
-  LLVM_DEBUG(dbgs() << "region-rp[" << (StageFile == RegFile::SGPR ? "SGPR"
-                                                                   : "VGPR+AGPR")
-                    << "]: tight-regions=" << Regions.size() << "\n");
-
-  struct Cand {
-    Register VReg;
-    LaneBitmask Lanes; // lanes R holds; exactly what gets spilled
-  };
-
-  for (const TightRegion &R : Regions) {
-    // ONE walk of R yields its current deficiency, its occupants, and the
-    // per-slot live sets that the direct planner evaluates.
-    // Re-measuring matters: regions were enumerated up front, so spills made for
-    // an earlier region may already have relieved this one (R.Deficiency is then
-    // stale).
-    // Not a pool selector: it picks the emitter's vector-vs-scalar spill
-    // mechanics, and AGPR is a vector file.
-    const bool IsVectorFile = R.File != RegFile::SGPR;
-    DenseMap<Register, RegionOccupancy> Occupants;
-    SmallVector<RegionSlot, 32> Slots;
-    unsigned Peak = measureRegionPeak(R, &Occupants, &Slots);
-    LLVM_DEBUG(dbgs() << "  region " << printMBBReference(*R.MBB) << " ["
-                      << R.Start << "," << R.End << ") short=" << Peak
-                      << " (enumerated " << R.Deficiency << ") occupants="
-                      << Occupants.size() << "\n");
-    if (!Peak)
-      continue;
-
-    // Candidates = occupant AND colored. Occupancy comes from the tracker's live
-    // set, so it is hole-accurate by construction (a value is never in the set
-    // inside its own liveness hole — the hull test this replaces admitted exactly
-    // that, which is how a value sitting in its own hole was picked with cover=8),
-    // and it is not liveAt(R.PeakSlot) either, because a peak can be a PLATEAU and
-    // that strict test dropped victims covering most of R (cf512 28->6).
-    // Uncolored occupants are counted in the peak but can be nobody's victim.
-    SmallVector<Cand, 32> Cands;
-    for (const auto &[V, Occ] : Occupants) {
-      if (!assignedHome(V))
-        continue;
-      const TargetRegisterClass *RC = MRI->getRegClass(V);
-      // poolOf, NOT isVectorRegister: the latter is isVGPRClass||isAGPRClass, both
-      // FALSE for the AV_* vector-super classes this allocator deliberately widens
-      // plain VGPR values into.
-      if (poolOf(RC) != R.File)
-        continue;
-      Cands.push_back({V, Occ.Lanes});
-    }
-    DEBUG_WITH_TYPE("amdgpu-ssa-fsm-trace", dbgs()
-        << "fsm region bb." << R.MBB->getNumber() << " [" << R.Start
-        << "," << R.End << ") peak-short=" << Peak
-        << " occupants=" << Occupants.size() << " colored=" << Cands.size() << "\n");
-    if (Cands.empty())
-      continue;
-    // DenseMap order is not stable across runs and selection ties would leak it
-    // into the output.
-    llvm::sort(Cands, [](const Cand &A, const Cand &B) {
-      return A.VReg.id() < B.VReg.id();
-    });
-
-    SmallVector<SpillCandidateInput, 32> Inputs;
-    for (const Cand &C : Cands)
-      if (!RecoverySpilledValues.overlaps(VRegMaskPair(C.VReg, C.Lanes)))
-        Inputs.push_back({C.VReg, C.Lanes});
-
-    Emitter->beginPass(IsVectorFile);
-    SmallVector<AreaSpillAction, 16> Actions;
-    unsigned VirtualShort = 0;
-    bool Planned = planAreaSpillSet(R, Slots, Inputs, Actions, &VirtualShort);
-    DEBUG_WITH_TYPE("amdgpu-ssa-fsm-trace", {
-      dbgs() << "fsm region bb." << R.MBB->getNumber()
-             << " eligible=" << Inputs.size() << " actions=" << Actions.size()
-             << " remaining-total-short=" << VirtualShort << "\n";
-      for (const AreaSpillAction &A : Actions)
-        dbgs() << "  victim=" << printReg(A.V, TRI) << " mask="
-               << PrintLaneMask(A.Lanes) << " area=" << A.Area << "\n";
-    });
-    if (!Planned)
-      continue;
-
-    bool Legal = llvm::all_of(Actions, [&](const AreaSpillAction &A) {
-      return Emitter->canSpill(VRegMaskPair(A.V, A.Lanes));
-    });
-    if (!Legal)
-      continue;
-
-    for (const AreaSpillAction &A : Actions) {
-      assert(LIS->hasInterval(A.V) && !LIS->getInterval(A.V).empty() &&
-             "planned victim lost its interval before set emission");
-      LLVM_DEBUG(dbgs() << "    [AREA] spill " << printReg(A.V, TRI)
-                        << " area=" << A.Area
-                        << " lanes=" << PrintLaneMask(A.Lanes) << "\n");
-      unassignColor(A.V);
-      auto Repair = spillWithForest(VRegMaskPair(A.V, A.Lanes),
-                                    LIS->getInterval(A.V).beginIndex());
-      queueUnassignedValues(Repair.Affected);
-      AnySpill = true;
-    }
-
-    Slots.clear();
-    unsigned Actual = measureRegionPeak(R, nullptr, &Slots);
-    LLVM_DEBUG(dbgs() << "    [AREA] committed set=" << Actions.size()
-                      << " virtual-short=" << VirtualShort
-                      << " actual-short=" << Actual << "\n");
-  }
-
-  LLVM_DEBUG(dbgs() << "region-rp: pass done, AnySpill=" << AnySpill << "\n");
-  return AnySpill;
 }
 
 PhiWeb AMDGPUSSARegisterAllocator::closePhiWeb(Register Seed) const {
@@ -2357,9 +1888,9 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
         // Count once per blocker; preserve collection order for equal counts.
         SmallDenseMap<Register, unsigned, 16> UseCounts;
         for (const auto &[B, OldHome] : Blockers) {
-          unsigned Count = 0;
-          for (const MachineOperand &MO : MRI->use_nodbg_operands(B))
-            Count += MO.readsReg();
+          unsigned Count = llvm::count_if(
+              MRI->use_nodbg_operands(B),
+              [](const MachineOperand &MO) { return MO.readsReg(); });
           UseCounts[B] = Count;
         }
         llvm::stable_sort(Blockers, [&](const auto &A, const auto &B) {
@@ -2556,8 +2087,8 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
   }
 }
 
-bool AMDGPUSSARegisterAllocator::drainUncolorableWorklist(
-    MachineFunction &MF, bool ReportFailure) {
+void AMDGPUSSARegisterAllocator::drainUncolorableWorklist(
+    MachineFunction &MF) {
   SSARA_TRACE();
   auto Colored = [&](Register R) { return assignedHome(R) != 0; };
   auto Skip = [&](Register R) {
@@ -2590,15 +2121,12 @@ bool AMDGPUSSARegisterAllocator::drainUncolorableWorklist(
     Register R = UncolorableVRegs[I];
     if (Colored(R) || Skip(R))
       continue;
-    if (!ReportFailure)
-      return false;
     const TargetRegisterClass *RC = MRI->getRegClass(R);
     bool IsVGPR = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
     unsigned RPLimit =
         allocatablePool(MF, IsVGPR ? RegFile::VGPR : RegFile::SGPR);
     reportPointOverPressure(R, IsVGPR, RPLimit, "worklist-drained");
   }
-  return true;
 }
 
 // A call destroys a register unless its regmask preserves it and the call does
@@ -4556,7 +4084,7 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
 
   // Approach-A emitter: spill values that coloring cannot place.
   Indexes = &getAnalysis<SlotIndexesWrapperPass>().getSI();
-  Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT, MLI);
+  Emitter = std::make_unique<SSASpillEmitter>(MF, LIS, Indexes, MDT);
   Emitter->setReporter(Reporter.get());
 
   // Erase fully-DEAD IMPLICIT_DEFs (def-only vreg, zero uses) before coloring.

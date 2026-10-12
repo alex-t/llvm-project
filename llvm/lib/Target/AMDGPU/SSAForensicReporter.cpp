@@ -299,32 +299,6 @@ void SSAForensicReporter::flushNow() {
 }
 
 //===----------------------------------------------------------------------===//
-// Region-RP rounds.
-//===----------------------------------------------------------------------===//
-
-uint64_t SSAForensicReporter::roundStarted(unsigned Round,
-                                           uint64_t UncolorableIn) {
-  if (!enabled())
-    return 0;
-  ForensicEvent &E = newEvent(ForensicEventKind::RoundStarted);
-  E.IntFacts.push_back({"round", (int64_t)Round});
-  E.IntFacts.push_back({"uncolorableIn", (int64_t)UncolorableIn});
-  return E.ID;
-}
-
-void SSAForensicReporter::roundCompleted(unsigned Round, uint64_t UncolorableOut,
-                                         bool Spilled, uint64_t StartedCause) {
-  if (!enabled())
-    return;
-  ForensicEvent &E = newEvent(ForensicEventKind::RoundCompleted);
-  E.IntFacts.push_back({"round", (int64_t)Round});
-  E.IntFacts.push_back({"uncolorableOut", (int64_t)UncolorableOut});
-  E.StrFacts.push_back({"spilled", Spilled ? "true" : "false"});
-  uint64_t ID = E.ID;
-  link(StartedCause, ID);
-}
-
-//===----------------------------------------------------------------------===//
 // Per-value coloring attempt.
 //===----------------------------------------------------------------------===//
 
@@ -524,47 +498,6 @@ void SSAForensicReporter::reloadEmitted(unsigned VRegIdx, StringRef Site) {
 //===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
-
-//===----------------------------------------------------------------------===//
-// Recovery classifier, Stage 1 (E19).
-//===----------------------------------------------------------------------===//
-
-void SSAForensicReporter::recoveryWindow(unsigned UncoloredVRegIdx,
-                                         int StartBlock, int EndBlock,
-                                         ArrayRef<unsigned> Crossers,
-                                         StringRef StopReason,
-                                         unsigned WebPhiIdx,
-                                         unsigned UncoloredWidth,
-                                         unsigned RPOvershoot) {
-  if (!enabled())
-    return;
-  ForensicEvent &E = newEvent(ForensicEventKind::RecoveryWindow);
-  E.IntFacts.push_back({"uncolored", (int64_t)UncoloredVRegIdx});
-  // Endpoints as BLOCK NUMBERS (not slot ordinals — layout != program order).
-  E.IntFacts.push_back({"startBlock", (int64_t)StartBlock});
-  E.IntFacts.push_back({"endBlock", (int64_t)EndBlock});
-  E.IntFacts.push_back({"crosserCount", (int64_t)Crossers.size()});
-  // Why the window stopped: RPRecovered / ForkDivergence / BackEdge / Cap.
-  E.StrFacts.push_back({"stopReason", StopReason.str()});
-  // PHI-web membership: the PHI result reg the value merges into (analyst signal
-  // for a deferred web-spill candidate). 0 = feeds no PHI.
-  E.IntFacts.push_back({"webPhi", (int64_t)WebPhiIdx});
-  // Stage-2 dispatch inputs: failing value width (dwords) + peak RP overshoot
-  // (RP - Limit) across the window. Per-crosser widths derived consumer-side.
-  E.IntFacts.push_back({"uncoloredWidth", (int64_t)UncoloredWidth});
-  E.IntFacts.push_back({"rpOvershoot", (int64_t)RPOvershoot});
-  // Spill-candidate universe as comma-joined vreg indices, in the order given
-  // (the allocator sorts by vreg index for determinism). Width is intentionally
-  // NOT logged — the consumer derives it from the vreg's register class.
-  std::string List;
-  raw_string_ostream OS(List);
-  for (size_t I = 0, N = Crossers.size(); I < N; ++I) {
-    if (I)
-      OS << ",";
-    OS << Crossers[I];
-  }
-  E.StrFacts.push_back({"crossers", OS.str()});
-}
 
 //===----------------------------------------------------------------------===//
 // Serialization.
