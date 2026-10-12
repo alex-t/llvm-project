@@ -638,7 +638,15 @@ void MachineLaneSSAUpdater::rewriteUseReaching(
   // first such operand this session. PHIs are excluded: their operands read on
   // distinct edges, so a shared key would wrongly conflate different values.
   const bool ShareRS = !UseMI->isPHI();
-  auto RSKey = std::make_pair(UseMI, OpMask);
+  // A bundle header summarizes its external uses. Share the reconstructed
+  // value with the matching operands on its members so both name one vreg.
+  MachineInstr *UseUnit = UseMI;
+  if (UseMI->isInsideBundle() && !MO.isInternalRead()) {
+    auto BundleI =
+        MachineBasicBlock::iterator::getAtBundleBegin(UseMI->getIterator());
+    UseUnit = &*BundleI;
+  }
+  auto RSKey = std::make_pair(UseUnit, OpMask);
   if (ShareRS)
     if (Register Cached = SuperUseRSCache.lookup(RSKey)) {
       recordAffected(MO.getReg());
@@ -945,9 +953,9 @@ getCoveringSubRegsForLaneMask(LaneBitmask Mask, const TargetRegisterInfo *TRI,
 }
 
 /// Build a REG_SEQUENCE to materialize a super-reg/mixed-lane use.
-/// Inserts at the PHI predecessor terminator (for PHI uses) or right before
-/// UseMI otherwise. Returns the new full-width vreg, the RS index via OutIdx,
-/// and the subrange lane masks that should be extended to that point.
+/// Inserts at the PHI predecessor terminator (for PHI uses) or before the
+/// instruction or bundle containing the use. Returns the new full-width vreg,
+/// the RS index via OutIdx, and the lane masks to extend to that point.
 Register MachineLaneSSAUpdater::buildRSForSuperUse(
     MachineInstr *UseMI, MachineOperand &MO, Register OldVR, Register NewVR,
     LaneBitmask MaskToRewrite, LiveInterval &LI,
@@ -958,7 +966,8 @@ Register MachineLaneSSAUpdater::buildRSForSuperUse(
   MachineRegisterInfo &MRI = MF.getRegInfo();
 
   MachineBasicBlock *InsertBB = UseMI->getParent();
-  MachineBasicBlock::iterator IP(UseMI);
+  MachineBasicBlock::iterator IP =
+      MachineBasicBlock::iterator::getAtBundleBegin(UseMI->getIterator());
   SlotIndex QueryIdx;
 
   if (UseMI->isPHI()) {

@@ -300,8 +300,10 @@ private:
   // Without this, an instruction reading a value in two operands (e.g.
   // V_MAX_F64 x, x or V_DIV_SCALE_F64 %v, %v) would get a distinct composed
   // vreg per operand, presenting two different registers to a constant-bus- or
-  // src0==src1-constrained instruction. Keyed by (use instr, operand lane
-  // mask); reset per session.
+  // src0==src1-constrained instruction. External bundle-member uses share
+  // the header's key so its aggregate operands name the same reconstruction.
+  // Keyed by (use instruction or bundle header, operand lane mask); reset per
+  // session.
   DenseMap<std::pair<MachineInstr *, LaneBitmask>, Register> SuperUseRSCache;
 
   // Captured at session start (before any rewrite): per non-PHI instruction
