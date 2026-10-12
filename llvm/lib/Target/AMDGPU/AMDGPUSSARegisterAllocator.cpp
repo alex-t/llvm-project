@@ -407,13 +407,24 @@ AMDGPUSSARegisterAllocator::splitWithForest(
     Register VR, MachineBasicBlock::iterator Point) {
   RecoveryScopeTimer PhaseTimer("split-repair");
   const TargetRegisterClass *RC = MRI->getRegClass(VR);
-  Emitter->beginPass(TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC));
+  bool IsVector = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
+  if (IsVector && !MFI->getSGPRForEXECCopy())
+    return std::nullopt;
+  Emitter->beginPass(IsVector);
+  const unsigned FirstNewVReg = MRI->getNumVirtRegs();
   auto Result = Emitter->splitLiveRangeAt(
       VR, Point, [this](ArrayRef<Register> Affected) {
         notifyLivenessChanged(Affected);
       });
-  if (Result)
+  if (Result) {
     ++RecoverySplitCount;
+    // Repair renames the new identity definition. Track only newly created
+    // values, excluding pre-existing whole-wave definitions in the affected set.
+    for (unsigned I = FirstNewVReg, E = MRI->getNumVirtRegs(); I != E; ++I)
+      if (MachineInstr *Copy = MRI->getUniqueVRegDef(Register::index2VirtReg(I)))
+        if (Copy->getOpcode() == AMDGPU::WWM_COPY)
+          RecoveryCopies.push_back(Copy);
+  }
   return Result;
 }
 
@@ -4016,9 +4027,37 @@ void AMDGPUSSARegisterAllocator::eliminateRedundantReloads(MachineFunction &MF) 
                     << "\n");
 }
 
+void AMDGPUSSARegisterAllocator::lowerRecoveryCopies(MachineFunction &MF) {
+  Register SavedExec = MFI->getSGPRForEXECCopy();
+  for (MachineInstr *Copy : RecoveryCopies) {
+    assert(SavedExec && "vector split transfer requires EXEC scratch");
+    MachineBasicBlock &MBB = *Copy->getParent();
+    // Physical liveness has not been rebuilt after operand rewriting. Preserve
+    // SCC unconditionally using the scratch SGPR reserved before allocation.
+    TII->insertScratchExecCopy(MF, MBB, Copy->getIterator(), Copy->getDebugLoc(),
+                              SavedExec, /*IsSCCLive=*/true, Indexes);
+    TII->restoreExec(MF, MBB, std::next(Copy->getIterator()), Copy->getDebugLoc(),
+                    SavedExec, Indexes);
+    MCRegister Dst = Copy->getOperand(0).getReg().asMCReg();
+    const TargetRegisterClass *RC = TRI->getPhysRegBaseClass(Dst);
+    unsigned Bits = TRI->getRegSizeInBits(*RC);
+    unsigned Width = std::max(1u, (Bits + 31) / 32);
+    for (unsigned I = 0; I < Width; ++I) {
+      MCRegister Part = Width == 1 ? Dst : TRI->getSubReg(
+          Dst, SIRegisterInfo::getSubRegFromChannel(I));
+      if (Bits < 32)
+        Part = TRI->get32BitRegister(Part);
+      MFI->allocateWWMSpill(MF, Part);
+    }
+    Copy->setDesc(TII->get(TargetOpcode::COPY));
+  }
+  RecoveryCopies.clear();
+}
+
 void AMDGPUSSARegisterAllocator::finalizeAfterRewrite(MachineFunction &MF) {
   SSARA_TRACE();
   // Run ONCE after both files are physical.
+  lowerRecoveryCopies(MF);
   if (EliminatePostColorReloads)
     eliminateRedundantReloads(MF);
   finalizeProperties(MF);
@@ -4048,6 +4087,7 @@ static unsigned countCalleeSavedSGPRLanes(MachineFunction &MF) {
 
 bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   RecoveryTimings.clear();
+  RecoveryCopies.clear();
   RecoveryScopeTimer AllocatorTimer("allocator-total");
   SSARA_TRACE();
   TRI =

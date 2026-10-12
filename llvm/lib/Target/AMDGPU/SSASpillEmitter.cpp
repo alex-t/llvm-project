@@ -415,9 +415,11 @@ SSASpillEmitter::splitLiveRangeAt(Register V,
 
   // Let the existing updater handle joins and backedges. Its reaching interval
   // must include the temporary identity redefinition before repair starts.
+  // A split must preserve lanes that are inactive here but read after EXEC
+  // expands. Vector transfers therefore execute in whole-wave mode.
+  const unsigned Opcode = IsVGPRPass ? AMDGPU::WWM_COPY : TargetOpcode::COPY;
   MachineInstr *CopyMI =
-      BuildMI(MBB, SplitPt, SplitPt->getDebugLoc(),
-              TII->get(TargetOpcode::COPY), V)
+      BuildMI(MBB, SplitPt, SplitPt->getDebugLoc(), TII->get(Opcode), V)
           .addReg(V);
   LIS->InsertMachineInstrInMaps(*CopyMI);
   LIS->removeInterval(V);

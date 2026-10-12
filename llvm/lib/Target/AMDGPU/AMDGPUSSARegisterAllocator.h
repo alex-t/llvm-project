@@ -151,6 +151,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // Completed splits in this function, retained across worklist retries.
   // Also lets the drain recognize a committed split as progress.
   unsigned RecoverySplitCount = 0;
+  // Whole-wave split transfers, lowered after physical-register rewriting.
+  SmallVector<MachineInstr *, 16> RecoveryCopies;
 
   // === Coloring ===
   void classifyVRegs();
@@ -410,6 +412,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // eliminateRegSequences), scoped to \p Only. Called per allocation stage.
   void rewriteStage(MachineFunction &MF, RegFile Only);
   // Finalize MachineFunction properties after both stages are physical.
+  void lowerRecoveryCopies(MachineFunction &MF);
   void finalizeAfterRewrite(MachineFunction &MF);
   void eliminateRedundantReloads(MachineFunction &MF);
   void lowerPHIs(MachineFunction &MF, RegFile Only);
