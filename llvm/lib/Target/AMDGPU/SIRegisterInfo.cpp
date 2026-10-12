@@ -87,6 +87,7 @@ struct SGPRSpillBuilder {
   MachineBasicBlock::iterator MI;
   ArrayRef<int16_t> SplitParts;
   unsigned NumSubRegs;
+  unsigned SourceDword = 0;
   bool IsKill;
   const DebugLoc &DL;
 
@@ -131,6 +132,13 @@ struct SGPRSpillBuilder {
     const TargetRegisterClass *RC = TRI.getPhysRegBaseClass(SuperReg);
     SplitParts = TRI.getRegSplitParts(RC, EltSize);
     NumSubRegs = SplitParts.empty() ? 1 : SplitParts.size();
+    if (MI->getOpcode() == AMDGPU::SI_SPILL_S32_RESTORE_OFFSET) {
+      int64_t Offset = MI->getOperand(2).getImm();
+      assert(Offset >= 0 &&
+             Offset < MF.getFrameInfo().getObjectSize(Index) / EltSize &&
+             "SGPR restore source dword outside spill slot");
+      SourceDword = Offset;
+    }
 
     if (IsWave32) {
       ExecReg = AMDGPU::EXEC_LO;
@@ -152,6 +160,9 @@ struct SGPRSpillBuilder {
     Data.PerVGPR = IsWave32 ? 32 : 64;
     Data.NumVGPRs = (NumSubRegs + (Data.PerVGPR - 1)) / Data.PerVGPR;
     Data.VGPRLanes = (1LL << std::min(Data.PerVGPR, NumSubRegs)) - 1LL;
+    // Offset-bearing restores are one dword wide. Select its packed memory
+    // lane when saving/restoring the temporary VGPR and setting EXEC.
+    Data.VGPRLanes <<= SourceDword % Data.PerVGPR;
     return Data;
   }
 
@@ -1252,6 +1263,7 @@ static unsigned getNumSubRegsForSpillOp(const MachineInstr &MI,
   case AMDGPU::SI_SPILL_AV64_RESTORE:
     return 2;
   case AMDGPU::SI_SPILL_S32_SAVE:
+  case AMDGPU::SI_SPILL_S32_RESTORE_OFFSET:
   case AMDGPU::SI_SPILL_S32_RESTORE:
   case AMDGPU::SI_SPILL_V32_SAVE:
   case AMDGPU::SI_SPILL_V32_RESTORE:
@@ -2118,7 +2130,7 @@ bool SIRegisterInfo::restoreSGPR(MachineBasicBlock::iterator MI, int Index,
               ? SB.SuperReg
               : Register(getSubReg(SB.SuperReg, SB.SplitParts[i]));
 
-      SpilledReg Spill = VGPRSpills[i];
+      SpilledReg Spill = VGPRSpills[SB.SourceDword + i];
       auto MIB = BuildMI(*SB.MBB, MI, SB.DL,
                          SB.TII.get(AMDGPU::SI_RESTORE_S32_FROM_VGPR), SubReg)
                      .addReg(Spill.VGPR)
@@ -2140,7 +2152,8 @@ bool SIRegisterInfo::restoreSGPR(MachineBasicBlock::iterator MI, int Index,
 
     for (unsigned Offset = 0; Offset < PVD.NumVGPRs; ++Offset) {
       // Load in VGPR data
-      SB.readWriteTmpVGPR(Offset, /*IsLoad*/ true);
+      SB.readWriteTmpVGPR(Offset + SB.SourceDword / PVD.PerVGPR,
+                         /*IsLoad*/ true);
 
       // Unpack lanes
       for (unsigned i = Offset * PVD.PerVGPR,
@@ -2155,7 +2168,7 @@ bool SIRegisterInfo::restoreSGPR(MachineBasicBlock::iterator MI, int Index,
         auto MIB = BuildMI(*SB.MBB, MI, SB.DL,
                            SB.TII.get(AMDGPU::SI_RESTORE_S32_FROM_VGPR), SubReg)
                        .addReg(SB.TmpVGPR, getKillRegState(LastSubReg))
-                       .addImm(i);
+                       .addImm((SB.SourceDword + i) % PVD.PerVGPR);
         if (SB.NumSubRegs > 1 && i == 0)
           MIB.addReg(SB.SuperReg, RegState::ImplicitDefine);
         if (Indexes) {
@@ -2284,6 +2297,7 @@ bool SIRegisterInfo::eliminateSGPRToVGPRSpillFrameIndex(
   case AMDGPU::SI_SPILL_S128_RESTORE:
   case AMDGPU::SI_SPILL_S96_RESTORE:
   case AMDGPU::SI_SPILL_S64_RESTORE:
+  case AMDGPU::SI_SPILL_S32_RESTORE_OFFSET:
   case AMDGPU::SI_SPILL_S32_RESTORE:
     return restoreSGPR(MI, FI, RS, Indexes, LIS, true, SpillToPhysVGPRLane);
   default:
@@ -2346,6 +2360,7 @@ bool SIRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator MI,
     case AMDGPU::SI_SPILL_S128_RESTORE:
     case AMDGPU::SI_SPILL_S96_RESTORE:
     case AMDGPU::SI_SPILL_S64_RESTORE:
+    case AMDGPU::SI_SPILL_S32_RESTORE_OFFSET:
     case AMDGPU::SI_SPILL_S32_RESTORE: {
       return restoreSGPR(MI, Index, RS);
     }

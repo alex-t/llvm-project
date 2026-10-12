@@ -22,10 +22,12 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/LiveIntervals.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "SSARATrace.h"
@@ -44,6 +46,9 @@ static cl::opt<int> CoverageTraceVReg(
 static cl::opt<bool> EnableRecoveryTiming(
     "amdgpu-ssa-phase-timing", cl::Hidden, cl::init(false),
     cl::desc("Report SSA allocator phase timings without enabling debug dumps"));
+static cl::opt<bool> EliminatePostColorReloads(
+    "amdgpu-ssa-eliminate-reloads", cl::Hidden, cl::init(true),
+    cl::desc("Eliminate redundant reloads after SSA register coloring"));
 static constexpr unsigned MaxRecoverySplits = 64;
 
 namespace {
@@ -4298,9 +4303,194 @@ void AMDGPUSSARegisterAllocator::rewriteStage(MachineFunction &MF,
   addPhysRegLiveIns(MF);
 }
 
+// Physical assignments are final; spill slots still identify reload sources.
+void AMDGPUSSARegisterAllocator::eliminateRedundantReloads(MachineFunction &MF) {
+  RecoveryScopeTimer Timer("post-color-reloads");
+  enum class ReloadKind { Scalar, Vector, WholeWaveVector };
+  struct SliceKey {
+    int FrameIndex;
+    unsigned ByteOffset;
+    unsigned Bytes;
+    ReloadKind Kind;
+
+    bool operator==(const SliceKey &Other) const {
+      return FrameIndex == Other.FrameIndex && ByteOffset == Other.ByteOffset &&
+             Bytes == Other.Bytes && Kind == Other.Kind;
+    }
+  };
+  struct AvailableSlice {
+    SliceKey Key;
+    MachineInstr *Def; // Retained reload, used for memory-alias queries.
+  };
+  unsigned RemovedBytes = 0;
+
+  for (MachineBasicBlock &MBB : MF) {
+    DenseMap<Register, AvailableSlice> Available;
+    bool Changed = false;
+    auto EraseIf = [&](auto Predicate) {
+      for (auto I = Available.begin(), E = Available.end(); I != E;) {
+        auto Current = I++;
+        if (Predicate(*Current))
+          Available.erase(Current);
+      }
+    };
+    auto Invalidate = [&](const MachineInstr &MI) {
+      // Only definitions and regmasks can clobber cached physical values.
+      // Aliases include dwords overlapping a true16 or tuple definition.
+      for (const MachineOperand &MO : MI.operands()) {
+        if (MO.isReg() && MO.isDef() && MO.getReg()) {
+          Register Reg = MO.getReg();
+          if (MO.getSubReg())
+            Reg = TRI->getSubReg(Reg, MO.getSubReg());
+          for (MCRegAliasIterator A(Reg, TRI, true); A.isValid(); ++A)
+            Available.erase(*A);
+        } else if (MO.isRegMask()) {
+          EraseIf([&](const auto &Entry) {
+            return MO.clobbersPhysReg(Entry.first);
+          });
+        }
+      }
+      // Scalar and whole-wave restores are independent of the current EXEC.
+      if (MI.modifiesRegister(AMDGPU::EXEC, TRI))
+        EraseIf([](const auto &Entry) {
+          return Entry.second.Key.Kind == ReloadKind::Vector;
+        });
+      if (!MI.mayStore())
+        return;
+
+      int StoreFI = 0;
+      Register StoredReg;
+      if (TII->isSpill(MI))
+        StoredReg = TII->isStoreToStackSlot(MI, StoreFI);
+      unsigned StoreOffset = 0;
+      unsigned StoreBytes = 0;
+      if (StoredReg) {
+        StoreBytes = TRI->getSpillSize(*TRI->getPhysRegBaseClass(StoredReg));
+        if (const MachineOperand *Offset =
+                TII->getNamedOperand(MI, AMDGPU::OpName::offset))
+          StoreOffset = Offset->getImm();
+      }
+      EraseIf([&](const auto &Entry) {
+        const AvailableSlice &A = Entry.second;
+        // Overwriting slot bytes breaks their equality with the cached register,
+        // even when the instruction does not write that register.
+        if (StoredReg)
+          return A.Key.FrameIndex == StoreFI &&
+                 A.Key.ByteOffset < StoreOffset + StoreBytes &&
+                 StoreOffset < A.Key.ByteOffset + A.Key.Bytes;
+        // Other stores invalidate only possibly aliasing spill sources. This
+        // retains entries across stores proven disjoint by LLVM's memory info.
+        return MI.mayAlias(static_cast<AAResults *>(nullptr), *A.Def, false);
+      });
+    };
+
+    // Visit bundle interiors for their clobbers, but do not rewrite bundles.
+    for (MachineInstr &MI : llvm::make_early_inc_range(MBB.instrs())) {
+      if (MI.isDebugInstr())
+        continue;
+      int FI = 0;
+      Register Dst;
+      if (TII->isSpill(MI)) {
+        if (MI.getOpcode() == AMDGPU::SI_SPILL_S32_RESTORE_OFFSET) {
+          FI = TII->getNamedOperand(MI, AMDGPU::OpName::addr)->getIndex();
+          Dst = MI.getOperand(0).getReg();
+        } else {
+          Dst = TII->isLoadFromStackSlot(MI, FI);
+        }
+      }
+      if (!Dst || MI.isBundled() || MI.hasOrderedMemoryRef()) {
+        Invalidate(MI);
+        continue;
+      }
+      assert(Dst.isPhysical() && "reload optimizer runs after physical rewrite");
+      assert(MI.getNumExplicitDefs() == 1 &&
+             "spill reload must have one explicit destination");
+      const ReloadKind Kind =
+          TII->isSGPRSpill(MI) ? ReloadKind::Scalar
+          : TII->isWWMRegSpillOpcode(MI.getOpcode()) ? ReloadKind::WholeWaveVector
+                                                  : ReloadKind::Vector;
+      unsigned SourceOffset = 0;
+      if (const MachineOperand *Offset =
+              TII->getNamedOperand(MI, AMDGPU::OpName::offset))
+        SourceOffset = Offset->getImm() * (Kind == ReloadKind::Scalar ? 4 : 1);
+      const auto *RC = TRI->getPhysRegBaseClass(Dst);
+      const unsigned Bytes = TRI->getSpillSize(*RC);
+      // A true16 restore stays a single two-byte slice. Wider registers are
+      // tracked as individual dwords, so writing one dword keeps the others.
+      const unsigned PartBytes = std::min(Bytes, 4u);
+      SmallVector<Register, 32> Parts;
+      if (Bytes > 4)
+        for (int16_t Sub : TRI->getRegSplitParts(RC, 4))
+          Parts.push_back(TRI->getSubReg(Dst, Sub));
+      else
+        Parts.push_back(Dst);
+      assert(Parts.size() * PartBytes == Bytes && "incomplete reload split");
+      SmallVector<unsigned, 32> Missing;
+      for (unsigned I = 0; I != Parts.size(); ++I) {
+        SliceKey Key{FI, SourceOffset + I * PartBytes, PartBytes, Kind};
+        auto Found = Available.find(Parts[I]);
+        if (Found == Available.end() || !(Found->second.Key == Key))
+          Missing.push_back(I);
+      }
+      if (Missing.size() == Parts.size()) {
+        // Keep the original wide operation if nothing can be eliminated.
+        Invalidate(MI);
+        for (unsigned I = 0; I != Parts.size(); ++I)
+          Available[Parts[I]] = {
+              {FI, SourceOffset + I * PartBytes, PartBytes, Kind}, &MI};
+        continue;
+      }
+
+      // Whole-wave restore pseudos are already single-dword operations.
+      assert(Kind != ReloadKind::WholeWaveVector || Missing.empty());
+      for (unsigned I : Missing) {
+        const unsigned Offset = SourceOffset + I * PartBytes;
+        unsigned Opcode;
+        if (Kind == ReloadKind::Scalar)
+          Opcode = AMDGPU::SI_SPILL_S32_RESTORE_OFFSET;
+        else
+          Opcode = TII->getVectorRegSpillRestoreOpcode(
+              Parts[I], TRI->getPhysRegBaseClass(Parts[I]), PartBytes, *MFI);
+        auto Reload = BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(Opcode), Parts[I])
+                          .addFrameIndex(FI);
+        if (Kind == ReloadKind::Scalar) {
+          Reload.addImm(Offset / 4);
+          for (const MachineOperand &MO : MI.implicit_operands())
+            if (MO.isReg() && MO.isUse() && MO.getReg() != AMDGPU::EXEC)
+              Reload.addReg(MO.getReg(), RegState::Implicit);
+        } else {
+          // Vector restore offsets are already expressed in bytes.
+          Reload.addReg(TII->getNamedOperand(MI, AMDGPU::OpName::soffset)->getReg())
+              .addImm(Offset);
+        }
+        for (MachineMemOperand *MMO : MI.memoperands())
+          Reload.addMemOperand(MF.getMachineMemOperand(MMO, I * PartBytes,
+                                                       PartBytes));
+        LIS->InsertMachineInstrInMaps(*Reload);
+        Invalidate(*Reload);
+        Available[Parts[I]] = {{FI, Offset, PartBytes, Kind},
+                               Reload.getInstr()};
+      }
+      RemovedBytes += (Parts.size() - Missing.size()) * PartBytes;
+      if (LIS->getSlotIndexes()->hasIndex(MI))
+        LIS->RemoveMachineInstrFromMaps(MI);
+      MI.eraseFromParent();
+      Changed = true;
+    }
+    // Sharing is confined to this block, so successor live-ins are unchanged.
+    // Repair flags once, not once for every eliminated reload and every slice.
+    if (Changed)
+      recomputeLivenessFlags(MBB);
+  }
+  LLVM_DEBUG(dbgs() << "  post-color reload bytes removed: " << RemovedBytes
+                    << "\n");
+}
+
 void AMDGPUSSARegisterAllocator::finalizeAfterRewrite(MachineFunction &MF) {
   SSARA_TRACE();
   // Run ONCE after both files are physical.
+  if (EliminatePostColorReloads)
+    eliminateRedundantReloads(MF);
   finalizeProperties(MF);
 }
 

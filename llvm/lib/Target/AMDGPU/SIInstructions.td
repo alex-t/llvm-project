@@ -1108,6 +1108,16 @@ multiclass SI_SPILL_SGPR <RegisterClass sgpr_class> {
   } // End UseNamedOperandTable = 1
 }
 
+// Post-color partial restore. The source dword is relative to the saved
+// slot, independently of the physical destination register.
+let UseNamedOperandTable = 1, Spill = 1, SALU = 1, Uses = [EXEC] in {
+  def SI_SPILL_S32_RESTORE_OFFSET : PseudoInstSI <
+    (outs SReg_32:$data), (ins i32imm:$addr, i32imm:$offset)> {
+    let mayStore = 0;
+    let mayLoad = 1;
+  }
+}
+
 // You cannot use M0 as the output of v_readlane_b32 instructions or
 // use it in the sdata operand of SMEM instructions. We still need to
 // be able to spill the physical register m0, so allow it for

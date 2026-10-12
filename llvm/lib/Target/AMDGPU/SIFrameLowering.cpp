@@ -1497,6 +1497,11 @@ void SIFrameLowering::processFunctionBeforeFrameFinalized(
             SpillFIs.set(FI);
             continue;
           }
+        } else if (MI.getOpcode() == AMDGPU::SI_SPILL_S32_RESTORE_OFFSET) {
+          // Offset-bearing restores still keep their spill slot alive.
+          TII->isSGPRStackAccess(MI, FrameIndex);
+          if (!MFI.isFixedObjectIndex(FrameIndex))
+            NonVGPRSpillFIs.set(FrameIndex);
         } else if (TII->isStoreToStackSlot(MI, FrameIndex) ||
                    TII->isLoadFromStackSlot(MI, FrameIndex))
           if (!MFI.isFixedObjectIndex(FrameIndex))

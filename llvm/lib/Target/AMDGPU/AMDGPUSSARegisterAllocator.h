@@ -507,6 +507,7 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void rewriteStage(MachineFunction &MF, RegFile Only);
   // Finalize MachineFunction properties after both stages are physical.
   void finalizeAfterRewrite(MachineFunction &MF);
+  void eliminateRedundantReloads(MachineFunction &MF);
   void lowerPHIs(MachineFunction &MF, RegFile Only);
   void resolvePermutation(
       MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,

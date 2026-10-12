@@ -134,7 +134,13 @@ bool AMDGPUMarkLastScratchLoad::run(MachineFunction &MF) {
       for (auto MI = MISegmentEnd->getReverseIterator(); MI != End; ++MI) {
         int LoadFI = 0;
 
-        if (SII->isLoadFromStackSlot(*MI, LoadFI) && LoadFI == FrameIndex) {
+        // Generic stack-slot folding rejects nonzero offsets, but this pass
+        // must still see the last access to any part of the slot.
+        Register Loaded =
+            MI->getOpcode() == AMDGPU::SI_SPILL_S32_RESTORE_OFFSET
+                ? SII->isSGPRStackAccess(*MI, LoadFI)
+                : SII->isLoadFromStackSlot(*MI, LoadFI);
+        if (Loaded && LoadFI == FrameIndex) {
           LastLoad = &*MI;
           break;
         }

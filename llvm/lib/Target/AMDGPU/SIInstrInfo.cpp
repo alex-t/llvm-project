@@ -9438,6 +9438,12 @@ Register SIInstrInfo::isLoadFromStackSlot(const MachineInstr &MI,
   if (isMUBUF(MI) || isVGPRSpill(MI))
     return isStackAccess(MI, FrameIndex);
 
+  // This interface has no offset result. Do not expose a nonzero-offset
+  // restore to offset-blind folding and load/store elimination clients.
+  if (MI.getOpcode() == AMDGPU::SI_SPILL_S32_RESTORE_OFFSET &&
+      MI.getOperand(2).getImm() != 0)
+    return Register();
+
   if (isSGPRSpill(MI))
     return isSGPRStackAccess(MI, FrameIndex);
 
