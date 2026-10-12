@@ -308,29 +308,35 @@ AMDGPUSSARegisterAllocator::spillWithForest(VRegMaskPair Value,
     });
   };
   using Segments = SmallVector<std::pair<SlotIndex, SlotIndex>, 8>;
-  SmallVector<std::pair<LaneBitmask, Segments>, 4> Before;
-  bool Repeated = RecoverySpilledValues.overlaps(Value);
-  if (Repeated) {
-    const LiveInterval &LI = LIS->getInterval(V);
-    auto Save = [&](LaneBitmask Mask, const LiveRange &LR) {
-      Before.emplace_back(Mask, Segments());
-      for (const auto &S : LR.segments)
-        Before.back().second.emplace_back(S.start, S.end);
+  using Coverage = SmallVector<std::pair<LaneBitmask, Segments>, 4>;
+  auto Snapshot = [&](const LiveInterval &LI) {
+    Coverage Result;
+    auto Save = [&](LaneBitmask Mask,
+                    ArrayRef<LiveRange::Segment> RangeSegments) {
+      Segments Saved;
+      for (const auto &S : RangeSegments)
+        Saved.emplace_back(S.start, S.end);
+      Result.emplace_back(Mask, std::move(Saved));
     };
     if (LI.hasSubRanges()) {
       LaneBitmask Missing = Value.getLaneMask();
       for (const auto &SR : LI.subranges()) {
         LaneBitmask Mask = SR.LaneMask & Value.getLaneMask();
         if (Mask.any())
-          Save(Mask, SR);
+          Save(Mask, SR.segments);
         Missing &= ~SR.LaneMask;
       }
       if (Missing.any())
-        Before.emplace_back(Missing, Segments());
+        Save(Missing, {});
     } else {
-      Save(Value.getLaneMask(), LI);
+      Save(Value.getLaneMask(), LI.segments);
     }
-  }
+    return Result;
+  };
+  bool Repeated = RecoverySpilledValues.overlaps(Value);
+  Coverage Before;
+  if (Repeated)
+    Before = Snapshot(LIS->getInterval(V));
   Dump("before");
   DEBUG_WITH_TYPE("amdgpu-ssa-spill-history", {
     if (CoverageTraceVReg < 0 ||
@@ -364,29 +370,25 @@ AMDGPUSSARegisterAllocator::spillWithForest(VRegMaskPair Value,
       return true;
     };
     bool Shrunk = false;
-    const LiveInterval *After = LIS->hasInterval(V) ? &LIS->getInterval(V) : nullptr;
-    for (const auto &[Mask, Old] : Before) {
-      for (unsigned Bit = 0; Bit < LaneBitmask::BitWidth; ++Bit) {
-        LaneBitmask Lane = LaneBitmask::getLane(Bit);
-        if ((Mask & Lane).none())
-          continue;
-        Segments Now;
-        auto Add = [&](const LiveRange &LR) {
-          for (const auto &S : LR.segments)
-            Now.emplace_back(S.start, S.end);
-        };
-        if (After) {
-          if (After->hasSubRanges()) {
-            for (const auto &SR : After->subranges())
-              if ((SR.LaneMask & Lane).any())
-                Add(SR);
-          } else {
-            Add(*After);
-          }
+    if (!LIS->hasInterval(V)) {
+      // A retired value has no remaining coverage. Keep the common
+      // progress check and spill-history bookkeeping below.
+      Shrunk = llvm::any_of(Before, [](const auto &Entry) {
+        return !Entry.second.empty();
+      });
+    } else {
+      Coverage After = Snapshot(LIS->getInterval(V));
+      // Compare each intersection of the old and new lane partitions once.
+      // Snapshot includes lanes with empty coverage in both partitions.
+      for (const auto &[OldMask, Old] : Before) {
+        for (const auto &[NewMask, Now] : After) {
+          if ((OldMask & NewMask).none())
+            continue;
+          if (!Covered(Now, Old))
+            report_fatal_error("repeated spill expanded original lane liveness");
+          if (!Shrunk && !Covered(Old, Now))
+            Shrunk = true;
         }
-        if (!Covered(Now, Old))
-          report_fatal_error("repeated spill expanded original lane liveness");
-        Shrunk |= !Covered(Old, Now);
       }
     }
     DEBUG_WITH_TYPE("amdgpu-ssa-spill-history", dbgs()
