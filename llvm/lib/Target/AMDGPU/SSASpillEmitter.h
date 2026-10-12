@@ -119,6 +119,7 @@ private:
   // stored at its def only once).
   DenseMap<VRegMaskPair, int> Virt2StackSlotMap;      // value -> stack slot
   DenseMap<VRegMaskPair, MachineInstr *> StoredAtDefinition; // store-at-def memo
+  DenseMap<VRegMaskPair, MachineInstr *> WebGroundStores;
 
   // Reload redefs create fresh vregs; callers exclude these from their own spill
   // candidate sets (a reload must not be immediately re-spilled). Written by the
@@ -164,6 +165,9 @@ private:
                            MachineInstr *InsertBefore = nullptr,
                            LaneBitmask ReloadMask = LaneBitmask::getAll());
   bool insertReloadForUse(MachineInstr *UseMI, VRegMaskPair SpilledVMP);
+  void collectReloadUses(VRegMaskPair VMP, SlotIndex KillIdx,
+                         SmallVectorImpl<MachineInstr *> &Uses,
+                         SmallVectorImpl<MachineInstr *> &PhiUses) const;
   MachineBasicBlock *getEffectiveKillBB(MachineBasicBlock *SpillBB) const;
   bool ordinaryVALUUseIsExecSafe(MachineInstr *UseMI) const;
 
@@ -194,6 +198,10 @@ public:
   /// position are legal. PHI-edge reloads are exempt from the EXEC-stability
   /// rule because each predecessor executes under that edge's lane mask.
   bool canSpill(VRegMaskPair VMP) const;
+
+  // Reject a repeat with no remaining reload work. Reuse a PHI-web ground
+  // store only after checking that its shared slot still carries this value.
+  bool prepareRepeatedSpill(VRegMaskPair VMP, SlotIndex KillIdx);
 
   /// THE primitive both callers use. Spill \p VMP: store at its definition
   /// (EXEC-safe — all lanes captured while EXEC is full), free the register from

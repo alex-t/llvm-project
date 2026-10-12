@@ -44,12 +44,14 @@ namespace llvm {
 class GCNSubtarget;
 class SIInstrInfo;
 class SIRegisterInfo;
+class SIMachineFunctionInfo;
 struct GCNRegPressure;
 
 class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   const SIRegisterInfo *TRI = nullptr;
   const SIInstrInfo *TII = nullptr;
   MachineRegisterInfo *MRI = nullptr;
+  SIMachineFunctionInfo *MFI = nullptr;
   MachineDominatorTree *MDT = nullptr;
   SlotIndexes *Indexes = nullptr;
   LiveIntervals *LIS = nullptr;
@@ -142,10 +144,10 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
 
   // Recovery mutations that must not repeat. A value moved to the sibling
   // vector pool may reclaim that home later, but is never moved back; a value
-  // spilled as a blocker or by the memory floor is never selected for another
-  // recovery spill. Cleared at the start of each allocation stage.
+  // lane already spilled is not selected by an overlapping recovery spill.
+  // Disjoint lanes of the same value remain eligible. Cleared at the start of each allocation stage.
   SmallDenseSet<Register, 8> RehomedVRegs;
-  SmallDenseSet<Register, 16> RecoverySpilledVRegs;
+  VRegMaskPairSet RecoverySpilledValues;
   // Completed splits in this function, retained across worklist retries.
   // Also lets the drain recognize a committed split as progress.
   unsigned RecoverySplitCount = 0;
@@ -208,44 +210,15 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// left MIR, LIS, register classes, and RF unchanged.
   /// Deferred means mutation is committed and all unresolved results are
   /// queued.
-  enum class RecoveryResult { Resolved, Changed, Deferred, NoChange };
+  enum class RecoveryResult { Resolved, Deferred, NoChange };
 
   enum class RecoveryState {
-    Entry,
     Web,
     CrossFileHome,
-    Blocker,
+    EvictBlockers,
     SelfSplit,
     Floor
   };
-
-  struct RecoveryFrame {
-    RecoveryState State = RecoveryState::Entry;
-    Register Value;
-    bool valid() const { return Value.isValid(); }
-  };
-
-  struct RecoveryTransition {
-    RecoveryFrame Next;
-    RecoveryFrame Resume;
-    bool valid() const { return Next.valid(); }
-  };
-
-  /// Spill a colored blocker B (occupying a physreg P legal for \p Failed) to
-  /// free P over \p Failed's range. Two candidate classes, both requiring B live
-  /// at F's end with NO use strictly inside (FS,FE) (so B's reload lands past FE
-  /// -> no round-trip):
-  ///  - LIVE-THROUGH (B.def <= FS): frees P over ALL of F -> Failed colors whole
-  ///    -> Resolved.
-  ///  - BORN-IN-F (B.def in (FS,FE)): frees P over F's TAIL [B.def,FE); F is
-  ///    split at B.def through SSA repair; surviving unassigned split results
-  ///    are queued and the strategy returns Deferred.
-  /// Multi-candidate pick = COVERAGE: live-through (frees all of F) beats
-  /// born-in-F; among born-in-F the earliest def frees the longest tail. Returns
-  /// an unchanged-state transition when a blocking PHI web must be processed by
-  /// the Web state first. Returns NoChange if no clean candidate exists.
-  RecoveryResult spillBlocker(Register Failed, Register &Remnant,
-                              RecoveryTransition &Transition);
 
   /// Close the PHI web seeded by \p Seed (a PHI result, or a PHI operand feeding
   /// one). Bidirectional closure over PHI operand/result edges, then the
@@ -395,38 +368,20 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// count (SGPR classes -> SGPR, everything else -> VGPR).
   RegFile fileOf(const TargetRegisterClass *RC) const;
 
-  /// Pick the register free at \p V's start that stays free LONGEST, and decide
-  /// whether that free run is worth peeling. Returns false when nothing is free
-  /// at the start, or when the run does not reach past \p V's first use
-  /// (genuine over-pressure rather than fragmentation). On true, \p PR is the
-  /// register and \p Bound the slot where it becomes occupied (>= V's end means
-  /// free across all of V). This is the single split-across policy used by
-  /// SelfSplit. Const — reads LIS/MRI/RF.
+  /// Select the longest free prefix that extends past the first use.
   bool pickPeelableRun(Register V, MCRegister &PR, SlotIndex &Bound) const;
-
-  /// Authoritative application of the current longest-run and first-use policy
-  /// to already collected placement facts. This method does not inspect
-  /// mutable allocation state and does not mutate it.
   bool selectPeelableRun(const PlacementProfile &Profile, MCRegister &PR,
                          SlotIndex &Bound) const;
-
-  /// Earliest non-debug use strictly after Start, or an invalid index if none.
-  /// Used by recovery to reject a free run that ends before the first use.
   SlotIndex firstUseAfter(Register V, SlotIndex Start) const;
-
   /// Set the subject window, target-ordered homes and physical clobber cuts.
   /// RF supplies occupied intervals; LIS supplies register-mask cuts.
   void initializePlacementProfile(Register Subject, PlacementProfile &Out) const;
   void collectPlacementBlockers(PlacementProfile &Profile) const;
 
-  /// Cross-file recovery strategy. First try to place \p R in its current
-  /// class or in that class's sibling vector pool. If that fails, temporarily
-  /// uncolor each colored crosser and try to move it from its ACTUAL physical
-  /// pool to the sibling pool. A successful crosser move returns Changed so the
-  /// recovery pipeline restarts from Web. Failed probes restore the old class and
-  /// color exactly. Its internal forced-target probe bypasses current-home
-  /// reclamation for a temporarily uncolored crosser.
+  /// Try only R in its current or sibling file. Never mutate a blocker here.
   RecoveryResult tryCrossFileHome(Register R);
+
+  bool tryEvict(Register B, SlotIndex Start, SlotIndex End);
 
   struct SpillCandidateInput {
     Register V;

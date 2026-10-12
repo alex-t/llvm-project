@@ -108,6 +108,80 @@ bool SSASpillEmitter::canSpill(VRegMaskPair VMP) const {
   return true;
 }
 
+bool SSASpillEmitter::prepareRepeatedSpill(VRegMaskPair VMP,
+                                             SlotIndex KillIdx) {
+  SmallVector<MachineInstr *, 8> Uses, PhiUses;
+  collectReloadUses(VMP, KillIdx, Uses, PhiUses);
+  if (Uses.empty() && PhiUses.empty())
+    return false;
+  MachineInstr *Store = WebGroundStores.lookup(VMP);
+  if (MachineInstr *Existing = StoredAtDefinition.lookup(VMP))
+    if (Existing != Store)
+      return true;
+  if (!Store)
+    return false;
+  int FI = 0;
+  bool FoundFI = false;
+  for (const MachineOperand &MO : Store->operands())
+    if (MO.isFI()) {
+      FI = MO.getIndex();
+      FoundFI = true;
+      break;
+    }
+  assert(FoundFI && "spill store must name a frame index");
+
+  SmallPtrSet<MachineInstr *, 16> Targets;
+  for (MachineInstr *Use : Uses)
+    Targets.insert(Use);
+  SmallPtrSet<MachineBasicBlock *, 8> EdgeTargets;
+  for (MachineInstr *Phi : PhiUses)
+    for (unsigned I = 1; I < Phi->getNumOperands(); I += 2) {
+      const MachineOperand &MO = Phi->getOperand(I);
+      if (MO.isReg() && MO.getReg() == VMP.getVReg() && MO.readsReg() &&
+          VRegMaskPair(MO, TRI, MRI).overlaps(VMP))
+        EdgeTargets.insert(Phi->getOperand(I + 1).getMBB());
+    }
+
+  // A different ground writer must not reach any prospective reload without
+  // passing the store of this value again. Scan each reachable block once per
+  // writer; this is a conservative CFG check, not reload commoning.
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB) {
+      if (&MI == Store || !MI.mayStore() ||
+          !llvm::any_of(MI.operands(), [FI](const MachineOperand &MO) {
+            return MO.isFI() && MO.getIndex() == FI;
+          }))
+        continue;
+      SmallPtrSet<MachineBasicBlock *, 16> Seen;
+      SmallVector<MachineBasicBlock *, 16> Work;
+      auto Visit = [&](MachineBasicBlock &BB,
+                       MachineBasicBlock::iterator Begin) {
+        for (auto I = Begin; I != BB.end(); ++I) {
+          if (&*I == Store)
+            return false;
+          if (Targets.count(&*I))
+            return true;
+        }
+        if (EdgeTargets.count(&BB))
+          return true;
+        for (MachineBasicBlock *Succ : BB.successors())
+          if (Seen.insert(Succ).second)
+            Work.push_back(Succ);
+        return false;
+      };
+      if (Visit(MBB, std::next(MI.getIterator())))
+        return false;
+      while (!Work.empty()) {
+        MachineBasicBlock *BB = Work.pop_back_val();
+        if (Visit(*BB, BB->begin()))
+          return false;
+      }
+    }
+  Virt2StackSlotMap[VMP] = FI;
+  StoredAtDefinition[VMP] = Store;
+  return true;
+}
+
 int SSASpillEmitter::assignVirt2StackSlot(VRegMaskPair VMP) {
   SSARA_TRACE();
   assert(VMP.getVReg().isVirtual() && "Expected virtual register");
@@ -258,7 +332,11 @@ SSASpillEmitter::spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange) {
                   : MRI->getRegClass(G);
     TII->storeRegToStackSlot(GBB, DIt, G, /*isKill=*/false, FI, StoreRC, TRI, G,
                              MachineInstr::NoFlags, GE.SubReg);
-    LIS->InsertMachineInstrInMaps(*std::prev(DIt));
+    MachineInstr *GroundStore = &*std::prev(DIt);
+    LIS->InsertMachineInstrInMaps(*GroundStore);
+    WebGroundStores[VRegMaskPair(
+        G, GE.SubReg ? TRI->getSubRegIndexLaneMask(GE.SubReg)
+                     : MRI->getMaxLaneMaskForVReg(G))] = GroundStore;
     ++NumSpills;
     if (Reporter && SSAForensicReporter::enabled())
       Reporter->spillEmitted(G.virtRegIndex(), "phi-web-store-at-def");
@@ -799,31 +877,20 @@ bool SSASpillEmitter::insertReloadForUse(MachineInstr *UseMI,
   return true;
 }
 
-SSASpillEmitter::RepairResult SSASpillEmitter::emitReloadsAndRepairSSA(
-    VRegMaskPair SpilledVMP, SlotIndex KillIdx, LivenessCallback OnChange) {
-  SSARA_TRACE();
+void SSASpillEmitter::collectReloadUses(
+    VRegMaskPair SpilledVMP, SlotIndex KillIdx,
+    SmallVectorImpl<MachineInstr *> &Uses,
+    SmallVectorImpl<MachineInstr *> &PhiUses) const {
   Register SpilledReg = SpilledVMP.getVReg();
-
   MachineInstr *KillMI = Indexes->getInstructionFromIndex(KillIdx);
-  assert(KillMI && "KillIdx must correspond to an instruction");
-
-  LLVM_DEBUG({
-    dbgs() << "\n=== emitReloadsAndRepairSSA() [Option 3: redef-only] ===\n";
-    dbgs() << "Spilled: " << printReg(SpilledReg, TRI) << " mask "
-           << PrintLaneMask(SpilledVMP.getLaneMask()) << "\n";
-  });
-
+  assert(KillMI && "kill must name an instruction");
   // Collect ordinary uses reachable from the kill and PHI edge uses. Direct
   // placement intentionally emits one reload at every such use; a post-color
   // coalescer may merge redundant reloads after physical assignments are known.
-  SmallVector<MachineInstr *, 8> Uses;
-  SmallVector<MachineInstr *, 4> PhiUses;
   for (MachineInstr &UseMI : MRI->use_nodbg_instructions(SpilledReg)) {
     if (isSpillInstr(&UseMI))
       continue;
-    MachineOperand *UseOp =
-        UseMI.findRegisterUseOperand(SpilledReg, TRI, /*isKill=*/false);
-    if (!UseOp || !VRegMaskPair(*UseOp, TRI, MRI).overlaps(SpilledVMP))
+    if (!usesSpilledVMP(&UseMI, SpilledVMP, TRI, MRI))
       continue;
     if (UseMI.isPHI()) {
       PhiUses.push_back(&UseMI);
@@ -843,6 +910,25 @@ SSASpillEmitter::RepairResult SSASpillEmitter::emitReloadsAndRepairSSA(
       return false;
     return LIS->getInstructionIndex(*A) < LIS->getInstructionIndex(*B);
   });
+}
+
+SSASpillEmitter::RepairResult SSASpillEmitter::emitReloadsAndRepairSSA(
+    VRegMaskPair SpilledVMP, SlotIndex KillIdx, LivenessCallback OnChange) {
+  SSARA_TRACE();
+  Register SpilledReg = SpilledVMP.getVReg();
+
+  MachineInstr *KillMI = Indexes->getInstructionFromIndex(KillIdx);
+  assert(KillMI && "KillIdx must correspond to an instruction");
+
+  LLVM_DEBUG({
+    dbgs() << "\n=== emitReloadsAndRepairSSA() [Option 3: redef-only] ===\n";
+    dbgs() << "Spilled: " << printReg(SpilledReg, TRI) << " mask "
+           << PrintLaneMask(SpilledVMP.getLaneMask()) << "\n";
+  });
+
+  SmallVector<MachineInstr *, 8> Uses;
+  SmallVector<MachineInstr *, 4> PhiUses;
+  collectReloadUses(SpilledVMP, KillIdx, Uses, PhiUses);
 
   for (MachineInstr *U : Uses) {
     if (!usesSpilledVMP(U, SpilledVMP, TRI, MRI))
