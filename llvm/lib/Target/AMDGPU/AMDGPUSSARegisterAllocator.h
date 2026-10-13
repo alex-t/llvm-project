@@ -172,12 +172,18 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// not occupy a register for it) so the rest of the walk proceeds as if that
   /// value were absent. Does not assert on failure.
   void color();
-  /// Place R against RF ownership over its complete lane live ranges,
-  /// without disturbing existing assignments. Used to place reload remainders
-  /// after a coloring-failure spill. Returns the assigned physical register,
-  /// or NoRegister if no register is free (should not happen for a width-1
-  /// reload — point pressure ≤ limit < file).
+  /// Place R against retained ownership. Tied results inherit/repair their
+  /// input's home, or remain deferred until the input is assigned. Tied
+  /// inheritance may queue displaced owners or a local input COPY.
   MCRegister colorOneInPlace(Register R);
+  struct TiedPlacement {
+    enum Kind { NotTied, Deferred, Assigned } State;
+    // Deferred with a zero register means the repair COPY is already queued.
+    Register InputToRecover;
+  };
+  TiedPlacement placeTiedDef(Register Reg);
+  std::optional<PendingTie> definingTie(Register Reg) const;
+  bool tiedHomesAllowPlacement(Register Reg, MCRegister PR);
   /// Whether evicting VR alone would leave an already-assigned tied partner.
   /// Uncolored future partners and undef tied uses do not prevent eviction.
   bool hasAssignedTiedPartner(Register VR) const;

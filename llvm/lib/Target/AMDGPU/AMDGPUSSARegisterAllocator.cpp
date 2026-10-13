@@ -660,6 +660,69 @@ void AMDGPUSSARegisterAllocator::collectBlockers(
   }
 }
 
+std::optional<AMDGPUSSARegisterAllocator::PendingTie>
+AMDGPUSSARegisterAllocator::definingTie(Register Reg) const {
+  MachineInstr *Def = MRI->getVRegDef(Reg);
+  for (const MachineOperand &MO : Def->operands()) {
+    if (!MO.isReg() || !MO.isDef() || MO.getReg() != Reg)
+      continue;
+    unsigned UseOpIdx;
+    if (Def->isRegTiedToUseOperand(MO.getOperandNo(), &UseOpIdx))
+      return PendingTie{Def, MO.getOperandNo(), UseOpIdx};
+  }
+  return std::nullopt;
+}
+
+// Check projected tied results over their complete intervals. Existing tied
+// assignments are constraints, not alternative homes to project away.
+bool AMDGPUSSARegisterAllocator::tiedHomesAllowPlacement(Register Reg,
+                                                       MCRegister PR) {
+  SmallVector<std::pair<Register, MCRegister>, 4> Worklist{{Reg, PR}};
+  for (size_t I = 0; I != Worklist.size(); ++I) {
+    auto [Input, InputHome] = Worklist[I];
+    for (const MachineOperand &Use : MRI->use_nodbg_operands(Input)) {
+      if (!Use.isTied() || Use.isUndef())
+        continue;
+      const MachineInstr &MI = *Use.getParent();
+      const MachineOperand &Def =
+          MI.getOperand(MI.findTiedOperandIdx(Use.getOperandNo()));
+      Register Result = Def.getReg();
+      MCRegister Home = InputHome;
+      if (unsigned SubIdx = Use.getSubReg()) {
+        Home = TRI->getSubReg(Home, SubIdx);
+        assert(Home && "Invalid tied-use subreg index");
+      }
+      if (MCRegister Assigned = assignedHome(Result)) {
+        MCRegister DefHome = Def.getSubReg()
+            ? TRI->getSubReg(Assigned, Def.getSubReg()) : Assigned;
+        if (Home != DefHome)
+          return false;
+      }
+      const TargetRegisterClass *ResultRC = MRI->getRegClass(Result);
+      if (unsigned DefSubIdx = Def.getSubReg()) {
+        Home = TRI->getMatchingSuperReg(Home, DefSubIdx, ResultRC);
+        if (!Home)
+          return false;
+      } else if (!ResultRC->contains(Home)) {
+        return false;
+      }
+      std::pair<Register, MCRegister> Assignment{Result, Home};
+      if (llvm::is_contained(Worklist, Assignment))
+        continue;
+      auto Query = forestInterferences(Result, Home);
+      if (!Query.has_value())
+        report_fatal_error("SSARA tied placement has an invalid RF query");
+      if (Query->HasFixedInterference)
+        return false;
+      for (Register Owner : Query->VirtualOwners)
+        if (Owner != Result && hasAssignedTiedPartner(Owner))
+          return false;
+      Worklist.push_back(Assignment);
+    }
+  }
+  return true;
+}
+
 MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     const TargetRegisterClass *RC, const LiveInterval &VI,
     ArrayRef<MCRegister> Hints, uint64_t AttemptID) {
@@ -674,48 +737,8 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
     dbgs() << "\n";
   });
 
-  // A tied result can outlive its input. Check every inherited home over
-  // the result's complete live interval, including when placing a repair COPY.
-  // Ordinary virtual blockers can be evicted at the result; a blocker with an
-  // assigned tied partner must retain its home. Undef uses impose no constraint.
-  auto TiedHomesAllowPlacement = [&](MCRegister PR) {
-    SmallVector<std::pair<Register, MCRegister>, 4> Worklist{{VI.reg(), PR}};
-    for (size_t I = 0; I != Worklist.size(); ++I) {
-      auto [Input, InputHome] = Worklist[I];
-      for (const MachineOperand &Use : MRI->use_nodbg_operands(Input)) {
-        if (!Use.isTied() || Use.isUndef())
-          continue;
-        const MachineInstr &MI = *Use.getParent();
-        Register Result =
-            MI.getOperand(MI.findTiedOperandIdx(Use.getOperandNo())).getReg();
-        MCRegister Home = InputHome;
-        if (unsigned SubIdx = Use.getSubReg()) {
-          Home = TRI->getSubReg(Home, SubIdx);
-          assert(Home && "Invalid tied-use subreg index");
-        }
-        std::pair<Register, MCRegister> Assignment{Result, Home};
-        if (llvm::is_contained(Worklist, Assignment))
-          continue;
-        // A candidate in another register file may not satisfy this tied
-        // result's class. Reject that candidate before querying ownership.
-        if (!MRI->getRegClass(Result)->contains(Home))
-          return false;
-        auto Query = forestInterferences(Result, Home);
-        if (!Query.has_value())
-          report_fatal_error("SSARA tied placement has an invalid RF query");
-        if (Query->HasFixedInterference)
-          return false;
-        for (Register Owner : Query->VirtualOwners)
-          if (Owner != Result && hasAssignedTiedPartner(Owner))
-            return false;
-        Worklist.push_back(Assignment);
-      }
-    }
-    return true;
-  };
-
   auto IsFree = [&](MCRegister PR) {
-    return placementIsFree(VI.reg(), PR) && TiedHomesAllowPlacement(PR);
+    return placementIsFree(VI.reg(), PR) && tiedHomesAllowPlacement(VI.reg(), PR);
   };
 
   // PRESSURE-TARGETED AGPR PREFERENCE (unified targets). An av_ value can live in
@@ -812,10 +835,43 @@ MCRegister AMDGPUSSARegisterAllocator::pickFreePhysReg(
   return MCRegister();
 }
 
+AMDGPUSSARegisterAllocator::TiedPlacement
+AMDGPUSSARegisterAllocator::placeTiedDef(Register Reg) {
+  auto Tie = definingTie(Reg);
+  if (!Tie)
+    return {TiedPlacement::NotTied};
+
+  MachineOperand &Use = Tie->MI->getOperand(Tie->UseOpIdx);
+  if (Use.isUndef()) {
+    // No input value to preserve; ordinary placement may choose any home.
+    Use.setReg(Reg);
+    Use.setSubReg(Tie->MI->getOperand(Tie->DefOpIdx).getSubReg());
+    return {TiedPlacement::NotTied};
+  }
+
+  Register Input = Use.getReg();
+  MCRegister InputHome = Input.isPhysical()
+      ? Input.asMCReg() : assignedHome(Input);
+  if (!InputHome)
+    return {TiedPlacement::Deferred, Input};
+
+  if (MCRegister Home = prepareTiedDefHome(*Tie, InputHome)) {
+    commitColor(Reg, Home);
+    return {TiedPlacement::Assigned};
+  }
+  // A meaningful assigned input can fail inheritance only after its local
+  // repair COPY was created and queued by prepareTiedDefHome.
+  return {TiedPlacement::Deferred};
+}
+
 MCRegister AMDGPUSSARegisterAllocator::colorOneInPlace(Register R) {
   SSARA_TRACE();
   if (assignedHome(R))
     report_fatal_error("in-place coloring requires an uncolored owner");
+  TiedPlacement Placement = placeTiedDef(R);
+  if (Placement.State != TiedPlacement::NotTied)
+    return assignedHome(R);
+
   // Query the complete lane live ranges against the current RF assignments.
   const TargetRegisterClass *RC = MRI->getRegClass(R);
   const LiveInterval &RI = LIS->getInterval(R);
@@ -1750,6 +1806,14 @@ void AMDGPUSSARegisterAllocator::reportPointOverPressure(Register R,
 
 bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
   SSARA_TRACE();
+  TiedPlacement Placement = placeTiedDef(Failed);
+  if (Placement.State != TiedPlacement::NotTied) {
+    // Do not spill/rehome a deferred tied result independently. Transfer this
+    // work item to its input; a local repair COPY is already queued.
+    if (Placement.InputToRecover)
+      UncolorableVRegs.push_back(Placement.InputToRecover);
+    return true;
+  }
   // Each attempt advances from self rehome through one blocker snapshot to
   // prefix self-splitting. A blocker mutation never restarts this attempt.
   // The snapshot bounds this attempt, and explicit split copies consume the
@@ -2328,7 +2392,8 @@ void AMDGPUSSARegisterAllocator::preassignValuesLiveAcrossCalls() {
 
 MCRegister AMDGPUSSARegisterAllocator::prepareTiedDefHome(
     const PendingTie &Tie, MCRegister InputHome) {
-  assert(InputHome && "tied input must have a home before inheritance");
+  assert((InputHome || Tie.MI->getOperand(Tie.UseOpIdx).isUndef()) &&
+         "defined tied input must have a home before inheritance");
   MachineInstr &MI = *Tie.MI;
   MachineBasicBlock *MBB = MI.getParent();
   Register Reg = MI.getOperand(Tie.DefOpIdx).getReg();
@@ -2371,8 +2436,8 @@ MCRegister AMDGPUSSARegisterAllocator::prepareTiedDefHome(
                         << " for " << printReg(Result, TRI) << " -> "
                         << TRI->getName(Home) << "\n");
       unassignColor(Owner);
-      if (!llvm::is_contained(UncolorableVRegs, Owner))
-        UncolorableVRegs.push_back(Owner);
+      // Recovery may already have consumed this owner's previous entry.
+      UncolorableVRegs.push_back(Owner);
     }
   };
 
@@ -2397,7 +2462,8 @@ MCRegister AMDGPUSSARegisterAllocator::prepareTiedDefHome(
       Query->VirtualOwners, [&](Register Owner) {
         return hasAssignedTiedPartner(Owner);
       });
-  if (Query->HasFixedInterference || PreserveInput || PreserveBlockers) {
+  if (Query->HasFixedInterference || PreserveInput || PreserveBlockers ||
+      !tiedHomesAllowPlacement(Reg, Chosen)) {
     // Copy only this tied use when the input remains live or its inherited
     // home conflicts with fixed ownership or an existing tied assignment.
     // Keep that assignment intact; later unassigned ties do not
