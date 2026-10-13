@@ -1774,7 +1774,10 @@ void SIRegisterInfo::buildSpillLoadStore(
       Register Sub = IsSubReg
              ? Register(getSubReg(ValueReg, getSubRegFromChannel(Lane)))
              : ValueReg;
-      auto MIB = spillVGPRtoAGPR(ST, MBB, MI, Index, Lane, Sub, IsKill);
+      // The spill mapping is relative to the frame object, while Lane is
+      // relative to the register being saved or restored.
+      auto MIB = spillVGPRtoAGPR(ST, MBB, MI, Index, InstOffset / 4 + Lane,
+                                Sub, IsKill);
       if (!MIB.getInstr())
         break;
       if (NeedSuperRegDef || (IsSubReg && IsStore && Lane == LaneS && IsFirstSubReg)) {
