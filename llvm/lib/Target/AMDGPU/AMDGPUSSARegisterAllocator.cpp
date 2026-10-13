@@ -1588,7 +1588,8 @@ AMDGPUSSARegisterAllocator::tryCrossFileHome(Register R) {
     auto AcceptsHome = [&](const MachineOperand &MO) {
       const MachineInstr *MI = MO.getParent();
       if (MI->isPHI())
-        return true;
+        return TRI->getCommonSubClass(
+                   Home, MRI->getRegClass(MI->getOperand(0).getReg())) != nullptr;
       const TargetRegisterClass *OpRC =
           TII->getRegClass(MI->getDesc(), MO.getOperandNo(), TRI);
       return !OpRC || TRI->getCommonSubClass(Home, OpRC) != nullptr;
@@ -1603,14 +1604,12 @@ AMDGPUSSARegisterAllocator::tryCrossFileHome(Register R) {
       SplitDef = &MO;
     }
 
-    SmallVector<MachineOperand *, 8> NeedsCopy;
-    for (MachineOperand &MO : MRI->use_operands(V)) {
-      if (MO.getSubReg())
-        return false;
-      if (MO.getParent()->isPHI())
+    // Rehome only when every reading use accepts the other register file.
+    for (MachineOperand &MO : MRI->use_nodbg_operands(V)) {
+      if (!MO.readsReg())
         continue;
-      if (!AcceptsHome(MO))
-        NeedsCopy.push_back(&MO);
+      if (MO.getSubReg() || !AcceptsHome(MO))
+        return false;
     }
 
     std::optional<MachineBasicBlock::iterator> SplitDefInsert;
@@ -1644,23 +1643,6 @@ AMDGPUSSARegisterAllocator::tryCrossFileHome(Register R) {
           UncolorableVRegs.push_back(Tmp);
       }
 
-      for (MachineOperand *MO : NeedsCopy) {
-        MachineInstr *MI = MO->getParent();
-        Register Tmp = MRI->createVirtualRegister(SavedRC);
-        auto InsertPt = AMDGPURegAllocInsertion::legalBefore(
-            *MI->getParent(), MI->getIterator());
-        MachineInstr *Copy =
-            BuildMI(*MI->getParent(), InsertPt, MI->getDebugLoc(),
-                    TII->get(TargetOpcode::COPY), Tmp)
-                .addReg(V);
-        LIS->InsertMachineInstrInMaps(*Copy);
-        MO->setReg(Tmp);
-        LIS->createAndComputeVirtRegInterval(Tmp);
-        RescueCopies.insert(Tmp);
-        if (!colorOneInPlace(Tmp))
-          UncolorableVRegs.push_back(Tmp);
-      }
-
       LIS->removeInterval(V);
       LIS->createAndComputeVirtRegInterval(V);
     }
@@ -1672,8 +1654,7 @@ AMDGPUSSARegisterAllocator::tryCrossFileHome(Register R) {
     RehomedVRegs.insert(V);
     LLVM_DEBUG(dbgs() << "  [cross-file-home] " << printReg(V, TRI) << " -> "
                       << TRI->getName(assignedHome(V)) << " ("
-                      << (ToAGPR ? "VGPR->AGPR" : "AGPR->VGPR") << "), "
-                      << NeedsCopy.size() << " copies back\n");
+                      << (ToAGPR ? "VGPR->AGPR" : "AGPR->VGPR") << ")\n");
     if (SSAForensicReporter::enabled())
       Reporter->transformation(ToAGPR ? "cross-file-home-to-agpr"
                                       : "cross-file-home-to-vgpr",
