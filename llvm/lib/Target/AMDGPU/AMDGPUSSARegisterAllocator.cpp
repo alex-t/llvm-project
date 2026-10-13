@@ -3581,7 +3581,8 @@ void AMDGPUSSARegisterAllocator::rewriteOperands(MachineFunction &MF,
         // real use: LLVM models its defined lanes with subranges and may assign
         // unrelated values to the other lanes. The operand-level flag cannot
         // represent that partial state.
-        if (MO.isUse() && !MO.isUndef() && LIS->hasInterval(VReg)) {
+        if (!MI.isDebugInstr() && MO.isUse() && !MO.isUndef() &&
+            LIS->hasInterval(VReg)) {
           const LiveInterval &LI = LIS->getInterval(VReg);
           if (LI.hasSubRanges()) {
             SlotIndex UseIdx = LIS->getInstructionIndex(MI).getRegSlot();

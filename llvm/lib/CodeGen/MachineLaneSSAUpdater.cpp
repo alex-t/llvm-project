@@ -138,6 +138,10 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
   // Scope the rename map to one OrigVReg. The driver processes all defs of an
   // OrigVReg before moving on, so clearing on change is sufficient.
   if (RenameSessionOrig != OrigVReg) {
+    // Debug locations have no SlotIndex and cannot participate in reaching-value
+    // repair. Retire them before renaming definitions rather than retain stale
+    // references to the original register.
+    MRI.markUsesInDebugValueAsUndef(OrigVReg);
     RenameSessionOrig = OrigVReg;
     DefInstrToRenamed.clear();
     LanePHIs.clear();
@@ -152,7 +156,7 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
     // scan ITS operands for others reading the same reg; a group of >=2 is
     // coupling to restore in finalizeCoupledUses.
     CoupledUseGroups.clear();
-    for (MachineOperand &MO : MRI.use_operands(OrigVReg)) {
+    for (MachineOperand &MO : MRI.use_nodbg_operands(OrigVReg)) {
       MachineInstr *UMI = MO.getParent();
       if (UMI->isPHI())
         continue;
@@ -285,7 +289,7 @@ Register MachineLaneSSAUpdater::repairSSAForNewDef(
     if (!OrigLI.hasSubRanges()) {
       // Check if any uses now access OrigVReg with subregister indices
       bool HasSubregUses = false;
-      for (const MachineOperand &MO : MRI.use_operands(OrigVReg)) {
+      for (const MachineOperand &MO : MRI.use_nodbg_operands(OrigVReg)) {
         if (MO.getSubReg() != 0) {
           HasSubregUses = true;
           break;
@@ -714,7 +718,7 @@ void MachineLaneSSAUpdater::rewriteDominatedUses(Register OrigVReg,
 
   // Iterate through all uses of OrigVReg
   for (MachineOperand &MO :
-       llvm::make_early_inc_range(MRI.use_operands(OrigVReg))) {
+       llvm::make_early_inc_range(MRI.use_nodbg_operands(OrigVReg))) {
     MachineInstr *UseMI = MO.getParent();
 
     // Skip the defining instruction itself -- its reads are the OLD value
