@@ -18,6 +18,7 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_AMDGPUSSAREGISTERALLOCATOR_H
 #define LLVM_LIB_TARGET_AMDGPU_AMDGPUSSAREGISTERALLOCATOR_H
 
+#include "AMDGPUNextUseAnalysis.h"
 #include "SSAForensicReporter.h"
 #include "SSAPlacementProfile.h"
 #include "SSARegisterForestAdapter.h"
@@ -467,6 +468,7 @@ public:
     AU.addRequired<SlotIndexesWrapperPass>();
     AU.addRequired<MachineDominatorTreeWrapperPass>();
     AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.addRequired<AMDGPUNextUseAnalysisWrapper>();
     AU.addPreserved<MachineLoopInfoWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
   }

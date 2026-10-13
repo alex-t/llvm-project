@@ -469,6 +469,7 @@ INITIALIZE_PASS_DEPENDENCY(LiveIntervalsWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(SlotIndexesWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(AMDGPUNextUseAnalysisWrapper)
 INITIALIZE_PASS_END(AMDGPUSSARegisterAllocator, DEBUG_TYPE,
                     "AMDGPU SSA Register Allocator", false, false)
 
@@ -1879,16 +1880,40 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
       if (needsRecovery(Cur)) {
         // Rehoming did not place the principal. Spill eligible live-through
         // blockers from this snapshot until placement succeeds or it is exhausted.
-        // Count once per blocker; preserve collection order for equal counts.
-        SmallDenseMap<Register, unsigned, 16> UseCounts;
+        // Take a fresh ranking snapshot before any blocker spill. Keep this
+        // order for the attempt; do not query NUA after subsequent mutations.
+        auto &NU = getAnalysis<AMDGPUNextUseAnalysisWrapper>().getNU();
+        // FIXME: Whole-function NUA recomputation for each blocker-ranking
+        // attempt is a temporary workaround for stale analysis after recovery
+        // mutations. Replace it with incremental analysis maintenance.
+        NU.invalidate(MF);
+        MachineInstr *Query = MRI->getVRegDef(Cur);
+        struct SpillCost {
+          unsigned NextUse;
+          unsigned NumUses = 0;
+        };
+        SmallDenseMap<Register, SpillCost, 16> Costs;
         for (const auto &[B, OldHome] : Blockers) {
-          unsigned Count = llvm::count_if(
-              MRI->use_nodbg_operands(B),
-              [](const MachineOperand &MO) { return MO.readsReg(); });
-          UseCounts[B] = Count;
+          VRegMaskPair VMP(B, MRI->getMaxLaneMaskForVReg(B));
+          SpillCost Cost{NU.getNextUseDistance(Query->getIterator(), VMP)};
+          for (const MachineOperand &MO : MRI->use_nodbg_operands(B)) {
+            if (!MO.readsReg())
+              continue;
+            ++Cost.NumUses;
+          }
+          Costs.try_emplace(B, Cost);
+          DEBUG_WITH_TYPE("amdgpu-ssa-fsm-trace", dbgs()
+              << "spill-cost principal=" << printReg(Cur, TRI)
+              << " blocker=" << printReg(B, TRI)
+              << " nud=" << Cost.NextUse
+              << " uses=" << Cost.NumUses << "\n");
         }
         llvm::stable_sort(Blockers, [&](const auto &A, const auto &B) {
-          return UseCounts.lookup(A.first) < UseCounts.lookup(B.first);
+          const SpillCost &ACost = Costs.find(A.first)->second;
+          const SpillCost &BCost = Costs.find(B.first)->second;
+          if (ACost.NextUse != BCost.NextUse)
+            return ACost.NextUse > BCost.NextUse;
+          return ACost.NumUses < BCost.NumUses;
         });
         for (const auto &[B, OldHome] : Blockers) {
           if (!needsRecovery(Cur))

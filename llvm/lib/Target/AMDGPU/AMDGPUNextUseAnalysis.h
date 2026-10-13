@@ -417,6 +417,13 @@ private:
   }
 
 public:
+  // Recovery can change instructions and uses between ranking decisions.
+  // Discard the snapshot; the next query recomputes it from the current MIR.
+  void invalidate(const MachineFunction &Function) {
+    clear();
+    MF = &Function;
+  }
+
   NextUseResult() = default;
   NextUseResult(const MachineFunction &MF, SlotIndexes &SI, MachineLoopInfo &LI)
       : Indexes(&SI), MRI(&MF.getRegInfo()), LI(&LI) {
