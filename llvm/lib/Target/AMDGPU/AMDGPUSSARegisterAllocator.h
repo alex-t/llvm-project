@@ -155,6 +155,15 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // Whole-wave split transfers, lowered after physical-register rewriting.
   SmallVector<MachineInstr *, 16> RecoveryCopies;
 
+  // Only edges split by this allocator; original MIR blocks keep their EXEC
+  // semantics. Retained across the scalar and vector allocation stages.
+  struct SplitEdge {
+    MachineBasicBlock *Pred;
+    MachineBasicBlock *Block;
+    MachineInstr *MaskChange; // Original predecessor's EXEC-update boundary.
+  };
+  SmallVector<SplitEdge, 8> SplitEdges;
+
   // === Coloring ===
   void classifyVRegs();
   // On unified-file targets (gfx90a/gfx942: VALU reads/writes AGPRs directly),
@@ -419,6 +428,8 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // eliminateRegSequences), scoped to \p Only. Called per allocation stage.
   void rewriteStage(MachineFunction &MF, RegFile Only);
   // Finalize MachineFunction properties after both stages are physical.
+  MCRegister allocateTempSGPR(Register Scratch);
+  void guardSplitEdgeTransfers();
   void lowerRecoveryCopies(MachineFunction &MF);
   void finalizeAfterRewrite(MachineFunction &MF);
   void eliminateRedundantReloads(MachineFunction &MF);

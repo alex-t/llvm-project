@@ -8,6 +8,7 @@
 
 #include "AMDGPUSSARegisterAllocator.h"
 #include "AMDGPU.h"
+#include "AMDGPULaneMaskUtils.h"
 #include "AMDGPURegAllocInsertion.h"
 #include "GCNRegPressure.h"
 #include "GCNSubtarget.h"
@@ -147,7 +148,7 @@ bool AMDGPUSSARegisterAllocator::hasAssignedTiedPartner(Register VR) const {
 }
 
 void AMDGPUSSARegisterAllocator::initializeForests() {
-  assert(!Forests[0] && "coloring requires a fresh register forest");
+  assert(!Forests[0] && "function requires a fresh register forest");
   const TargetRegisterClass *Classes[] = {&AMDGPU::SGPR_32RegClass,
                                           &AMDGPU::VGPR_32RegClass,
                                           &AMDGPU::AGPR_32RegClass};
@@ -159,6 +160,37 @@ void AMDGPUSSARegisterAllocator::initializeForests() {
         *Forests[F], *TRI, *MRI,
         [this](const TargetRegisterClass *RC) { return availableOrder(RC); });
   }
+
+  // Seed input physical occupancy once, before allocation or rewriting.
+  // Subsequent assignments remain in RF across both allocation stages.
+  // Register-mask interference continues to be queried through LIS.
+  BitVector PhysicalRegistersToImport(TRI->getNumRegs());
+  for (const MachineBasicBlock &MBB : MRI->getMF()) {
+    for (const auto &LiveIn : MBB.liveins())
+      if (MRI->isAllocatable(LiveIn.PhysReg))
+        PhysicalRegistersToImport.set(LiveIn.PhysReg);
+    for (const MachineInstr &MI : MBB) {
+      if (MI.isDebugInstr())
+        continue;
+      for (const MachineOperand &MO : MI.operands()) {
+        if (MO.isReg() && MO.getReg().isPhysical() && MO.getReg() &&
+            MRI->isAllocatable(MO.getReg().asMCReg()))
+          PhysicalRegistersToImport.set(MO.getReg());
+        if (MO.isRegMask())
+          MRI->addPhysRegsUsedFromRegMask(MO.getRegMask());
+      }
+    }
+  }
+  std::array<SmallVector<MCPhysReg, 16>, 3> FixedByFile;
+  for (int R : PhysicalRegistersToImport.set_bits()) {
+    if (!adapterFor(MCRegister(R)))
+      report_fatal_error("unsupported fixed physical register");
+    RegFile File = poolOf(TRI->getPhysRegBaseClass(MCRegister(R)));
+    FixedByFile[static_cast<unsigned>(File)].push_back(R);
+  }
+  for (unsigned F = 0; F != Adapters.size(); ++F)
+    if (!Adapters[F]->assignFixed(FixedByFile[F], *LIS))
+      report_fatal_error("fixed physical ownership insertion failed");
 }
 
 RegisterForestAdapter *
@@ -408,8 +440,6 @@ AMDGPUSSARegisterAllocator::splitWithForest(
   RecoveryScopeTimer PhaseTimer("split-repair");
   const TargetRegisterClass *RC = MRI->getRegClass(VR);
   bool IsVector = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
-  if (IsVector && !MFI->getSGPRForEXECCopy())
-    return std::nullopt;
   Emitter->beginPass(IsVector);
   const unsigned FirstNewVReg = MRI->getNumVirtRegs();
   auto Result = Emitter->splitLiveRangeAt(
@@ -2537,7 +2567,7 @@ bool AMDGPUSSARegisterAllocator::resumePendingTies() {
 void AMDGPUSSARegisterAllocator::color() {
   RecoveryScopeTimer PhaseTimer("color");
   SSARA_TRACE();
-  initializeForests();
+  assert(Forests[0] && "function ownership must be initialized");
   // The vreg set may have moved since the earlier classification: recovery in
   // the preceding allocation stage can add reload values. Rebuild the width
   // tiers for this stage before anything consults them.
@@ -2569,36 +2599,6 @@ void AMDGPUSSARegisterAllocator::color() {
   // fragmenting alignment slots needed by wider tuples (e.g., a VGPR_32 at an
   // odd index blocking an even-aligned VReg_64 pair on gfx90a).
   //
-  // Discover concrete fixed operands once per epoch. The adapter imports
-  // their lane lifetimes; register-mask interference is queried through LIS.
-  BitVector PhysicalRegistersToImport(TRI->getNumRegs());
-  for (const MachineBasicBlock &MBB : MRI->getMF()) {
-    for (const auto &LiveIn : MBB.liveins())
-      if (MRI->isAllocatable(LiveIn.PhysReg))
-        PhysicalRegistersToImport.set(LiveIn.PhysReg);
-    for (const MachineInstr &MI : MBB) {
-      if (MI.isDebugInstr())
-        continue;
-      for (const MachineOperand &MO : MI.operands()) {
-        if (MO.isReg() && MO.getReg().isPhysical() && MO.getReg() &&
-            MRI->isAllocatable(MO.getReg().asMCReg()))
-          PhysicalRegistersToImport.set(MO.getReg());
-        if (MO.isRegMask())
-          MRI->addPhysRegsUsedFromRegMask(MO.getRegMask());
-      }
-    }
-  }
-  std::array<SmallVector<MCPhysReg, 16>, 3> FixedByFile;
-  for (int R : PhysicalRegistersToImport.set_bits()) {
-    if (!adapterFor(MCRegister(R)))
-      report_fatal_error("unsupported fixed physical register");
-    RegFile File = poolOf(TRI->getPhysRegBaseClass(MCRegister(R)));
-    FixedByFile[static_cast<unsigned>(File)].push_back(R);
-  }
-  for (unsigned F = 0; F != Adapters.size(); ++F)
-    if (!Adapters[F]->assignFixed(FixedByFile[F], *LIS))
-      report_fatal_error("fixed physical ownership insertion failed");
-
   // Give values crossing calls first choice of preserved homes.
   preassignValuesLiveAcrossCalls();
 
@@ -3009,6 +3009,20 @@ void AMDGPUSSARegisterAllocator::emitSwap(MachineBasicBlock &MBB,
     return;
   }
   SwapInChunks(4);
+}
+
+MCRegister AMDGPUSSARegisterAllocator::allocateTempSGPR(Register Scratch) {
+  // Completed-stage assignments and earlier temporaries still own their
+  // spans in RF. Do not reconstruct their occupancy from physical LIS caches.
+  LIS->createAndComputeVirtRegInterval(Scratch);
+  for (MCRegister PR : availableOrder(MRI->getRegClass(Scratch))) {
+    if (!placementIsFree(Scratch, PR))
+      continue;
+    commitColor(Scratch, PR);
+    MRI->replaceRegWith(Scratch, PR);
+    return PR;
+  }
+  report_fatal_error("SSARA EXEC guard has no free local SGPR scratch");
 }
 
 MCRegister AMDGPUSSARegisterAllocator::findLocalScratch(
@@ -3529,8 +3543,20 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
       LLVM_DEBUG(dbgs() << "  Splitting critical edge "
                         << printMBBReference(*Pred) << " -> "
                         << printMBBReference(MBB) << "\n");
+      // Capture the original PHI-source mask boundary before changing CFG.
+      // AMDGPU marks branch-mask updates as artificial terminators. Unlike
+      // branches, these instructions survive SplitCriticalEdge's branch repair.
+      MachineInstr *MaskChange = nullptr;
+      for (MachineInstr &Term : Pred->terminators())
+        if (Term.modifiesRegister(AMDGPU::EXEC, TRI)) {
+          MaskChange = &Term;
+          break;
+        }
       InsertMBB = Pred->SplitCriticalEdge(&MBB, *this);
       assert(InsertMBB && "Failed to split critical edge");
+      // Keep provenance across allocation stages: recovery may insert new
+      // transfers into this predecessor after its original PHIs are lowered.
+      SplitEdges.push_back({Pred, InsertMBB, MaskChange});
     }
 
     LLVM_DEBUG(dbgs() << "  Edge " << printMBBReference(*InsertMBB) << " -> "
@@ -3684,6 +3710,8 @@ void AMDGPUSSARegisterAllocator::addPhysRegLiveIns(MachineFunction &MF) {
   for (MachineBasicBlock &MBB : MF) {
     SlotIndex BBStart = LIS->getMBBStartIdx(&MBB);
     visitAssignments([&](Register VReg, MCRegister PhysReg) {
+      if (fileOf(MRI->getRegClass(VReg)) != StageFile)
+        return; // Earlier-stage live-ins were published at their rewrite.
       if (LIS->getInterval(VReg).liveAt(BBStart) && !MBB.isLiveIn(PhysReg))
         MBB.addLiveIn(PhysReg);
     });
@@ -3909,11 +3937,8 @@ void AMDGPUSSARegisterAllocator::rewriteStage(MachineFunction &MF,
   rewriteOperands(MF, Only);
   eliminateRegSequences(MF);
   eliminateIdentityCopies(MF);
-  // Add THIS stage's cross-block physreg live-ins now, while its RF ownership
-  // is still intact (the next stage clears RF ownership). addPhysRegLiveIns
-  // reads RF ownership + LIS, so a single end-of-run call would miss the
-  // earlier stage's entries. It only ADDS (sortUniqueLiveIns), so running per
-  // stage is safe.
+  // Publish this stage's physical live-ins before the next stage sees its
+  // rewritten operands. RF ownership remains intact across the transition.
   addPhysRegLiveIns(MF);
 }
 
@@ -4100,17 +4125,83 @@ void AMDGPUSSARegisterAllocator::eliminateRedundantReloads(MachineFunction &MF) 
                     << "\n");
 }
 
+void AMDGPUSSARegisterAllocator::guardSplitEdgeTransfers() {
+  const auto &LMC = AMDGPU::LaneMaskConstants::get(*ST);
+  for (const SplitEdge &Edge : SplitEdges) {
+    if (!Edge.MaskChange)
+      continue;
+    MachineBasicBlock &MBB = *Edge.Block;
+    auto Begin = AMDGPURegAllocInsertion::bodyBegin(MBB);
+    auto End = AMDGPURegAllocInsertion::bodyEnd(MBB);
+    bool NeedsExec = false;
+    for (auto I = Begin; I != End; ++I)
+      NeedsExec |= TII->mayReadEXEC(*MRI, *I);
+    if (!NeedsExec)
+      continue;
+
+    Register SavedExec =
+        MRI->createVirtualRegister(TRI->getWaveMaskRegClass());
+    // Save in the original predecessor, before its recorded mask update.
+    auto SavePt = Edge.MaskChange->getIterator();
+    MachineInstr *Save =
+        BuildMI(*Edge.Pred, SavePt, DebugLoc(), TII->get(LMC.MovOpc), SavedExec)
+            .addReg(LMC.ExecReg);
+    LIS->InsertMachineInstrInMaps(*Save);
+
+    // Query after all predecessor instructions: an SCC use by its branch
+    // alone does not make SCC live out. Preserve only the outgoing value.
+    Register SavedSCC;
+    if (Edge.Pred->computeRegisterLiveness(TRI, AMDGPU::SCC,
+                                          Edge.Pred->end()) ==
+        MachineBasicBlock::LQR_Live) {
+      SavedSCC = MRI->createVirtualRegister(&AMDGPU::SReg_32RegClass);
+      MBB.addLiveIn(AMDGPU::SCC);
+      MachineInstr *SaveCC =
+          BuildMI(MBB, Begin, DebugLoc(), TII->get(AMDGPU::S_CSELECT_B32),
+                  SavedSCC)
+              .addImm(1)
+              .addImm(0);
+      LIS->InsertMachineInstrInMaps(*SaveCC);
+    }
+
+    // Both boundaries enclose every transfer already inserted into the block,
+    // including reloads for PHIs created by SSA repair in the later stage.
+    for (auto InsertPt : {Begin, End})
+      for (Register Dst : {LMC.ExecReg, SavedExec, LMC.ExecReg}) {
+        MachineInstr *Xor =
+            BuildMI(MBB, InsertPt, DebugLoc(), TII->get(LMC.XorOpc), Dst)
+                .addReg(LMC.ExecReg)
+                .addReg(SavedExec);
+        Xor->addRegisterDead(AMDGPU::SCC, TRI);
+        LIS->InsertMachineInstrInMaps(*Xor);
+      }
+
+    if (SavedSCC) {
+      MachineInstr *RestoreCC =
+          BuildMI(MBB, End, DebugLoc(), TII->get(AMDGPU::S_CMP_LG_U32))
+              .addReg(SavedSCC, RegState::Kill)
+              .addImm(0);
+      LIS->InsertMachineInstrInMaps(*RestoreCC);
+    }
+    MBB.addLiveIn(allocateTempSGPR(SavedExec));
+    MBB.sortUniqueLiveIns();
+    if (SavedSCC)
+      allocateTempSGPR(SavedSCC);
+  }
+  SplitEdges.clear();
+}
+
 void AMDGPUSSARegisterAllocator::lowerRecoveryCopies(MachineFunction &MF) {
-  Register SavedExec = MFI->getSGPRForEXECCopy();
   for (MachineInstr *Copy : RecoveryCopies) {
-    assert(SavedExec && "vector split transfer requires EXEC scratch");
     MachineBasicBlock &MBB = *Copy->getParent();
-    // Physical liveness has not been rebuilt after operand rewriting. Preserve
-    // SCC unconditionally using the scratch SGPR reserved before allocation.
+    Register SavedExec =
+        MRI->createVirtualRegister(TRI->getWaveMaskRegClass());
+    // Preserve SCC independently of the vector transfer's lane mask.
     TII->insertScratchExecCopy(MF, MBB, Copy->getIterator(), Copy->getDebugLoc(),
                               SavedExec, /*IsSCCLive=*/true, Indexes);
     TII->restoreExec(MF, MBB, std::next(Copy->getIterator()), Copy->getDebugLoc(),
                     SavedExec, Indexes);
+    allocateTempSGPR(SavedExec);
     MCRegister Dst = Copy->getOperand(0).getReg().asMCReg();
     const TargetRegisterClass *RC = TRI->getPhysRegBaseClass(Dst);
     unsigned Bits = TRI->getRegSizeInBits(*RC);
@@ -4129,7 +4220,9 @@ void AMDGPUSSARegisterAllocator::lowerRecoveryCopies(MachineFunction &MF) {
 
 void AMDGPUSSARegisterAllocator::finalizeAfterRewrite(MachineFunction &MF) {
   SSARA_TRACE();
-  // Run ONCE after both files are physical.
+  // Guard the complete edge body after both stages have finished adding
+  // transfers. Per-copy WWM guards nest inside it and restore its mask.
+  guardSplitEdgeTransfers();
   lowerRecoveryCopies(MF);
   if (EliminatePostColorReloads)
     eliminateRedundantReloads(MF);
@@ -4161,6 +4254,7 @@ static unsigned countCalleeSavedSGPRLanes(MachineFunction &MF) {
 bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   RecoveryTimings.clear();
   RecoveryCopies.clear();
+  SplitEdges.clear();
   RecoveryScopeTimer AllocatorTimer("allocator-total");
   SSARA_TRACE();
   TRI =
@@ -4236,6 +4330,10 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // consume the whole file. Each stage colors, recovers, and rewrites ONLY its
   // file's vregs (StageFile filters color()/recovery/rewriteStage);
   // the files are disjoint register sets, so this only reorders within a file.
+  MaxVGPRIdx = 0;
+  MaxSGPRIdx = 0;
+  MaxAGPRIdx = 0;
+  initializeForests();
   Emitter->clearSGPRSpillLanes();
   for (RegFile Stage : {RegFile::SGPR, RegFile::VGPR}) {
     StageFile = Stage;
@@ -4250,10 +4348,6 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   // either of them.
   StrideCache.clear();
 
-  clearColors();
-  MaxVGPRIdx = 0;
-  MaxSGPRIdx = 0;
-  MaxAGPRIdx = 0;
   UncolorableVRegs.clear();
   // Reset recovery bookkeeping at the start of this allocation stage.
   RescueCopies.clear();
@@ -4301,13 +4395,15 @@ bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
     // the loop.
 
     rewriteStage(MF, StageFile);
-    clearColors();
+    // Rewriting materializes an assignment; it does not free its storage.
+    // Keep ownership for the next stage and final temporary allocation.
   } // end of the two allocation stages
 
   // E17 RunCompleted: flush this function's record to the configured sinks.
   Reporter->endRun(UncolorableVRegs.size());
 
   finalizeAfterRewrite(MF);
+  clearColors();
 
   AllocatorTimer.finish();
   if (EnableRecoveryTiming)
