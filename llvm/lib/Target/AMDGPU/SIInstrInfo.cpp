@@ -62,6 +62,141 @@ static cl::opt<bool> Fix16BitCopies(
   cl::init(true),
   cl::ReallyHidden);
 
+/// If \p MI is a copy from exec, return the register copied to.
+Register SIInstrInfo::isCopyFromExec(const MachineInstr &MI) const {
+  const auto &LMC = AMDGPU::LaneMaskConstants::get(ST);
+  switch (MI.getOpcode()) {
+  case AMDGPU::COPY:
+  case AMDGPU::S_MOV_B64:
+  case AMDGPU::S_MOV_B64_term:
+  case AMDGPU::S_MOV_B32:
+  case AMDGPU::S_MOV_B32_term: {
+    const MachineOperand &Src = MI.getOperand(1);
+    if (Src.isReg() && Src.getReg() == LMC.ExecReg)
+      return MI.getOperand(0).getReg();
+  }
+  }
+
+  return AMDGPU::NoRegister;
+}
+
+bool SIInstrInfo::isSaveExec(const MachineInstr &MI) {
+  switch (MI.getOpcode()) {
+  case AMDGPU::S_AND_SAVEEXEC_B32:
+  case AMDGPU::S_AND_SAVEEXEC_B64:
+  case AMDGPU::S_OR_SAVEEXEC_B32:
+  case AMDGPU::S_OR_SAVEEXEC_B64:
+  case AMDGPU::S_XOR_SAVEEXEC_B32:
+  case AMDGPU::S_XOR_SAVEEXEC_B64:
+  case AMDGPU::S_ANDN2_SAVEEXEC_B32:
+  case AMDGPU::S_ANDN2_SAVEEXEC_B64:
+  case AMDGPU::S_ORN2_SAVEEXEC_B32:
+  case AMDGPU::S_ORN2_SAVEEXEC_B64:
+  case AMDGPU::S_NAND_SAVEEXEC_B32:
+  case AMDGPU::S_NAND_SAVEEXEC_B64:
+  case AMDGPU::S_NOR_SAVEEXEC_B32:
+  case AMDGPU::S_NOR_SAVEEXEC_B64:
+  case AMDGPU::S_XNOR_SAVEEXEC_B32:
+  case AMDGPU::S_XNOR_SAVEEXEC_B64:
+  case AMDGPU::S_ANDN1_SAVEEXEC_B32:
+  case AMDGPU::S_ANDN1_SAVEEXEC_B64:
+  case AMDGPU::S_ORN1_SAVEEXEC_B32:
+  case AMDGPU::S_ORN1_SAVEEXEC_B64:
+  case AMDGPU::S_AND_SAVEEXEC_B32_term:
+  case AMDGPU::S_AND_SAVEEXEC_B64_term:
+    return true;
+  default:
+    return false;
+  }
+}
+
+const MachineInstr *
+SIInstrInfo::findSavedExecBefore(const MachineInstr &MaskChange) const {
+  const auto &LMC = AMDGPU::LaneMaskConstants::get(ST);
+  bool BeforeChange = false;
+  for (const MachineInstr &MI : llvm::reverse(*MaskChange.getParent())) {
+    if (MI.isDebugInstr())
+      continue;
+    if (&MI == &MaskChange) {
+      if (isSaveExec(MI))
+        return &MI;
+      BeforeChange = true;
+      continue;
+    }
+    // Ignore the suffix after the requested mask-change boundary.
+    if (!BeforeChange)
+      continue;
+    Register Copy = isCopyFromExec(MI);
+    if (Copy)
+      return &MI;
+    // COPY's implicit EXEC def constrains scheduling; it does not change EXEC.
+    // A real intervening update means an older save holds a different mask.
+    if (!Copy && MI.modifiesRegister(LMC.ExecReg, &RI))
+      break;
+  }
+  return nullptr;
+}
+
+const MachineInstr *SIInstrInfo::findExecComplementBefore(
+    const MachineInstr &MaskChange, const MachineInstr &Save) const {
+  const auto &LMC = AMDGPU::LaneMaskConstants::get(ST);
+  Register Original = isCopyFromExec(Save);
+  if (!Original || Save.getParent() != MaskChange.getParent())
+    return nullptr;
+  // Recognize the lowered mask installation, EXEC = Active.
+  if (MaskChange.getOpcode() != LMC.MovOpc &&
+      MaskChange.getOpcode() != LMC.MovTermOpc && !MaskChange.isCopy())
+    return nullptr;
+  const MachineOperand &Src = MaskChange.getOperand(1);
+  if (MaskChange.getOperand(0).getReg() != LMC.ExecReg ||
+      !Src.isReg() || !Src.readsReg() || Src.getSubReg())
+    return nullptr;
+  Register Active = Src.getReg();
+  const MachineInstr *Complement = nullptr;
+  Register Result;
+  for (const MachineInstr *MI = Save.getNextNode(); MI != &MaskChange;
+       MI = MI->getNextNode()) {
+    if (!MI)
+      return nullptr;
+    if (MI->isDebugInstr())
+      continue;
+    if (!Complement && MI->getOpcode() == LMC.XorOpc) {
+      const MachineOperand &A = MI->getOperand(1);
+      const MachineOperand &B = MI->getOperand(2);
+      if (A.isReg() && B.isReg() && A.readsReg() && B.readsReg() &&
+          !A.getSubReg() && !B.getSubReg() &&
+          ((A.getReg() == Original && B.getReg() == Active) ||
+           (B.getReg() == Original && A.getReg() == Active))) {
+        Result = MI->getOperand(0).getReg();
+        if (!Result.isPhysical() ||
+            !RI.getWaveMaskRegClass()->contains(Result) ||
+            MI->modifiesRegister(Active, &RI))
+          return nullptr;
+        Complement = MI;
+        continue;
+      }
+    }
+    if ((!Complement && MI->modifiesRegister(Original, &RI)) ||
+        (Complement && (MI->modifiesRegister(Result, &RI) ||
+                        MI->modifiesRegister(Active, &RI))))
+      return nullptr;
+  }
+  if (!Complement)
+    return nullptr;
+  // At the split edge, EXEC must still be Active and Result must still be
+  // Original XOR Active. Neither the branch suffix nor the split body may
+  // invalidate the identity; the caller checks the split body and RF lifetime.
+  for (const MachineInstr *MI = MaskChange.getNextNode(); MI;
+       MI = MI->getNextNode()) {
+    if (MI->isDebugInstr())
+      continue;
+    if (MI->modifiesRegister(LMC.ExecReg, &RI) ||
+        MI->modifiesRegister(Result, &RI))
+      return nullptr;
+  }
+  return Complement;
+}
+
 SIInstrInfo::SIInstrInfo(const GCNSubtarget &ST)
     : AMDGPUGenInstrInfo(ST, AMDGPU::ADJCALLSTACKUP, AMDGPU::ADJCALLSTACKDOWN),
       RI(ST), ST(ST) {

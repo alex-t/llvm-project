@@ -45,7 +45,6 @@ private:
   SmallVector<std::pair<MachineInstr *, MachineInstr *>, 1> OrXors;
   SmallVector<MachineOperand *, 1> KillFlagCandidates;
 
-  Register isCopyFromExec(const MachineInstr &MI) const;
   Register isCopyToExec(const MachineInstr &MI) const;
   bool removeTerminatorBit(MachineInstr &MI) const;
   MachineBasicBlock::reverse_iterator
@@ -116,23 +115,6 @@ INITIALIZE_PASS_END(SIOptimizeExecMaskingLegacy, DEBUG_TYPE,
 char SIOptimizeExecMaskingLegacy::ID = 0;
 
 char &llvm::SIOptimizeExecMaskingLegacyID = SIOptimizeExecMaskingLegacy::ID;
-
-/// If \p MI is a copy from exec, return the register copied to.
-Register SIOptimizeExecMasking::isCopyFromExec(const MachineInstr &MI) const {
-  switch (MI.getOpcode()) {
-  case AMDGPU::COPY:
-  case AMDGPU::S_MOV_B64:
-  case AMDGPU::S_MOV_B64_term:
-  case AMDGPU::S_MOV_B32:
-  case AMDGPU::S_MOV_B32_term: {
-    const MachineOperand &Src = MI.getOperand(1);
-    if (Src.isReg() && Src.getReg() == LMC.ExecReg)
-      return MI.getOperand(0).getReg();
-  }
-  }
-
-  return AMDGPU::NoRegister;
-}
 
 /// If \p MI is a copy to exec, return the register copied from.
 Register SIOptimizeExecMasking::isCopyToExec(const MachineInstr &MI) const {
@@ -330,7 +312,7 @@ MachineBasicBlock::reverse_iterator SIOptimizeExecMasking::findExecCopy(
 
   auto E = MBB.rend();
   for (unsigned N = 0; N <= InstLimit && I != E; ++I, ++N) {
-    Register CopyFromExec = isCopyFromExec(*I);
+    Register CopyFromExec = TII->isCopyFromExec(*I);
     if (CopyFromExec.isValid())
       return I;
   }

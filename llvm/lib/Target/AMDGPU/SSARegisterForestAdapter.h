@@ -68,6 +68,14 @@ public:
     SlotIndex End;
   };
 
+  /// Extend an existing whole-register owner over Required, atomically.
+  /// Preserve existing coverage; reject other owners, partial-register records,
+  /// and register-mask clobbers. Only newly covered regions are inserted.
+  /// This late physical-lifetime operation updates RF, not virtual LIS.
+  bool extendWholeRegister(
+      Register VR, MCRegister PR,
+      ArrayRef<std::pair<SlotIndex, SlotIndex>> Required, LiveIntervals &LIS);
+
   bool isFree(MCRegister PR, SlotIndex Start, SlotIndex End) const;
   /// Visit stored ownership components interfering with PR over [Start, End).
   /// Mapping stays private; callbacks receive complete stored intervals and

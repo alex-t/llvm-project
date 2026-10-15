@@ -4224,19 +4224,79 @@ void AMDGPUSSARegisterAllocator::guardSplitEdgeTransfers() {
     if (!NeedsExec)
       continue;
 
-    Register SavedExec =
-        MRI->createVirtualRegister(TRI->getWaveMaskRegClass());
-    // Save in the original predecessor, before its recorded mask update.
-    auto SavePt = Edge.MaskChange->getIterator();
-    MachineInstr *Save =
-        BuildMI(*Edge.Pred, SavePt, DebugLoc(), TII->get(LMC.MovOpc), SavedExec)
-            .addReg(LMC.ExecReg);
-    LIS->InsertMachineInstrInMaps(*Save);
+    // Establish the edge mask from the repaired branch, not from layout alone.
+    MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+    SmallVector<MachineOperand, 2> Cond;
+    bool ZeroExec = false;
+    if (!TII->analyzeBranch(*Edge.Pred, TBB, FBB, Cond) && Cond.size() == 2) {
+      if (!FBB)
+        FBB = Edge.Pred->getNextNode();
+      ZeroExec =
+          (Cond[0].getImm() == SIInstrInfo::EXECZ && TBB == &MBB) ||
+          (Cond[0].getImm() == SIInstrInfo::EXECNZ && FBB == &MBB && TBB != &MBB);
+    }
+
+    MCRegister ReusedExec;
+    bool ReusedComplement = false;
+    if (const MachineInstr *Save = TII->findSavedExecBefore(*Edge.MaskChange)) {
+      const MachineInstr *Complement =
+          TII->findExecComplementBefore(*Edge.MaskChange, *Save);
+      if (Complement)
+        Save = Complement;
+      Register R = Save->getOperand(0).getReg();
+      if (R.isPhysical() && TRI->getWaveMaskRegClass()->contains(R)) {
+        // A complementary mask stays unchanged through the two EXEC XORs.
+        // A direct save is overwritten by the general swap sequence.
+        bool CanBorrow = true;
+        for (auto I = Begin; I != End; ++I)
+          if (I->modifiesRegister(R, TRI) ||
+              (!ZeroExec && !Complement && I->readsRegister(R, TRI))) {
+            CanBorrow = false;
+            break;
+          }
+
+        if (CanBorrow) {
+          auto *Adapter = adapterFor(R);
+          SlotIndex SavedAt = LIS->getInstructionIndex(*Save).getRegSlot();
+          Register Owner;
+          bool ValidOwner = true;
+          if (Adapter && Adapter->visitInterferences(
+                  R, SavedAt, SavedAt.getNextSlot(),
+                  [&](const SSARegisterForest::Ownership &O) {
+                    if (!O.Owner.isVirtual() || assignedHome(O.Owner) != R.asMCReg() ||
+                        (Owner && Owner != O.Owner))
+                      ValidOwner = false;
+                    else
+                      Owner = O.Owner;
+                  }) && ValidOwner && Owner) {
+            const std::pair<SlotIndex, SlotIndex> Required[] = {
+                {SavedAt, LIS->getMBBEndIdx(Edge.Pred)},
+                {LIS->getMBBStartIdx(&MBB), LIS->getMBBEndIdx(&MBB)}};
+            // Install both extensions before emitting guards or allocating
+            // another scratch. Failure leaves every existing owner untouched.
+            if (Adapter->extendWholeRegister(Owner, R, Required, *LIS)) {
+              ReusedExec = R.asMCReg();
+              ReusedComplement = Complement != nullptr;
+            }
+          }
+        }
+      }
+    }
+
+    Register SavedExec = ReusedExec;
+    if (!SavedExec) {
+      SavedExec = MRI->createVirtualRegister(TRI->getWaveMaskRegClass());
+      // No reusable saved mask: retain the existing scratch path.
+      MachineInstr *Save =
+          BuildMI(*Edge.Pred, Edge.MaskChange->getIterator(), DebugLoc(),
+                  TII->get(LMC.MovOpc), SavedExec).addReg(LMC.ExecReg);
+      LIS->InsertMachineInstrInMaps(*Save);
+    }
 
     // Query after all predecessor instructions: an SCC use by its branch
     // alone does not make SCC live out. Preserve only the outgoing value.
     Register SavedSCC;
-    if (Edge.Pred->computeRegisterLiveness(TRI, AMDGPU::SCC,
+    if (!ZeroExec && Edge.Pred->computeRegisterLiveness(TRI, AMDGPU::SCC,
                                           Edge.Pred->end()) ==
         MachineBasicBlock::LQR_Live) {
       SavedSCC = MRI->createVirtualRegister(&AMDGPU::SReg_32RegClass);
@@ -4251,15 +4311,37 @@ void AMDGPUSSARegisterAllocator::guardSplitEdgeTransfers() {
 
     // Both boundaries enclose every transfer already inserted into the block,
     // including reloads for PHIs created by SSA repair in the later stage.
-    for (auto InsertPt : {Begin, End})
-      for (Register Dst : {LMC.ExecReg, SavedExec, LMC.ExecReg}) {
+    if (ZeroExec) {
+      // The saved mask remains intact, and MOV does not clobber SCC.
+      LIS->InsertMachineInstrInMaps(
+          *BuildMI(MBB, Begin, DebugLoc(), TII->get(LMC.MovOpc), LMC.ExecReg)
+               .addReg(SavedExec));
+      LIS->InsertMachineInstrInMaps(
+          *BuildMI(MBB, End, DebugLoc(), TII->get(LMC.MovOpc), LMC.ExecReg)
+               .addImm(0));
+    } else if (ReusedComplement) {
+      // C = Original XOR Active, so Active XOR C restores Original.
+      // The same XOR after the transfers restores Active without changing C.
+      for (auto InsertPt : {Begin, End}) {
         MachineInstr *Xor =
-            BuildMI(MBB, InsertPt, DebugLoc(), TII->get(LMC.XorOpc), Dst)
+            BuildMI(MBB, InsertPt, DebugLoc(), TII->get(LMC.XorOpc), LMC.ExecReg)
                 .addReg(LMC.ExecReg)
                 .addReg(SavedExec);
         Xor->addRegisterDead(AMDGPU::SCC, TRI);
         LIS->InsertMachineInstrInMaps(*Xor);
       }
+    } else {
+      // Swap twice: both EXEC and the borrowed register regain their values.
+      for (auto InsertPt : {Begin, End})
+        for (Register Dst : {LMC.ExecReg, SavedExec, LMC.ExecReg}) {
+          MachineInstr *Xor =
+              BuildMI(MBB, InsertPt, DebugLoc(), TII->get(LMC.XorOpc), Dst)
+                  .addReg(LMC.ExecReg)
+                  .addReg(SavedExec);
+          Xor->addRegisterDead(AMDGPU::SCC, TRI);
+          LIS->InsertMachineInstrInMaps(*Xor);
+        }
+    }
 
     if (SavedSCC) {
       MachineInstr *RestoreCC =
@@ -4268,10 +4350,12 @@ void AMDGPUSSARegisterAllocator::guardSplitEdgeTransfers() {
               .addImm(0);
       LIS->InsertMachineInstrInMaps(*RestoreCC);
     }
-    MBB.addLiveIn(allocateTempSGPR(SavedExec));
+    MBB.addLiveIn(ReusedExec ? ReusedExec : allocateTempSGPR(SavedExec));
     MBB.sortUniqueLiveIns();
     if (SavedSCC)
       allocateTempSGPR(SavedSCC);
+    recomputeLivenessFlags(*Edge.Pred);
+    recomputeLivenessFlags(MBB);
   }
   SplitEdges.clear();
 }

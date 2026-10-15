@@ -94,6 +94,7 @@ private:
   TargetSchedModel SchedModel;
   mutable std::unique_ptr<AMDGPUMIRFormatter> Formatter;
 
+public:
   // The inverse predicate should have the negative value.
   enum BranchPredicate {
     INVALID_BR = 0,
@@ -105,6 +106,7 @@ private:
     EXECZ = 3
   };
 
+private:
   using SetVectorType = SmallSetVector<MachineInstr *, 32>;
 
   static unsigned getBranchOpcode(BranchPredicate Cond);
@@ -188,6 +190,7 @@ private:
   bool verifyCopy(const MachineInstr &MI, const MachineRegisterInfo &MRI,
                   StringRef &ErrInfo) const;
 
+
   bool resultDependsOnExec(const MachineInstr &MI) const;
 
 protected:
@@ -207,6 +210,22 @@ protected:
                                        unsigned OpIdx1) const override;
 
 public:
+  /// Return the destination of a COPY or scalar MOV from EXEC, or NoRegister.
+  Register isCopyFromExec(const MachineInstr &MI) const;
+
+  /// Whether the instruction saves incoming EXEC in its explicit destination.
+  static bool isSaveExec(const MachineInstr &MI);
+
+  /// Find the nearest local save of EXEC's value before MaskChange.
+  /// The caller must validate and reserve its destination's extended lifetime.
+  const MachineInstr *findSavedExecBefore(const MachineInstr &MaskChange) const;
+
+  /// Find Original XOR Active, where Save copies incoming EXEC and
+  /// MaskChange installs Active into EXEC. The result survives to the edge.
+  const MachineInstr *findExecComplementBefore(
+      const MachineInstr &MaskChange, const MachineInstr &Save) const;
+
+
   enum TargetOperandFlags {
     MO_MASK = 0xf,
 

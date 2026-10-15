@@ -100,6 +100,53 @@ RegisterForestAdapter::physicalSpan(MCRegister PR) const {
   return {FirstPhysicalLeaf, FirstPhysicalLeaf + Width};
 }
 
+bool RegisterForestAdapter::extendWholeRegister(
+    Register VR, MCRegister PR,
+    ArrayRef<std::pair<SlotIndex, SlotIndex>> Required, LiveIntervals &LIS) {
+  if (!VR.isVirtual() || assignedHome(VR) != PR)
+    return false;
+  auto Whole = physicalSpan(PR);
+  Regions Additions;
+  LiveInterval Probe(VR, 0);
+  VNInfo *Value = nullptr;
+  for (const auto &Range : Required) {
+    SlotIndex Start = Range.first;
+    SlotIndex End = Range.second;
+    if (!Start.isValid() || !End.isValid() || !(Start < End))
+      return false;
+    if (!Value)
+      Value = Probe.getNextValue(Start, LIS.getVNInfoAllocator());
+    Probe.addSegment(LiveRange::Segment(Start, End, Value));
+
+    SmallVector<std::pair<SlotIndex, SlotIndex>, 4> Covered;
+    bool Conflict = false;
+    if (!visitInterferences(PR, Start, End,
+                            [&](const SSARegisterForest::Ownership &O) {
+          if (O.Owner != VR || !(O.Span == Whole)) {
+            Conflict = true;
+            return;
+          }
+          Covered.emplace_back(std::max(Start, O.Start), std::min(End, O.End));
+        }) || Conflict)
+      return false;
+
+    // A composite RF record can be visited more than once. Sorting and taking
+    // the union also handles those duplicates without inserting self-overlaps.
+    llvm::sort(Covered);
+    SlotIndex Cursor = Start;
+    for (const auto &[Begin, Finish] : Covered) {
+      if (Cursor < Begin)
+        Additions.push_back({Whole, Cursor, Begin});
+      Cursor = std::max(Cursor, Finish);
+    }
+    if (Cursor < End)
+      Additions.push_back({Whole, Cursor, End});
+  }
+  if (hasRegMaskInterference(PR, Probe, LIS))
+    return false;
+  return Forest.assign(VR, PR, Additions);
+}
+
 bool RegisterForestAdapter::isFree(MCRegister PR, SlotIndex Start,
                                    SlotIndex End) const {
   return Forest.isFree(physicalSpan(PR), Start, End);
