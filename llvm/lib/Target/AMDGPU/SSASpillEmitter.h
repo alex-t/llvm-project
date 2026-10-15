@@ -146,6 +146,10 @@ private:
   int createSpillSlot(const TargetRegisterClass *RC);
   RepairResult emitReloadsAndRepairSSA(VRegMaskPair SpilledVMP, SlotIndex KillIdx,
                                        LivenessCallback OnChange);
+  RepairResult emitReloadsAndRepairSSA(VRegMaskPair SpilledVMP,
+                                       ArrayRef<MachineInstr *> Uses,
+                                       ArrayRef<MachineInstr *> PhiUses,
+                                       LivenessCallback OnChange);
   std::pair<Register, MachineInstr *>
   getOrCreateReloadInBlock(MachineBasicBlock *BB, VRegMaskPair SpilledVMP,
                            MachineInstr *InsertBefore = nullptr,

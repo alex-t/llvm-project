@@ -253,6 +253,7 @@ SSASpillEmitter::spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange) {
   // ran in the RA (closePhiWeb + webReloadFeasible); this is pure mechanics over an
   // already-closed, sound, feasible web — it cannot fail.
   assert(Web.valid() && "spillPhiWeb requires a closed, sound web");
+  const unsigned FirstNewVReg = MRI->getNumVirtRegs();
   Register PhiResult = Web.Root;
   const auto &PhiMembers = Web.PhiMembers;
   const auto &GroundOps = Web.GroundOps;
@@ -270,16 +271,27 @@ SSASpillEmitter::spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange) {
                     << " web=" << PhiMembers.size() << " PHIs, "
                     << GroundOps.size() << " ground ops\n");
 
-  // --- 2. Collect the members that have an EXTERNAL use (non-web-edge). Internal
-  // edges (a member feeding another web PHI) vanish when the PHIs are erased. ---
-  auto isInternalEdge = [&](MachineInstr &U) {
-    return U.isPHI() && PhiMembers.count(U.getOperand(0).getReg());
+  // Freeze every member's external-use list before stores or SSA repair can
+  // change operands. Membership is that of the original closed web.
+  struct MemberReloads {
+    Register Member;
+    SmallVector<MachineInstr *, 8> Uses;
+    SmallVector<MachineInstr *, 4> PhiUses;
   };
-  SmallSetVector<Register, 32> MembersWithExtUse;
-  for (Register M : PhiMembers)
-    for (MachineInstr &U : MRI->reg_nodbg_instructions(M))
-      if (U.readsVirtualRegister(M) && !isInternalEdge(U))
-        MembersWithExtUse.insert(M);
+  SmallVector<MemberReloads, 8> ReloadPlans;
+  for (Register M : PhiMembers) {
+    MachineInstr *Def = MRI->getUniqueVRegDef(M);
+    assert(Def && Def->isPHI() && "closed web member must have a PHI def");
+    MemberReloads Plan{M, {}, {}};
+    collectReloadUses(VRegMaskPair(M, MRI->getMaxLaneMaskForVReg(M)),
+                      LIS->getInstructionIndex(*Def).getRegSlot(), Plan.Uses,
+                      Plan.PhiUses);
+    llvm::erase_if(Plan.PhiUses, [&](MachineInstr *Use) {
+      return PhiMembers.count(Use->getOperand(0).getReg());
+    });
+    if (!Plan.Uses.empty() || !Plan.PhiUses.empty())
+      ReloadPlans.push_back(std::move(Plan));
+  }
 
   VRegMaskPair RootVMP(PhiResult, MRI->getMaxLaneMaskForVReg(PhiResult));
   int FI = assignVirt2StackSlot(RootVMP);
@@ -342,15 +354,10 @@ SSASpillEmitter::spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange) {
   // the value delivery is memory on whichever
   // edge ran. This is the join-dissolution: the spilled web is FINAL (no register
   // coalescing remains — the coalescer's job on it is done by the spill).
-  for (Register M : MembersWithExtUse) {
-    MachineInstr *MDef = MRI->getUniqueVRegDef(M);
-    if (!MDef)
-      continue;
-    VRegMaskPair VMP(M, MRI->getMaxLaneMaskForVReg(M));
+  for (const MemberReloads &Plan : ReloadPlans) {
+    VRegMaskPair VMP(Plan.Member, MRI->getMaxLaneMaskForVReg(Plan.Member));
     Virt2StackSlotMap[VMP] = FI;
-    emitReloadsAndRepairSSA(VMP,
-                            LIS->getInstructionIndex(*MDef).getRegSlot(),
-                            CollectChanges);
+    emitReloadsAndRepairSSA(VMP, Plan.Uses, Plan.PhiUses, CollectChanges);
   }
 
   for (Register M : PhiMembers) {
@@ -368,6 +375,11 @@ SSASpillEmitter::spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange) {
       StoredAtDefinition.erase(MVMP);
     }
     if (MachineInstr *D = MRI->getUniqueVRegDef(M)) {
+      // Repair may have changed these operands. Their final liveness must
+      // reflect removal of this PHI use.
+      for (const MachineOperand &MO : D->uses())
+        if (MO.isReg() && MO.getReg().isVirtual())
+          Result.Affected.push_back(MO.getReg());
       LIS->RemoveMachineInstrFromMaps(*D);
       D->eraseFromParent();
     }
@@ -376,12 +388,64 @@ SSASpillEmitter::spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange) {
     LastWebErased.push_back(M);
   }
 
-  for (Register G : GroundOps) {
-    if (!G.isVirtual() || MRI->reg_nodbg_empty(G))
+  // All original web PHIs are gone. Classify uses against the complete set
+  // of PHIs created by this repair, so internal cycles do not keep themselves
+  // alive. A PHI feeding an external reader keeps its PHI dependencies alive.
+  SmallSetVector<MachineInstr *, 16> RepairPHIs;
+  for (Register R : Result.Affected) {
+    if (R.virtRegIndex() < FirstNewVReg)
       continue;
-    if (LIS->hasInterval(G))
-      LIS->removeInterval(G);
-    LIS->createAndComputeVirtRegInterval(G);
+    if (MachineInstr *Def = MRI->getUniqueVRegDef(R))
+      if (Def->isPHI())
+        RepairPHIs.insert(Def);
+  }
+  SmallSetVector<MachineInstr *, 16> LivePHIs;
+  for (MachineInstr *Phi : RepairPHIs) {
+    Register R = Phi->getOperand(0).getReg();
+    if (llvm::any_of(MRI->use_nodbg_operands(R), [&](MachineOperand &MO) {
+          return MO.readsReg() && !RepairPHIs.count(MO.getParent());
+        }))
+      LivePHIs.insert(Phi);
+  }
+  for (unsigned I = 0; I != LivePHIs.size(); ++I) {
+    MachineInstr *Phi = LivePHIs[I];
+    for (const MachineOperand &MO : Phi->uses()) {
+      if (!MO.isReg() || !MO.getReg().isVirtual() || !MO.readsReg())
+        continue;
+      MachineInstr *Def = MRI->getUniqueVRegDef(MO.getReg());
+      if (RepairPHIs.count(Def))
+        LivePHIs.insert(Def);
+    }
+  }
+  // No surviving reader depends on this group; erase it as a whole.
+  for (MachineInstr *Phi : RepairPHIs) {
+    if (LivePHIs.count(Phi))
+      continue;
+    for (const MachineOperand &MO : Phi->uses())
+      if (MO.isReg() && MO.getReg().isVirtual())
+        Result.Affected.push_back(MO.getReg());
+    MRI->markUsesInDebugValueAsUndef(Phi->getOperand(0).getReg());
+    LIS->RemoveMachineInstrFromMaps(*Phi);
+    Phi->eraseFromParent();
+  }
+
+  // Original web PHIs and unused repair-PHI groups have been removed.
+  // Only now can a reload's remaining readers determine whether it is dead.
+  for (unsigned I = 0; I != Result.Affected.size(); ++I) {
+    Register R = Result.Affected[I];
+    if (R.virtRegIndex() < FirstNewVReg)
+      continue;
+    MachineInstr *Def = MRI->getUniqueVRegDef(R);
+    if (!Def || !isReloadInstr(Def) ||
+        llvm::any_of(MRI->use_nodbg_operands(R),
+                     [](const MachineOperand &MO) { return MO.readsReg(); }))
+      continue;
+    for (const MachineOperand &MO : Def->uses())
+      if (MO.isReg() && MO.getReg().isVirtual())
+        Result.Affected.push_back(MO.getReg());
+    MRI->markUsesInDebugValueAsUndef(R);
+    LIS->RemoveMachineInstrFromMaps(*Def);
+    Def->eraseFromParent();
   }
 
   llvm::sort(Result.Affected,
@@ -389,6 +453,23 @@ SSASpillEmitter::spillPhiWeb(const PhiWeb &Web, LivenessCallback OnChange) {
   Result.Affected.erase(
       std::unique(Result.Affected.begin(), Result.Affected.end()),
       Result.Affected.end());
+  // Recompute from the completed transformation before publishing to the forest.
+  // Retired IDs remain in Affected so their old ownership is removed.
+  for (Register R : Result.Affected) {
+    if (LIS->hasInterval(R))
+      LIS->removeInterval(R);
+    if (!MRI->def_empty(R)) {
+      LIS->createAndComputeVirtRegInterval(R);
+      continue;
+    }
+    assert(!llvm::any_of(MRI->use_nodbg_operands(R),
+                        [](const MachineOperand &MO) { return MO.readsReg(); }) &&
+           "PHI-web spill left a live use without a definition");
+    // Only undef operands remain. The verifier requires an interval for every
+    // referenced vreg; this empty interval carries no liveness to allocate.
+    if (!MRI->reg_nodbg_empty(R))
+      LIS->createEmptyInterval(R);
+  }
   OnChange(Result.Affected);
 
   LLVM_DEBUG(dbgs() << "  phi-web: coalesced, erased " << LastWebErased.size()
@@ -807,21 +888,23 @@ void SSASpillEmitter::collectReloadUses(
 
 SSASpillEmitter::RepairResult SSASpillEmitter::emitReloadsAndRepairSSA(
     VRegMaskPair SpilledVMP, SlotIndex KillIdx, LivenessCallback OnChange) {
+  SmallVector<MachineInstr *, 8> Uses;
+  SmallVector<MachineInstr *, 4> PhiUses;
+  collectReloadUses(SpilledVMP, KillIdx, Uses, PhiUses);
+  return emitReloadsAndRepairSSA(SpilledVMP, Uses, PhiUses, OnChange);
+}
+
+SSASpillEmitter::RepairResult SSASpillEmitter::emitReloadsAndRepairSSA(
+    VRegMaskPair SpilledVMP, ArrayRef<MachineInstr *> Uses,
+    ArrayRef<MachineInstr *> PhiUses, LivenessCallback OnChange) {
   SSARA_TRACE();
   Register SpilledReg = SpilledVMP.getVReg();
-
-  MachineInstr *KillMI = Indexes->getInstructionFromIndex(KillIdx);
-  assert(KillMI && "KillIdx must correspond to an instruction");
 
   LLVM_DEBUG({
     dbgs() << "\n=== emitReloadsAndRepairSSA() [Option 3: redef-only] ===\n";
     dbgs() << "Spilled: " << printReg(SpilledReg, TRI) << " mask "
            << PrintLaneMask(SpilledVMP.getLaneMask()) << "\n";
   });
-
-  SmallVector<MachineInstr *, 8> Uses;
-  SmallVector<MachineInstr *, 4> PhiUses;
-  collectReloadUses(SpilledVMP, KillIdx, Uses, PhiUses);
 
   for (MachineInstr *U : Uses) {
     if (!usesSpilledVMP(U, SpilledVMP, TRI, MRI))
