@@ -100,6 +100,17 @@ public:
   /// Invalid mapping or conflicting ownership returns false without insertion.
   bool assignFixed(ArrayRef<MCPhysReg> Registers, LiveIntervals &LIS);
 
+  /// Test placement without collecting owners. Preserve lane/subrange and
+  /// regmask semantics of interferences(); nullopt denotes invalid mapping.
+  std::optional<bool> isFree(MCRegister PR, const LiveInterval &Probe,
+                             LiveIntervals &LIS) const;
+
+  /// One sufficient placement blocker: virtual owner or SELF_OWNED (including
+  /// regmask clobbers). Zero means free; nullopt means invalid input.
+  std::optional<Register> firstInterference(MCRegister PR,
+                                          const LiveInterval &Probe,
+                                          LiveIntervals &LIS) const;
+
   struct Interference {
     SmallVector<Register, 4> VirtualOwners;
     bool HasFixedInterference = false;

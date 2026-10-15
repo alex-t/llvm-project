@@ -238,6 +238,11 @@ public:
   /// Invalid arguments return false.
   bool isFree(PhysicalSpan Span, SlotIndex Start, SlotIndex End) const;
 
+  /// Return one overlapping owner, zero when free, or nullopt for invalid
+  /// input. The selected owner is unspecified; no owner list is constructed.
+  std::optional<Register> firstInterference(PhysicalSpan Span, SlotIndex Start,
+                                          SlotIndex End) const;
+
   /// Return whether every canonical component of Span contains the exact
   /// assignment {Span, Start, End, Owner}. Invalid arguments return false.
   bool contains(PhysicalSpan Span, SlotIndex Start, SlotIndex End,
@@ -275,6 +280,7 @@ private:
     ArrayRef<const Ownership *> ownership() const { return OwnedHere; }
     const Ownership *find(SlotIndex Start, SlotIndex End, Register Owner) const;
     bool interferes(SlotIndex Start, SlotIndex End) const;
+    const Ownership *firstInterference(SlotIndex Start, SlotIndex End) const;
     void visitInterferences(
         SlotIndex Start, SlotIndex End,
         function_ref<void(const Ownership &)> Visit) const;

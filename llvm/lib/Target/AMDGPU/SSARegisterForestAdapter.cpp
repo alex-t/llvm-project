@@ -148,6 +148,71 @@ bool RegisterForestAdapter::visitLiveRanges(
   return true;
 }
 
+std::optional<Register>
+RegisterForestAdapter::firstInterference(MCRegister PR,
+                                         const LiveInterval &Probe,
+                                         LiveIntervals &LIS) const {
+  Register VR = Probe.reg();
+  if (!getVirtualRegClassOrNull(VR, MRI) ||
+      !physicalSpans(VRegMaskPair(VR, MRI.getMaxLaneMaskForVReg(VR)), PR))
+    return std::nullopt;
+  Register Owner;
+  bool Valid = visitLiveRanges(
+      Probe, [&](const LiveRange &Range, LaneBitmask Mask) {
+        if (Owner)
+          return true;
+        auto Spans = physicalSpans(VRegMaskPair(VR, Mask), PR);
+        if (!Spans)
+          return false;
+        for (const auto &Segment : Range.segments)
+          for (auto Span : *Spans) {
+            auto Found = Forest.firstInterference(Span, Segment.start,
+                                                  Segment.end);
+            if (!Found)
+              return false;
+            if (*Found) {
+              Owner = *Found;
+              return true;
+            }
+          }
+        return true;
+      });
+  if (!Valid)
+    return std::nullopt;
+  if (!Owner && hasRegMaskInterference(PR, Probe, LIS))
+    return SSARegisterForest::SELF_OWNED;
+  return Owner;
+}
+
+std::optional<bool>
+RegisterForestAdapter::isFree(MCRegister PR, const LiveInterval &Probe,
+                              LiveIntervals &LIS) const {
+  Register VR = Probe.reg();
+  if (!getVirtualRegClassOrNull(VR, MRI) ||
+      !physicalSpans(VRegMaskPair(VR, MRI.getMaxLaneMaskForVReg(VR)), PR))
+    return std::nullopt;
+
+  bool Free = true;
+  bool Valid = visitLiveRanges(
+      Probe, [&](const LiveRange &Range, LaneBitmask Mask) {
+        if (!Free)
+          return true;
+        auto Spans = physicalSpans(VRegMaskPair(VR, Mask), PR);
+        if (!Spans)
+          return false;
+        for (const auto &Segment : Range.segments)
+          for (auto Span : *Spans)
+            if (!Forest.isFree(Span, Segment.start, Segment.end)) {
+              Free = false;
+              return true;
+            }
+        return true;
+      });
+  if (!Valid)
+    return std::nullopt;
+  return Free && !hasRegMaskInterference(PR, Probe, LIS);
+}
+
 std::optional<RegisterForestAdapter::Interference>
 RegisterForestAdapter::interferences(MCRegister PR,
                                      const LiveInterval &Probe) const {

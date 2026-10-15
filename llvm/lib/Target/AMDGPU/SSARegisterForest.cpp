@@ -96,8 +96,15 @@ SSARegisterForest::NodeState::find(SlotIndex Start, SlotIndex End,
 
 bool SSARegisterForest::NodeState::interferes(SlotIndex Start,
                                               SlotIndex End) const {
+  return firstInterference(Start, End) != nullptr;
+}
+
+const SSARegisterForest::Ownership *
+SSARegisterForest::NodeState::firstInterference(SlotIndex Start,
+                                               SlotIndex End) const {
   const std::size_t Position = firstEndingAfter(Start);
-  return Position != OwnedHere.size() && OwnedHere[Position]->Start < End;
+  return Position != OwnedHere.size() && OwnedHere[Position]->Start < End
+      ? OwnedHere[Position] : nullptr;
 }
 
 void SSARegisterForest::NodeState::visitInterferences(
@@ -389,6 +396,23 @@ bool SSARegisterForest::subtreeOrAncestorInterference(NodeIndex MemoryIndex,
     if (Nodes[I].interferes(Start, End))
       return true;
   return false;
+}
+
+std::optional<Register>
+SSARegisterForest::firstInterference(PhysicalSpan Span, SlotIndex Start,
+                                     SlotIndex End) const {
+  auto Cover = cover(Span);
+  if (!Cover || !Start.isValid() || !End.isValid() || !(Start < End))
+    return std::nullopt;
+  for (NodeIndex Node : *Cover) {
+    for (NodeIndex I : subtree(Node))
+      if (const Ownership *Owned = Nodes[I].firstInterference(Start, End))
+        return Owned->Owner;
+    for (NodeIndex I : ancestors(Node))
+      if (const Ownership *Owned = Nodes[I].firstInterference(Start, End))
+        return Owned->Owner;
+  }
+  return Register();
 }
 
 bool SSARegisterForest::isFree(PhysicalSpan Span, SlotIndex Start,

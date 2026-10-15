@@ -148,6 +148,9 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // lane already spilled is not selected by an overlapping recovery spill.
   // Disjoint lanes of the same value remain eligible. Cleared at the start of each allocation stage.
   SmallDenseSet<Register, 8> RehomedVRegs;
+  // Experimental bound on whole-interval relocation: one successful move per
+  // virtual register per function, across all principals and allocation stages.
+  SmallDenseSet<Register, 32> EvictedVRegs;
   VRegMaskPairSet RecoverySpilledValues;
   // Completed splits in this function, retained across worklist retries.
   // Also lets the drain recognize a committed split as progress.
@@ -361,11 +364,20 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   /// Shared by the coloring-time split paths.
   void commitColor(Register Piece, MCRegister PR);
 
+  struct PlacementWitness {
+    MCRegister Home;
+    Register Owner;
+    bool Fixed;
+  };
+
   /// Distinct virtual blockers of Subject over its legal candidate homes.
   /// Owners and their full homes come from RF; fixed conflicts are not victims.
   void collectBlockers(
       Register Subject,
-      SmallVectorImpl<std::pair<Register, MCRegister>> &Blockers) const;
+      SmallVectorImpl<std::pair<Register, MCRegister>> &Blockers,
+      SmallVectorImpl<PlacementWitness> *Witnesses) const;
+  bool mayPlaceAfterMove(Register Subject, Register Moved,
+                         MutableArrayRef<PlacementWitness> Witnesses) const;
 
   // True if the parallel PHI edge-copies for Pred->MBB cannot be safely placed
   // at Pred's terminator (they would clobber a value live into a sibling

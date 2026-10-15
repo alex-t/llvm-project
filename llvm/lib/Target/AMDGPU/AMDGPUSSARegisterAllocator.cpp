@@ -225,10 +225,16 @@ AMDGPUSSARegisterAllocator::forestInterferences(Register VR,
 
 bool AMDGPUSSARegisterAllocator::placementIsFree(Register VR,
                                                  MCRegister PR) const {
-  auto Query = forestInterferences(VR, PR);
-  if (!Query)
+  RegisterForestAdapter *Adapter = adapterFor(PR);
+  const TargetRegisterClass *RC = VR.isVirtual() &&
+          VR.virtRegIndex() < MRI->getNumVirtRegs()
+      ? MRI->getRegClassOrNull(VR) : nullptr;
+  if (!Adapter || !RC || !RC->contains(PR) || !LIS->hasInterval(VR))
     report_fatal_error("invalid register-forest placement query");
-  return !Query->HasFixedInterference && Query->VirtualOwners.empty();
+  auto Free = Adapter->isFree(PR, LIS->getInterval(VR), *LIS);
+  if (!Free)
+    report_fatal_error("invalid register-forest placement query");
+  return *Free;
 }
 
 bool AMDGPUSSARegisterAllocator::isFreeAt(MCRegister PR, SlotIndex At) const {
@@ -672,13 +678,18 @@ void AMDGPUSSARegisterAllocator::collectLiveSet(
 
 void AMDGPUSSARegisterAllocator::collectBlockers(
     Register Subject,
-    SmallVectorImpl<std::pair<Register, MCRegister>> &Blockers) const {
+    SmallVectorImpl<std::pair<Register, MCRegister>> &Blockers,
+    SmallVectorImpl<PlacementWitness> *Witnesses) const {
   RecoveryScopeTimer PhaseTimer("collect-blockers");
   SmallDenseSet<Register, 16> Seen;
   for (MCRegister Home : availableOrder(MRI->getRegClass(Subject))) {
     auto Query = forestInterferences(Subject, Home);
     if (!Query)
       report_fatal_error("invalid register-forest blocker query");
+    if (Witnesses)
+      Witnesses->push_back({Home, Query->VirtualOwners.empty()
+                                     ? Register() : Query->VirtualOwners.front(),
+                            Query->HasFixedInterference});
     for (Register Owner : Query->VirtualOwners) {
       if (!Seen.insert(Owner).second)
         continue;
@@ -688,6 +699,30 @@ void AMDGPUSSARegisterAllocator::collectBlockers(
       Blockers.emplace_back(Owner, Assigned);
     }
   }
+}
+
+bool AMDGPUSSARegisterAllocator::mayPlaceAfterMove(
+    Register Subject, Register Moved,
+    MutableArrayRef<PlacementWitness> Witnesses) const {
+  bool MayPlace = false;
+  for (PlacementWitness &Witness : Witnesses) {
+    if (Witness.Fixed)
+      continue;
+    // An unmoved owner still blocks the same lanes and interval. A formerly
+    // free home must also be checked: Moved may now occupy it.
+    if (Witness.Owner && Witness.Owner != Moved)
+      continue;
+    auto Owner = adapterFor(Witness.Home)->firstInterference(
+        Witness.Home, LIS->getInterval(Subject), *LIS);
+    if (!Owner)
+      report_fatal_error("invalid register-forest placement witness query");
+    Witness.Fixed = *Owner == SSARegisterForest::SELF_OWNED;
+    Witness.Owner = Witness.Fixed ? Register() : *Owner;
+    MayPlace |= !Witness.Fixed && !Witness.Owner;
+  }
+  // Refresh every invalid witness even if one home is free: a failed
+  // placement may leave this certificate in use for the next move.
+  return MayPlace;
 }
 
 std::optional<AMDGPUSSARegisterAllocator::PendingTie>
@@ -1522,18 +1557,32 @@ bool AMDGPUSSARegisterAllocator::selectPeelableRun(
   const SlotIndex S = Profile.Region.Start;
   const SlotIndex E = Profile.Region.End;
 
-  SmallVector<PlacementFreeRun, 32> FreeRuns;
-  getFreeRuns(Profile, FreeRuns);
-
-  // FreeRuns is grouped in target home order. Updating only for a strictly
-  // longer run therefore preserves the target-order first-home tie-break.
-  SlotIndex Best = S;
-  for (const PlacementFreeRun &Run : FreeRuns) {
-    if (Run.Range.Start != S)
+  // Only the free prefix beginning at S can be peeled. Its end is the first
+  // blocker or legality cut for that home; later slices cannot affect it.
+  SmallVector<SlotIndex, 32> PrefixEnds(Profile.Homes.size(), E);
+  for (const PlacementProfile::BlockerSpan &Span : Profile.Blockers) {
+    if (!(Span.Range.Start < E && S < Span.Range.End))
       continue;
-    if (!PR || Best < Run.Range.End) {
-      PR = Run.PhysReg;
-      Best = Run.Range.End;
+    SlotIndex Stop = Span.Range.Start < S ? S : Span.Range.Start;
+    for (unsigned Home : Span.BlockedHomes.set_bits())
+      if (Home < PrefixEnds.size() && Stop < PrefixEnds[Home])
+        PrefixEnds[Home] = Stop;
+  }
+  for (const PlacementProfile::HomeCut &Cut : Profile.Cuts) {
+    if (!(S < Cut.At && Cut.At < E))
+      continue;
+    for (unsigned Home : Cut.CutHomes.set_bits())
+      if (Home < PrefixEnds.size() && Cut.At < PrefixEnds[Home])
+        PrefixEnds[Home] = Cut.At;
+  }
+
+  // Scan in target order and update only for a strictly longer prefix, so
+  // equal-length candidates retain the existing first-home tie-break.
+  SlotIndex Best = S;
+  for (unsigned Home = 0; Home != PrefixEnds.size(); ++Home) {
+    if (Best < PrefixEnds[Home]) {
+      PR = Profile.Homes[Home];
+      Best = PrefixEnds[Home];
     }
   }
   if (!PR)
@@ -1594,6 +1643,8 @@ AMDGPUSSARegisterAllocator::trySelfSplitColor(Register Failed) {
 bool AMDGPUSSARegisterAllocator::tryEvict(Register B, SlotIndex Start,
                                          SlotIndex End) {
   RecoveryScopeTimer PhaseTimer("cheap-rehome");
+  if (EvictedVRegs.count(B))
+    return false;
   MCRegister OldHome = assignedHome(B);
   if (!OldHome || !LIS->hasInterval(B) || LIS->getInterval(B).empty() ||
       !LIS->getInterval(B).overlaps(Start, End) || RescueCopies.count(B))
@@ -1601,27 +1652,37 @@ bool AMDGPUSSARegisterAllocator::tryEvict(Register B, SlotIndex Start,
   if (hasAssignedTiedPartner(B))
     return false;
   const TargetRegisterClass *RC = MRI->getRegClass(B);
+  struct OperandConstraint {
+    const TargetRegisterClass *RC;
+    unsigned SubReg;
+  };
+  SmallVector<OperandConstraint, 8> Constraints;
+  bool CanChangeClass = true;
+  for (const MachineOperand &MO : MRI->reg_nodbg_operands(B)) {
+    if (MO.isUse() && !MO.readsReg())
+      continue;
+    if (MO.getSubReg() || MO.isTied())
+      CanChangeClass = false;
+    const MachineInstr *MI = MO.getParent();
+    if (MI->isPHI())
+      continue;
+    Constraints.push_back(
+        {TII->getRegClass(MI->getDesc(), MO.getOperandNo(), TRI),
+         MO.getSubReg()});
+  }
+
   auto TryClass = [&](const TargetRegisterClass *HomeRC) {
-    if (!HomeRC)
+    if (!HomeRC || (HomeRC != RC && !CanChangeClass))
       return false;
     for (MCPhysReg PR : availableOrder(HomeRC)) {
       if (TRI->regsOverlap(PR, OldHome))
         continue;
       bool Accepts = llvm::all_of(
-          MRI->reg_nodbg_operands(B), [&](const MachineOperand &MO) {
-            if (MO.isUse() && !MO.readsReg())
-              return true;
-            if ((MO.getSubReg() || MO.isTied()) && HomeRC != RC)
-              return false;
-            const MachineInstr *MI = MO.getParent();
-            if (MI->isPHI())
-              return true;
-            const TargetRegisterClass *OperandRC =
-                TII->getRegClass(MI->getDesc(), MO.getOperandNo(), TRI);
-            MCRegister OperandHome = MO.getSubReg()
-                ? TRI->getSubReg(PR, MO.getSubReg()) : MCRegister(PR);
+          Constraints, [&](const OperandConstraint &Constraint) {
+            MCRegister OperandHome = Constraint.SubReg
+                ? TRI->getSubReg(PR, Constraint.SubReg) : MCRegister(PR);
             return OperandHome &&
-                   (!OperandRC || OperandRC->contains(OperandHome));
+                   (!Constraint.RC || Constraint.RC->contains(OperandHome));
           });
       if (!Accepts)
         continue;
@@ -1634,6 +1695,7 @@ bool AMDGPUSSARegisterAllocator::tryEvict(Register B, SlotIndex Start,
       }
       unassignColor(B);
       commitColor(B, PR);
+      EvictedVRegs.insert(B);
       if (HomeRC != RC)
         RehomedVRegs.insert(B);
       DEBUG_WITH_TYPE("amdgpu-ssa-coverage", dbgs()
@@ -1844,8 +1906,9 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
       UncolorableVRegs.push_back(Placement.InputToRecover);
     return true;
   }
-  // Each attempt advances from self rehome through one blocker snapshot to
-  // prefix self-splitting. A blocker mutation never restarts this attempt.
+  // Try prefix self-splitting before rehoming. Rehoming is the last
+  // alternative before blocker or self spilling; a blocker mutation never
+  // restarts this attempt.
   // The snapshot bounds this attempt, and explicit split copies consume the
   // function-wide budget. Same-file homes may change in later attempts, and
   // repairs can append new values to the worklist; these local restrictions
@@ -1871,7 +1934,7 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
       RecoveryScopeTimer PhaseTimer("web-state");
       PhiWeb Web = closePhiWeb(Cur);
       if (!Web.valid()) {
-        State = RecoveryState::CrossFileHome;
+        State = RecoveryState::SelfSplit;
         continue;
       }
 
@@ -1887,7 +1950,7 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
       if (llvm::any_of(GroundStores, [&](VRegMaskPair VMP) {
             return RecoverySpilledValues.overlaps(VMP);
           })) {
-        State = RecoveryState::CrossFileHome;
+        State = RecoveryState::SelfSplit;
         continue;
       }
       const TargetRegisterClass *RC = MRI->getRegClass(Cur);
@@ -1917,23 +1980,44 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
     case RecoveryState::EvictBlockers: {
       RecoveryScopeTimer PhaseTimer("eviction-state");
       SmallVector<std::pair<Register, MCRegister>, 16> Blockers;
-      collectBlockers(Cur, Blockers);
-      unsigned Tried = 0, Moved = 0;
+      // Tied-def placement can repair MIR even when placement fails. Keep
+      // its existing retry path; witnesses require unchanged live intervals.
+      const bool UseWitnesses = !definingTie(Cur);
+      SmallVector<PlacementWitness, 32> Witnesses;
+      collectBlockers(Cur, Blockers, UseWitnesses ? &Witnesses : nullptr);
+      unsigned Tried = 0, Moved = 0, SkippedPlacement = 0;
       for (const auto &[B, OldHome] : Blockers) {
+        // Keep the shared snapshot intact for subsequent spill selection.
+        // Already relocated values cannot be moved again in this function.
+        if (EvictedVRegs.count(B))
+          continue;
         if (!needsRecovery(Cur))
           break;
         if (assignedHome(B) != OldHome || !LIS->hasInterval(B) ||
             !LIS->getInterval(B).overlaps(LIS->getInterval(Cur)))
           continue;
-        // Mutations can renumber SlotIndexes. Read the current window for every
-        // surviving snapshot member and intentionally ignore its result.
+        // Tied-def placement may repair MIR and renumber SlotIndexes.
+        // Read the current window for every surviving snapshot member.
         SlotIndex Start = LIS->getInterval(Cur).beginIndex();
         SlotIndex End = LIS->getInterval(Cur).endIndex();
         DEBUG_WITH_TYPE("amdgpu-ssa-coverage", dbgs()
             << "evict principal=" << printReg(Cur, TRI)
             << " blocker=" << printReg(B, TRI) << " begin\n");
         ++Tried;
-        Moved += tryEvict(B, Start, End);
+        if (tryEvict(B, Start, End)) {
+          ++Moved;
+          bool Retry = true;
+          if (UseWitnesses) {
+            RecoveryScopeTimer WitnessTimer("placement-witness");
+            Retry = mayPlaceAfterMove(Cur, B, Witnesses);
+          }
+          if (Retry) {
+            RecoveryScopeTimer PlacementTimer("eviction-principal-placement");
+            colorOneInPlace(Cur);
+          } else {
+            ++SkippedPlacement;
+          }
+        }
         DEBUG_WITH_TYPE("amdgpu-ssa-coverage", dbgs()
             << "evict principal=" << printReg(Cur, TRI)
             << " blocker=" << printReg(B, TRI) << " end\n");
@@ -1941,7 +2025,8 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
       DEBUG_WITH_TYPE("amdgpu-ssa-fsm-trace", {
         if (CoverageTraceVReg < 0 || Cur.virtRegIndex() == unsigned(CoverageTraceVReg))
           dbgs() << "fsm blockers snapshot=" << Blockers.size()
-                 << " tried=" << Tried << " moved=" << Moved << "\n";
+                 << " tried=" << Tried << " moved=" << Moved
+                 << " skipped-placement=" << SkippedPlacement << "\n";
       });
       DEBUG_WITH_TYPE("amdgpu-ssa-blocker-detail", {
         if (CoverageTraceVReg >= 0 &&
@@ -2142,7 +2227,9 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
               << " home=" << printReg(assignedHome(Cur), TRI) << "\n");
         }
       }
-      State = RecoveryState::SelfSplit;
+      if (!needsRecovery(Cur))
+        return true;
+      State = RecoveryState::Floor;
       continue;
     }
 
@@ -2165,7 +2252,7 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
         return true;
       }
       assert(Split == RecoveryResult::NoChange);
-      State = RecoveryState::Floor;
+      State = RecoveryState::CrossFileHome;
       continue;
     }
 
@@ -4252,6 +4339,7 @@ static unsigned countCalleeSavedSGPRLanes(MachineFunction &MF) {
 }
 
 bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
+  EvictedVRegs.clear();
   RecoveryTimings.clear();
   RecoveryCopies.clear();
   SplitEdges.clear();
