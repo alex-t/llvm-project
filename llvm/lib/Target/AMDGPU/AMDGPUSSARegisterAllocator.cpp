@@ -3467,6 +3467,60 @@ void AMDGPUSSARegisterAllocator::resolvePermutation(
   MaxSGPRIdx = std::max(MaxSGPRIdx, PeakSGPR);
 }
 
+void AMDGPUSSARegisterAllocator::recordPhysicalTransfers(
+    RegisterForestAdapter &Adapter, MachineBasicBlock &Block,
+    MachineBasicBlock::iterator CopyBegin, MachineBasicBlock::iterator CopyEnd,
+    ArrayRef<MCRegister> RequiredAtExit) {
+  SlotIndex BlockExit = LIS->getMBBEndIdx(&Block);
+  SlotIndex InputCoverageStart;
+  if (CopyBegin == Block.getFirstNonPHI()) {
+    // A sequence after the PHI prefix consumes incoming values from block entry.
+    // This also covers the empty body of a freshly split edge block.
+    InputCoverageStart = LIS->getMBBStartIdx(&Block);
+  } else if (CopyBegin == Block.end()) {
+    InputCoverageStart = BlockExit;
+  } else {
+    // Earlier occupancy in an existing predecessor is already recorded.
+    InputCoverageStart = LIS->getInstructionIndex(*CopyBegin).getBaseIndex();
+  }
+  SmallVector<RegisterForestAdapter::PhysicalRegUseDef, 16> RegUsesAndDefs;
+  for (auto I = CopyBegin; I != CopyEnd; ++I) {
+    if (I->isDebugInstr())
+      continue;
+    SlotIndex At = LIS->getInstructionIndex(*I).getRegSlot();
+    // The backward lifetime walk must process defs before same-instruction
+    // reads, so store reads before defs (including tied operands).
+    for (bool Defs : {false, true})
+      for (const MachineOperand &MO : I->operands()) {
+        if (!MO.isReg() || !MO.getReg().isPhysical() ||
+            !MRI->isAllocatable(MO.getReg().asMCReg()) ||
+            (Defs ? !MO.isDef() : !MO.readsReg()))
+          continue;
+        if (adapterFor(MO.getReg()) == &Adapter)
+          RegUsesAndDefs.push_back({MO.getReg().asMCReg(), At, Defs});
+      }
+  }
+  Adapter.recordPhysicalTransfers(RegUsesAndDefs, RequiredAtExit,
+                                  InputCoverageStart, BlockExit);
+}
+
+void AMDGPUSSARegisterAllocator::recordSplitLiveThrough(
+    MachineBasicBlock &NewBlock, MachineBasicBlock &OldSuccessor,
+    ArrayRef<MCRegister> PRsLiveInSucc) {
+  SlotIndex Start = LIS->getMBBStartIdx(&NewBlock);
+  SlotIndex End = LIS->getMBBEndIdx(&NewBlock);
+  SlotIndex SuccessorStart = LIS->getMBBStartIdx(&OldSuccessor);
+  // Splitting a CFG edge affects all files, including completed stages.
+  for (const auto &Adapter : Adapters)
+    Adapter->recordSplitLiveThrough(SuccessorStart, Start, End);
+  for (MCRegister PR : PRsLiveInSucc) {
+    if (!MRI->isAllocatable(PR))
+      continue;
+    if (auto *Adapter = adapterFor(PR))
+      Adapter->recordPhysicalLiveThrough(PR, Start, End);
+  }
+}
+
 void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
   RecoveryScopeTimer PhaseTimer("lower-phis");
   SSARA_TRACE();
@@ -3479,6 +3533,8 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
     MachineBasicBlock *Pred;
     MachineBasicBlock *Successor;
     SmallVector<std::pair<MCRegister, MCRegister>> Copies;
+    SmallVector<MCRegister, 8> LiveThrough;
+    SmallVector<MCRegister, 8> Destinations;
     bool Split;
   };
   SmallVector<EdgeCopyPlan, 8> EdgeCopies;
@@ -3495,6 +3551,12 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
     if (MBB.empty() || !MBB.front().isPHI())
       continue;
 
+    // Capture already-physical live-ins before adding this stage's PHI
+    // destinations: the latter are defined by the copies we are about to emit.
+    SmallVector<MCRegister, 8> LiveThrough;
+    for (const auto &LI : MBB.liveins())
+      LiveThrough.push_back(LI.PhysReg);
+    SmallVector<MCRegister, 8> Destinations;
     DenseMap<unsigned, SmallVector<std::pair<MCRegister, MCRegister>>>
         PredCopies;
 
@@ -3509,6 +3571,7 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
         continue;
       MCRegister DstPhys = assignedHome(DstVReg);
       assert(DstPhys && "PHI result not colored");
+      Destinations.push_back(DstPhys);
 
       // The PHI result physreg flows into this block from each predecessor.
       // After the PHI is erased, the block has no definition of DstPhys, so
@@ -3613,7 +3676,8 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
       assert(Pred && "PHI predecessor block number must resolve");
       auto &Copies = PredCopies.find(PredNumber)->second;
       bool Split = edgeCopiesNeedSplit(Pred, &MBB, Copies);
-      EdgeCopies.push_back({Pred, &MBB, std::move(Copies), Split});
+      EdgeCopies.push_back({Pred, &MBB, std::move(Copies), LiveThrough,
+                            Destinations, Split});
     }
   }
 
@@ -3639,6 +3703,7 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
         }
       InsertMBB = Pred->SplitCriticalEdge(&MBB, *this);
       assert(InsertMBB && "Failed to split critical edge");
+      recordSplitLiveThrough(*InsertMBB, MBB, Plan.LiveThrough);
       // Keep provenance across allocation stages: recovery may insert new
       // transfers into this predecessor after its original PHIs are lowered.
       SplitEdges.push_back({Pred, InsertMBB, MaskChange});
@@ -3647,6 +3712,8 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
     LLVM_DEBUG(dbgs() << "  Edge " << printMBBReference(*InsertMBB) << " -> "
                       << printMBBReference(MBB) << ":\n");
     auto InsertPt = AMDGPURegAllocInsertion::bodyEnd(*InsertMBB);
+    auto Before = InsertPt == InsertMBB->begin() ? InsertMBB->end()
+                                                : std::prev(InsertPt);
     // Remove undef edges from the permutation, but defer their definitions:
     // an undef destination may still hold another PHI's incoming value.
     SmallVector<MCRegister, 4> UndefDests;
@@ -3666,9 +3733,19 @@ void AMDGPUSSARegisterAllocator::lowerPHIs(MachineFunction &MF, RegFile Only) {
                   TII->get(TargetOpcode::IMPLICIT_DEF), Dst);
       LIS->InsertMachineInstrInMaps(*IDef);
     }
+    auto Begin = Before == InsertMBB->end() ? InsertMBB->begin()
+                                           : std::next(Before);
+    recordPhysicalTransfers(*Adapters[static_cast<unsigned>(Only)], *InsertMBB,
+                            Begin, InsertPt, Plan.Destinations);
   }
 
   for (MachineInstr *PHI : PHIsToErase) {
+    // The lowered value is a live-in, rather than a definition at the old PHI
+    // slot. Publish the short entry prefix before removing that definition.
+    MCRegister Home = assignedHome(PHI->getOperand(0).getReg());
+    adapterFor(Home)->recordPhysicalLiveThrough(
+        Home, LIS->getMBBStartIdx(PHI->getParent()),
+        LIS->getInstructionIndex(*PHI).getRegSlot());
     // Keep SlotIndexes consistent: a later allocation stage queries
     // getInstructionIndex over the whole function, so an erased instr must leave
     // the maps.

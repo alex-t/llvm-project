@@ -177,6 +177,48 @@ public:
   SmallVector<Register, 4> onChange(ArrayRef<Register> Affected,
                                   LiveIntervals &LIS);
 
+  struct PhysicalRegUseDef {
+    MCRegister Reg; // Concrete register/slice in this adapter's file.
+    SlotIndex At;   // Instruction register slot at which it is read or written.
+    bool IsDef;    // True for a write, false for a read; tied operands have both.
+  };
+
+  /// Construct physical lifetimes for one emitted sequence and publish them
+  /// to RF. Existing coverage/owners remain unchanged; missing coverage uses
+  /// SELF_OWNED because the added operands are already physical.
+  ///
+  /// RegUsesAndDefs: accesses to this file, in instruction order. Put all reads
+  /// before all defs at the same instruction, so reverse traversal handles
+  /// writes before their inputs. Physical aliases are resolved per half-dword.
+  /// RequiredAtExit: final values required at the outgoing boundary. Seed
+  /// their lifetimes at BlockExit; they need not appear in RegUsesAndDefs (no-copy PHIs).
+  /// InputCoverageStart: start of coverage for reads with no preceding definition
+  /// in RegUsesAndDefs. It must not follow any supplied access.
+  /// BlockExit: exclusive outgoing lifetime boundary, after every supplied access.
+  /// Intermediate values end at their last read; unused defs retain a short
+  /// interval covering the write. No MIR or LIS state is changed.
+  void recordPhysicalTransfers(ArrayRef<PhysicalRegUseDef> RegUsesAndDefs,
+                               ArrayRef<MCRegister> RequiredAtExit,
+                               SlotIndex InputCoverageStart, SlotIndex BlockExit);
+
+  /// Record an uninterrupted physical lifetime without analyzing instructions.
+  /// PR names storage in this adapter's file; Start and End are the inclusive
+  /// start and exclusive end slots of the required interval. The caller must
+  /// establish that the value is available and must survive throughout it.
+  /// Fill missing coverage with SELF_OWNED; preserve existing records. Empty
+  /// intervals do nothing. Used for physical live-ins and erased-PHI prefixes.
+  void recordPhysicalLiveThrough(MCRegister PR, SlotIndex Start, SlotIndex End);
+
+  /// Carry this file's recorded successor-entry occupancy through a new block.
+  /// SuccessorStart is the RF point to query; [Start, End) is the new block's
+  /// full slot interval. The caller establishes the CFG edge relationship.
+  /// Snapshot the entry owners before adding ranges, retaining known virtual
+  /// identities so later saved-EXEC reuse can still extend those owners.
+  /// Already-physical live-ins absent from that RF point are supplied by the
+  /// caller separately through recordPhysicalLiveThrough. No LIS walk occurs.
+  void recordSplitLiveThrough(SlotIndex SuccessorStart, SlotIndex Start,
+                             SlotIndex End);
+
   bool contains(Register VR, MCRegister PR, SlotIndex Start, SlotIndex End) const;
   bool assign(Register VR, MCRegister PR, SlotIndex Start, SlotIndex End);
   bool release(Register VR, MCRegister PR, SlotIndex Start, SlotIndex End);
@@ -231,6 +273,21 @@ private:
   bool projectLiveRegions(Register VR, MCRegister PR, LiveIntervals &LIS,
                           Regions &Out) const;
   void releaseRegions(Register VR, ArrayRef<SSARegisterForest::OwnershipRegion>);
+  /// Assign a previously established free physical span/time rectangle.
+  /// Span is in RF half-dword coordinates; [Start, End) is its lifetime.
+  /// Owner is SELF_OWNED or an existing virtual owner with a recorded home.
+  /// Empty ranges do nothing; insertion failure is an RF consistency error.
+  void assignPhysicalRegion(SSARegisterForest::PhysicalSpan Span,
+                            SlotIndex Start, SlotIndex End, Register Owner);
+  /// Common publication algorithm: subtract existing RF coverage from each
+  /// requested span/time rectangle, then assign only uncovered pieces to Owner.
+  /// Regions may overlap or repeat. Existing records are never removed or
+  /// relabeled, even if their owner differs. Owner defaults to SELF_OWNED;
+  /// split-edge propagation supplies the known owner instead. This adds
+  /// required occupancy; it does not shorten conservative existing lifetimes.
+  void recordFixedRegions(
+      ArrayRef<SSARegisterForest::OwnershipRegion> Regions,
+      Register Owner = SSARegisterForest::SELF_OWNED);
 
   /// RF alone decomposes this span into canonical nodes. An unsupported size
   /// or an out-of-bounds home yields an invalid span, rejected by RF.

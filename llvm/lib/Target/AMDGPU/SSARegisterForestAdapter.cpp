@@ -11,6 +11,7 @@
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/LiveInterval.h"
@@ -388,6 +389,102 @@ bool RegisterForestAdapter::assignFixed(ArrayRef<MCPhysReg> Registers,
     (void)Assigned;
   }
   return true;
+}
+
+void RegisterForestAdapter::assignPhysicalRegion(
+    SSARegisterForest::PhysicalSpan Span, SlotIndex Start, SlotIndex End,
+    Register Owner) {
+  if (!(Start < End))
+    return;
+  SSARegisterForest::OwnershipRegion Addition{Span, Start, End};
+  bool Assigned = Owner.isVirtual()
+      ? Forest.assign(Owner, Forest.assignedHome(Owner), {Addition})
+      : Forest.assign(Span, Start, End, Owner);
+  if (!Assigned)
+    report_fatal_error("physical lifetime publication failed");
+}
+
+// Physical rewriting adds lifetimes outside the original SSA intervals. Keep
+// their existing ownership intact and publish only the uncovered portions.
+void RegisterForestAdapter::recordFixedRegions(
+    ArrayRef<SSARegisterForest::OwnershipRegion> Required, Register Owner) {
+  for (const auto &R : Required) {
+    for (unsigned Leaf = R.Span.FirstPhysicalLeaf;
+         Leaf != R.Span.EndPhysicalLeaf; ++Leaf) {
+      SSARegisterForest::PhysicalSpan Span{Leaf, Leaf + 1};
+      SmallVector<std::pair<SlotIndex, SlotIndex>, 4> Covered;
+      if (!Forest.visitInterferences(
+              Span, R.Start, R.End,
+              [&](auto, const SSARegisterForest::Ownership &O) {
+                Covered.emplace_back(std::max(R.Start, O.Start),
+                                     std::min(R.End, O.End));
+              }))
+        report_fatal_error("invalid physical lifetime publication");
+      llvm::sort(Covered);
+      SlotIndex Cursor = R.Start;
+      for (const auto &C : Covered) {
+        assignPhysicalRegion(Span, Cursor, C.first, Owner);
+        Cursor = std::max(Cursor, C.second);
+      }
+      assignPhysicalRegion(Span, Cursor, R.End, Owner);
+    }
+  }
+}
+
+void RegisterForestAdapter::recordPhysicalTransfers(
+    ArrayRef<PhysicalRegUseDef> RegUsesAndDefs, ArrayRef<MCRegister> RequiredAtExit,
+    SlotIndex InputCoverageStart, SlotIndex BlockExit) {
+  // Track physical half-dwords, so tuple and true16 aliases share state.
+  DenseMap<unsigned, SlotIndex> LiveUntil;
+  for (MCRegister PR : RequiredAtExit) {
+    auto Span = physicalSpan(PR);
+    for (unsigned L = Span.FirstPhysicalLeaf; L != Span.EndPhysicalLeaf; ++L)
+      LiveUntil[L] = BlockExit;
+  }
+  Regions Required;
+  for (const PhysicalRegUseDef &A : llvm::reverse(RegUsesAndDefs)) {
+    auto Span = physicalSpan(A.Reg);
+    for (unsigned L = Span.FirstPhysicalLeaf; L != Span.EndPhysicalLeaf; ++L) {
+      auto I = LiveUntil.find(L);
+      if (A.IsDef) {
+        SlotIndex Finish = I == LiveUntil.end() ? A.At.getNextSlot() : I->second;
+        if (A.At < Finish)
+          Required.push_back({{L, L + 1}, A.At, Finish});
+        if (I != LiveUntil.end())
+          LiveUntil.erase(I);
+      } else if (I == LiveUntil.end()) {
+        LiveUntil[L] = A.At;
+      }
+    }
+  }
+  for (const auto &Entry : LiveUntil)
+    if (InputCoverageStart < Entry.second)
+      Required.push_back({{Entry.first, Entry.first + 1}, InputCoverageStart, Entry.second});
+  recordFixedRegions(Required);
+}
+
+void RegisterForestAdapter::recordPhysicalLiveThrough(
+    MCRegister PR, SlotIndex Start, SlotIndex End) {
+  if (!(Start < End))
+    return;
+  SSARegisterForest::OwnershipRegion Region{physicalSpan(PR), Start, End};
+  recordFixedRegions({Region});
+}
+
+void RegisterForestAdapter::recordSplitLiveThrough(
+    SlotIndex SuccessorStart, SlotIndex Start, SlotIndex End) {
+  SmallVector<SSARegisterForest::Ownership, 16> Live;
+  if (!Forest.visitInterferences(
+          {0, Forest.numLeaves()}, SuccessorStart, SuccessorStart.getNextSlot(),
+          [&](auto, const SSARegisterForest::Ownership &O) {
+            Live.push_back(O);
+          }))
+    report_fatal_error("invalid split-edge ownership query");
+  // Keep known owner identity: later saved-EXEC reuse may extend that owner.
+  for (const auto &O : Live) {
+    SSARegisterForest::OwnershipRegion R{O.Span, Start, End};
+    recordFixedRegions({R}, O.Owner);
+  }
 }
 
 bool RegisterForestAdapter::contains(Register VR, MCRegister PR,

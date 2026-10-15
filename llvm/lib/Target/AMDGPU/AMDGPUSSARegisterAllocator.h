@@ -445,6 +445,46 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   void lowerRecoveryCopies(MachineFunction &MF);
   void finalizeAfterRewrite(MachineFunction &MF);
   void eliminateRedundantReloads(MachineFunction &MF);
+  /// Publish the added physical lifetimes of a resolved PHI-copy sequence.
+  /// Call after emitting the sequence and before another allocation query.
+  /// This updates RF only; it neither rewrites instructions nor recomputes LIS.
+  ///
+  /// Adapter: register file of the current allocation stage. The PHI copies
+  /// and RequiredAtExit belong to this file; other-file implicit operands are
+  /// ignored by this helper.
+  /// CopyBegin, CopyEnd: half-open instruction range containing only the newly
+  /// emitted sequence in one block. CopyEnd is excluded and is normally the
+  /// first terminator. It is not the outgoing lifetime boundary.
+  /// RequiredAtExit: physical PHI destinations whose final values must survive
+  /// through block exit, including destinations needing no copy. This is the
+  /// set affected by this update, not the block's complete live-out set.
+  /// Block: containing block for both iterators. The helper derives lifetime
+  /// boundaries from it: inputs are covered from block entry when the sequence
+  /// starts at the first non-PHI instruction, otherwise from the inserted sequence's first instruction.
+  /// Final destinations remain occupied through block exit. Existing RF
+  /// coverage before the sequence and in successors is preserved.
+  void recordPhysicalTransfers(
+      RegisterForestAdapter &Adapter, MachineBasicBlock &Block,
+      MachineBasicBlock::iterator CopyBegin, MachineBasicBlock::iterator CopyEnd,
+      ArrayRef<MCRegister> RequiredAtExit);
+
+  /// Publish occupancy through a newly inserted critical-edge block.
+  /// Call immediately after splitting the edge, before inserting its copies.
+  /// This CFG mutation affects all files, including previously lowered stages.
+  ///
+  /// NewBlock: new block, with its only successor equal to OldSuccessor. Occupancy
+  /// is added over its entire [block-start, block-end) interval.
+  /// OldSuccessor: original edge destination. Its RF entry occupancy supplies
+  /// values that must pass through NewBlock; existing owner identities are kept.
+  /// PRsLiveInSucc: OldSuccessor's physical live-ins captured before this
+  /// stage adds its PHI destinations. This includes earlier-stage PHI values
+  /// whose lifetimes now cross NewBlock. This stage's incoming copy sources are
+  /// handled separately by recordPhysicalTransfers after copy emission.
+  /// No copy sequence is inspected and no whole-function liveness is rebuilt.
+  void recordSplitLiveThrough(MachineBasicBlock &NewBlock,
+                             MachineBasicBlock &OldSuccessor,
+                             ArrayRef<MCRegister> PRsLiveInSucc);
+
   void lowerPHIs(MachineFunction &MF, RegFile Only);
   void resolvePermutation(
       MachineBasicBlock &MBB, MachineBasicBlock::iterator InsertPt,
