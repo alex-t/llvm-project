@@ -155,8 +155,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // Completed splits in this function, retained across worklist retries.
   // Also lets the drain recognize a committed split as progress.
   unsigned RecoverySplitCount = 0;
-  // Whole-wave split transfers, lowered after physical-register rewriting.
-  SmallVector<MachineInstr *, 16> RecoveryCopies;
 
   // Only edges split by this allocator; original MIR blocks keep their EXEC
   // semantics. Retained across the scalar and vector allocation stages.
@@ -442,7 +440,6 @@ class AMDGPUSSARegisterAllocator : public MachineFunctionPass {
   // Finalize MachineFunction properties after both stages are physical.
   MCRegister allocateTempSGPR(Register Scratch);
   void guardSplitEdgeTransfers();
-  void lowerRecoveryCopies(MachineFunction &MF);
   void finalizeAfterRewrite(MachineFunction &MF);
   void eliminateRedundantReloads(MachineFunction &MF);
   /// Publish the added physical lifetimes of a resolved PHI-copy sequence.

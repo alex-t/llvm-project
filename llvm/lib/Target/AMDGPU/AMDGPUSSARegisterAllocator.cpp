@@ -447,20 +447,12 @@ AMDGPUSSARegisterAllocator::splitWithForest(
   const TargetRegisterClass *RC = MRI->getRegClass(VR);
   bool IsVector = TRI->isVGPRClass(RC) || TRI->isAGPRClass(RC);
   Emitter->beginPass(IsVector);
-  const unsigned FirstNewVReg = MRI->getNumVirtRegs();
   auto Result = Emitter->splitLiveRangeAt(
       VR, Point, [this](ArrayRef<Register> Affected) {
         notifyLivenessChanged(Affected);
       });
-  if (Result) {
+  if (Result)
     ++RecoverySplitCount;
-    // Repair renames the new identity definition. Track only newly created
-    // values, excluding pre-existing whole-wave definitions in the affected set.
-    for (unsigned I = FirstNewVReg, E = MRI->getNumVirtRegs(); I != E; ++I)
-      if (MachineInstr *Copy = MRI->getUniqueVRegDef(Register::index2VirtReg(I)))
-        if (Copy->getOpcode() == AMDGPU::WWM_COPY)
-          RecoveryCopies.push_back(Copy);
-  }
   return Result;
 }
 
@@ -4442,39 +4434,11 @@ void AMDGPUSSARegisterAllocator::guardSplitEdgeTransfers() {
   SplitEdges.clear();
 }
 
-void AMDGPUSSARegisterAllocator::lowerRecoveryCopies(MachineFunction &MF) {
-  for (MachineInstr *Copy : RecoveryCopies) {
-    MachineBasicBlock &MBB = *Copy->getParent();
-    Register SavedExec =
-        MRI->createVirtualRegister(TRI->getWaveMaskRegClass());
-    // Preserve SCC independently of the vector transfer's lane mask.
-    TII->insertScratchExecCopy(MF, MBB, Copy->getIterator(), Copy->getDebugLoc(),
-                              SavedExec, /*IsSCCLive=*/true, Indexes);
-    TII->restoreExec(MF, MBB, std::next(Copy->getIterator()), Copy->getDebugLoc(),
-                    SavedExec, Indexes);
-    allocateTempSGPR(SavedExec);
-    MCRegister Dst = Copy->getOperand(0).getReg().asMCReg();
-    const TargetRegisterClass *RC = TRI->getPhysRegBaseClass(Dst);
-    unsigned Bits = TRI->getRegSizeInBits(*RC);
-    unsigned Width = std::max(1u, (Bits + 31) / 32);
-    for (unsigned I = 0; I < Width; ++I) {
-      MCRegister Part = Width == 1 ? Dst : TRI->getSubReg(
-          Dst, SIRegisterInfo::getSubRegFromChannel(I));
-      if (Bits < 32)
-        Part = TRI->get32BitRegister(Part);
-      MFI->allocateWWMSpill(MF, Part);
-    }
-    Copy->setDesc(TII->get(TargetOpcode::COPY));
-  }
-  RecoveryCopies.clear();
-}
-
 void AMDGPUSSARegisterAllocator::finalizeAfterRewrite(MachineFunction &MF) {
   SSARA_TRACE();
   // Guard the complete edge body after both stages have finished adding
-  // transfers. Per-copy WWM guards nest inside it and restore its mask.
+  // transfers.
   guardSplitEdgeTransfers();
-  lowerRecoveryCopies(MF);
   if (EliminatePostColorReloads)
     eliminateRedundantReloads(MF);
   finalizeProperties(MF);
@@ -4505,7 +4469,6 @@ static unsigned countCalleeSavedSGPRLanes(MachineFunction &MF) {
 bool AMDGPUSSARegisterAllocator::runOnMachineFunction(MachineFunction &MF) {
   EvictedVRegs.clear();
   RecoveryTimings.clear();
-  RecoveryCopies.clear();
   SplitEdges.clear();
   RecoveryScopeTimer AllocatorTimer("allocator-total");
   SSARA_TRACE();
