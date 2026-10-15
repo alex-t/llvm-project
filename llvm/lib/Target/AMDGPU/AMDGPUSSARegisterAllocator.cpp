@@ -2062,10 +2062,8 @@ bool AMDGPUSSARegisterAllocator::recoverUncolorable(Register Failed) {
         // Take a fresh ranking snapshot before any blocker spill. Keep this
         // order for the attempt; do not query NUA after subsequent mutations.
         auto &NU = getAnalysis<AMDGPUNextUseAnalysisWrapper>().getNU();
-        // FIXME: Whole-function NUA recomputation for each blocker-ranking
-        // attempt is a temporary workaround for stale analysis after recovery
-        // mutations. Replace it with incremental analysis maintenance.
-        NU.invalidate(MF);
+        // Experiment: retain stale NUA distances across recovery mutations.
+        // NU.invalidate(MF);
         MachineInstr *Query = MRI->getVRegDef(Cur);
         struct SpillCost {
           unsigned NextUse;
