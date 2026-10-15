@@ -1765,7 +1765,12 @@ AMDGPUSSARegisterAllocator::tryCrossFileHome(Register R) {
     if (SplitDef) {
       SplitDefInsert =
           AMDGPURegAllocInsertion::legalAfter(*SplitDef->getParent());
-      if (!SplitDefInsert)
+      // Decline this rehome before changing classes or RF ownership if the
+      // definition transfer cannot be placed. Recovery can try its next action.
+      if (!SplitDefInsert ||
+          !(SplitDefInsert = AMDGPURegAllocInsertion::copyPosition(
+                *SplitDef->getParent()->getParent(), *SplitDefInsert, V,
+                *MDT, *TII)))
         return false;
     }
 

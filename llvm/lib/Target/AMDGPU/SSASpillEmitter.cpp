@@ -487,6 +487,12 @@ SSASpillEmitter::splitLiveRangeAt(Register V,
     return std::nullopt;
   MachineBasicBlock &MBB = *SplitPt->getParent();
   SplitPt = AMDGPURegAllocInsertion::legalBefore(MBB, SplitPt);
+  auto CopyPt = AMDGPURegAllocInsertion::copyPosition(MBB, SplitPt, V, *DT, *TII);
+  // Decline this split without changing MIR or liveness. The caller retains
+  // the original interval and can continue recovery with another action.
+  if (!CopyPt)
+    return std::nullopt;
+  SplitPt = *CopyPt;
   if (SplitPt == MBB.end())
     return std::nullopt;
   SlotIndex Before = LIS->getInstructionIndex(*SplitPt).getBaseIndex();
@@ -494,13 +500,11 @@ SSASpillEmitter::splitLiveRangeAt(Register V,
     return std::nullopt;
   assert(MRI->hasOneDef(V) && "split requires an SSA input");
 
-  // Let the existing updater handle joins and backedges. Its reaching interval
-  // must include the temporary identity redefinition before repair starts.
-  // A split must preserve lanes that are inactive here but read after EXEC
-  // expands. Vector transfers therefore execute in whole-wave mode.
-  const unsigned Opcode = IsVGPRPass ? AMDGPU::WWM_COPY : TargetOpcode::COPY;
+  // Placement is chosen before liveness and SSA repair. The new definition
+  // serves the redirected uses; other paths retain the original definition.
   MachineInstr *CopyMI =
-      BuildMI(MBB, SplitPt, SplitPt->getDebugLoc(), TII->get(Opcode), V)
+      BuildMI(MBB, SplitPt, SplitPt->getDebugLoc(),
+              TII->get(TargetOpcode::COPY), V)
           .addReg(V);
   LIS->InsertMachineInstrInMaps(*CopyMI);
   LIS->removeInterval(V);
